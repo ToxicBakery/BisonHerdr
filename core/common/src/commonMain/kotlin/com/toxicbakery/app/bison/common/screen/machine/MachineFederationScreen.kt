@@ -68,11 +68,15 @@ import com.toxicbakery.app.bison.model.AppSettings
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
+import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.app_version_label
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
+import com.toxicbakery.app.bison.version.AppVersion
 import kotlinx.coroutines.launch
+import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.localDI
 import org.kodein.di.instance
 
@@ -133,11 +137,25 @@ fun MachineFederationScreen(
                                 .background(palette.accentPrimary),
                         )
                         Column {
-                            Text(
-                                text = "BisonHerdr Fleet",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "BisonHerdr Fleet",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                // Shared entry-point version surface (mirrors SnapshotPB DeviceBrowserScreen).
+                                // Dev builds show the `-dev` marker; build with
+                                // `-Pbison.stampBuildMetadata=true` to also show the `+<sha>` of the commit.
+                                Text(
+                                    text = stringResource(Res.string.app_version_label, AppVersion.NAME),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.fgMuted,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                            }
                             Text(
                                 text = "${connectedMachines.size} connected / ${machines.size} configured • Theme: ${palette.displayName}",
                                 style = MaterialTheme.typography.labelSmall,
@@ -502,6 +520,12 @@ private fun ThemeAndSettingsBottomSheet(
                 onCheckedChange = { enabled ->
                     onUpdateSettings { it.copy(splitThumbLayoutEnabled = enabled) }
                 },
+            )
+            Text(
+                text = stringResource(Res.string.app_version_label, AppVersion.NAME),
+                style = MaterialTheme.typography.labelSmall,
+                color = palette.fgMuted,
+                fontFamily = FontFamily.Monospace,
             )
             Spacer(modifier = Modifier.height(24.dp))
         }

@@ -30,3 +30,7 @@ Thumbs.db
 *~
 *.swp
 *.swo
+
+# Python bytecode from scripts/ (cut_version.py + its tests)
+__pycache__/
+*.pyc
