@@ -5,11 +5,14 @@ This file defines workspace-wide instructions and workflow rules for AI coding a
 ## 1. Definition of Done & Git Workflow (REQUIRED)
 
 - **Zero-Warning Builds (Definition of Done):** Work is **not** complete until all relevant Gradle/Kotlin and Cargo/Rust builds and tests pass **with zero compiler, linker, or build warnings**. Fix all deprecation, unused-symbol, unchecked-cast, clippy, and build configuration warnings before considering any task done.
-- **Commit to `main` as work completes:** Agents **must** commit changes directly to the `main` branch as each task, phase, or logical unit of work is completed. Do not leave completed work uncommitted in the working tree.
-- **Atomic, verified commits:**
-  1. Verify that all relevant builds and unit tests complete **without warnings** or errors before committing.
-  2. Check `git status` and `git diff` to ensure only intended files are staged and no temporary files or secrets are included.
-  3. Commit to `main` with a clear, descriptive commit message (e.g., `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`, `refactor: ...`).
+- **Use Git Worktrees & Pull Requests for All Changes:** Agents **must never** commit directly to `main`. All changes **must** be developed in an isolated `git worktree` on a dedicated branch and merged via a GitHub Pull Request (`gh pr create`) targeting `main`. Do not leave completed work uncommitted or unsubmitted.
+- **Atomic, Verified Commits & PR Workflow:**
+  1. Create an isolated worktree and branch from `main` for each logical unit of work (e.g., `git worktree add ../bison-herdr-<slug> -b <type>/<slug> origin/main`).
+  2. Verify that all relevant builds and unit tests complete **without warnings** or errors before committing.
+  3. Check `git status` and `git diff` to ensure only intended files are staged and no temporary files or plaintext secrets are included.
+  4. Commit to the worktree branch with a clear, descriptive Conventional Commit message (e.g., `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`, `refactor: ...`).
+  5. Push the branch to `origin` and open a Pull Request targeting `main` using `gh pr create`.
+  6. Remove temporary worktrees (`git worktree remove`) once changes are merged.
 
 ## 2. Project Mission & Architecture
 
