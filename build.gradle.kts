@@ -15,6 +15,10 @@ plugins {
     alias(libs.plugins.composite) apply false
 }
 
+// Single calendar-derived version for every module, resolved once from `git describe`
+// (see composite util resolveProjectVersion()).
+// Release builds (checked out on a tag) get a clean `26.29.1`; dev/PR/main builds
+// get a `-dev` marker.
 val projectVersion = resolveProjectVersion()
 allprojects {
     version = projectVersion

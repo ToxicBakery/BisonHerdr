@@ -3,7 +3,7 @@
   "component": {
     "group": "com.toxicbakery.app.bison.composite",
     "module": "composite",
-    "version": "1.0-5fe657e2c2d9",
+    "version": "1.0-23da83fe9c70",
     "attributes": {
       "org.gradle.status": "release"
     }
@@ -27,13 +27,13 @@
       },
       "files": [
         {
-          "name": "composite-1.0-5fe657e2c2d9.jar",
-          "url": "composite-1.0-5fe657e2c2d9.jar",
-          "size": 30964,
-          "sha512": "8a2e9bac2e16c1f1abd7d6b5aef6f967981f462fb20208a9b1c8ad83ef37e25262ee5f9f0b5b95e9bd5ae0ce95e3f071addba3bd1a1ceb12ce30607d098b66d3",
-          "sha256": "acf53f7047bfed70eb00ecc0f159a804d15b13b62c53808feccb3b64ad99c57c",
-          "sha1": "6f0840ec7aa7af9fbb23641270b84e99cdd1435b",
-          "md5": "34e75cc82d0c4e127d565d0c03624e5e"
+          "name": "composite-1.0-23da83fe9c70.jar",
+          "url": "composite-1.0-23da83fe9c70.jar",
+          "size": 30966,
+          "sha512": "33732b2c43187aef652f0f2f104c893eaf9a4155f0389326982280bf5bd41c028db553b2cd659914701f629aa3ff37378099031cf13521b95332b7daffe195d8",
+          "sha256": "863252f374341d50aa8064ced40a8675ecae31c2401ecda3f4d5cbfd33fccc48",
+          "sha1": "a41d8760e89bd00f00e23afe8c7da3024e319944",
+          "md5": "be3be7e4d69c4f4a44a0d2c66bb640d4"
         }
       ]
     },
@@ -50,13 +50,13 @@
       },
       "files": [
         {
-          "name": "composite-1.0-5fe657e2c2d9.jar",
-          "url": "composite-1.0-5fe657e2c2d9.jar",
-          "size": 30964,
-          "sha512": "8a2e9bac2e16c1f1abd7d6b5aef6f967981f462fb20208a9b1c8ad83ef37e25262ee5f9f0b5b95e9bd5ae0ce95e3f071addba3bd1a1ceb12ce30607d098b66d3",
-          "sha256": "acf53f7047bfed70eb00ecc0f159a804d15b13b62c53808feccb3b64ad99c57c",
-          "sha1": "6f0840ec7aa7af9fbb23641270b84e99cdd1435b",
-          "md5": "34e75cc82d0c4e127d565d0c03624e5e"
+          "name": "composite-1.0-23da83fe9c70.jar",
+          "url": "composite-1.0-23da83fe9c70.jar",
+          "size": 30966,
+          "sha512": "33732b2c43187aef652f0f2f104c893eaf9a4155f0389326982280bf5bd41c028db553b2cd659914701f629aa3ff37378099031cf13521b95332b7daffe195d8",
+          "sha256": "863252f374341d50aa8064ced40a8675ecae31c2401ecda3f4d5cbfd33fccc48",
+          "sha1": "a41d8760e89bd00f00e23afe8c7da3024e319944",
+          "md5": "be3be7e4d69c4f4a44a0d2c66bb640d4"
         }
       ]
     }
