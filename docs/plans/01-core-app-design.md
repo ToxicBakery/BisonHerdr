@@ -1,0 +1,984 @@
+# 01 — Herdr Tablet & Android Core App Design
+
+This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for the new native Android / Tablet client.
+
+---
+
+## Part I: Executive Summary & Problem Statement
+
+Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. The new Herdr Android/Tablet client is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built directly on Herdr's **Endpoint Generation 1** protocol.
+
+| Pain Point in Existing Mobile/Android Apps | Root Cause | Herdr Tablet Architecture Solution |
+| :--- | :--- | :--- |
+| **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen in **<50ms with zero SSH reconnect**. |
+| **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Fast-Roam:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` remain rendered on screen with a non-intrusive `"Reconnecting..."` pill. `ConnectivityManager.NetworkCallback` detects interface switches in milliseconds, re-binds the SSH bridge immediately, and resyncs via `surface_reuse` / `surface_delta`. |
+| **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste before atomic submission via `agent.prompt` or `pane.send_input`. |
+| **Clunky workspace, tab & split-pane navigation** | Desktop keyboard shortcuts (`prefix+w`, `prefix+h/j/k/l`) require awkward multi-key chords on touchscreens. | **Native Compose Shell Chrome + Direct Split Gestures:** Herdr's server renders *only* the pane grid (`PaneSurfaceFrame`). Android renders the Sidebar, Tab Bar, draggable BSP split handles (`layout.set_split_ratio`), and double-tap pane zoom (`pane.zoom`) natively at 120Hz. |
+| **Hard to see or act on `blocked` / `done` coding agents** | Agents are buried across multiple SSH hosts, workspaces, and split panes. | **Unified Multi-Machine Agent Rail + Blocked Action Strip:** Aggregates `ClientShellAgent` states across all connected SSH machines. When viewing a `blocked` agent, a contextual action bar provides 1-tap `Approve (Enter)`, `Cancel (Esc)`, `y`, `n`, and option number buttons. |
+
+---
+
+## Part II: Herdr Server API Surface & Protocol Architecture
+
+Herdr cleanly separates **shared session/runtime authority** (owned by the server) from **TUI presentation** (owned by attached clients) and **external automation** (CLI wrappers, scripts, coding agents, and plugins).
+
+### 1. Multi-Layered Communication Overview
+
+```mermaid
+flowchart TB
+    subgraph External["Automation, CLI & Plugins"]
+        CLI["CLI Wrappers (`src/cli/`)"]
+        Scripts["Raw JSON Clients / Scripts"]
+        Hooks["Agent Hooks & Plugins (`herdr-plugin.toml`)"]
+    end
+
+    subgraph TUI["Attached UI Clients (Desktop & Android Tablet)"]
+        LocalShell["Client-Owned Shell (Local / SSH / Cloud)"]
+        DirectTerm["Same-Install Direct Terminal / Attach"]
+    end
+
+    subgraph Server["Herdr Server Process (`HeadlessServer` + `App`)"]
+        ApiServer["JSON API Server (`herdr.sock`)\n`src/api/server.rs`"]
+        ClientAccept["Binary Client Listener (`herdr-client.sock`)\n`src/server/client_accept.rs`"]
+        EventHub["EventHub (512-event ring)\n`src/api/event_hub.rs`"]
+        AppLoop["App Runtime & State (`App` / `AppState`)\n`src/app/api.rs`"]
+        TermRuntimes["PTY & Terminal Runtimes\n`src/terminal/runtime.rs`"]
+    end
+
+    CLI -->|"NDJSON Request/Response"| ApiServer
+    Scripts -->|"NDJSON Request/Response"| ApiServer
+    Hooks -->|"NDJSON / CLI"| ApiServer
+
+    LocalShell -->|"Length-prefixed Bincode + Endpoint Gen 1"| ClientAccept
+    DirectTerm -->|"Length-prefixed Bincode (Protocol v22)"| ClientAccept
+
+    ApiServer -->|"mpsc: ApiRequestMessage"| AppLoop
+    ApiServer <-->|"poll / subscribe"| EventHub
+    ClientAccept -->|"ClientShellEndpointRequest"| AppLoop
+    AppLoop -->|"emit_event"| EventHub
+    AppLoop <-->|"PTY I/O & Detection"| TermRuntimes
+```
+
+| Layer | Transport & Framing | Primary Source Files | Purpose |
+| :--- | :--- | :--- | :--- |
+| **1. Public JSON Socket API** | Newline-delimited JSON (`\n`) over Unix domain socket / Windows named pipe (`herdr.sock`), or over SSH via `herdr remote-api-bridge` | `src/api/server.rs`, `src/api/schema.rs` | External control, scripting, agent orchestration, event subscriptions, and hook reporting. |
+| **2. CLI & Schema Projection** | Declarative macro projection onto `clap` args and `schemars` JSON Schema | `src/cli/projection.rs`, `src/api/schema/operations.rs` | Keeps CLI flags (`herdr workspace`, `herdr pane`, `herdr agent`) and `herdr api schema --json` 1:1 with wire types. |
+| **3. Client-Owned Shell Endpoint Protocol (Gen 1)** | `[u32LE length][bincode]` outer frames carrying forward-compatible JSON control envelopes (`EndpointControl`), or over SSH via `herdr remote-client-bridge` | `src/protocol/endpoint.rs`, `src/server/headless/endpoint_requests.rs` | Cross-version compatible UI client protocol for Local, SSH, and Cloud connections (`ENDPOINT_PROTOCOL_GENERATION = 1`). |
+| **4. Private Binary Wire Protocol** | `[u32LE length][bincode]` (`PROTOCOL_VERSION = 22`) over `herdr-client.sock` | `src/protocol/wire.rs` | Same-install high-throughput frame rendering, direct terminal attach/observe/control, Kitty graphics, and live binary handoff. |
+
+---
+
+### 2. Public JSON Socket API (`herdr.sock`)
+
+#### 2.1 Socket Discovery & SSH Bridge
+On a Herdr host, the API socket path resolves in the following order (`src/api/mod.rs`, `src/session.rs`):
+1. Explicit CLI `--session <name>` (`~/.config/herdr/sessions/<name>/herdr.sock`)
+2. `HERDR_SOCKET_PATH` environment variable override
+3. `HERDR_SESSION=<name>` environment variable
+4. Default session socket (`~/.config/herdr/herdr.sock`)
+
+For remote connections over SSH, Herdr provides two built-in stdio bridges:
+- **`herdr remote-api-bridge`** (`src/remote.rs`): Connects stdio directly to `herdr.sock` for NDJSON API requests and event subscriptions.
+- **`herdr remote-client-bridge [--idle-timeout-v1]`** (`src/remote/host.rs`): Autostarts the remote Herdr server daemon if not running, verifies `ENDPOINT_PROTOCOL_GENERATION == 1`, registers any forwarded SSH agent, and bridges stdio to `herdr-client.sock`.
+
+#### 2.2 Wire Envelope & Request Lifecycle
+Every request on `herdr.sock` is a single UTF-8 JSON line (max 1 MiB, 5-second initial read timeout):
+
+```json
+{"id": "req_1", "method": "pane.split", "params": {"direction": "right", "focus": true}}
+```
+
+- **Request (`src/api/schema.rs`):** `Request { id: String, #[serde(flatten)] method: Method }` where `Method` is tagged by `#[serde(tag = "method", content = "params")]`.
+- **Success Response (`src/api/schema/response.rs`):**
+  ```json
+  {"id": "req_1", "result": {"type": "pane_info", "pane": { ... }}}
+  ```
+- **Error Response (`src/api/schema/response.rs`):**
+  ```json
+  {"id": "req_1", "error": {"code": "pane_not_found", "message": "pane not found"}}
+  ```
+
+```mermaid
+sequenceDiagram
+    participant Client as API Client / CLI
+    participant ConnThread as API Connection Thread (`herdr-api-conn`)
+    participant App as App Event Loop (`src/app/api.rs`)
+    participant EventHub as EventHub (`src/api/event_hub.rs`)
+
+    Client->>ConnThread: {"id":"1","method":"...","params":{...}}\n
+    alt Fast-path in `handle_connection_with_stop`
+        ConnThread-->>Client: Immediate response (`ping`, `server.stop`, `server.ssh_agent.register`)
+    else Blocking Wait / Subscription (`agent.wait`, `events.subscribe`, `pane.wait_for_output`)
+        ConnThread->>App: Probe initial state via `api_tx`
+        loop Poll every 100ms (`CONNECTION_POLL_INTERVAL`)
+            ConnThread->>EventHub: Check `events_after(last_sequence)`
+            ConnThread->>App: Re-verify state snapshot if needed
+        end
+        ConnThread-->>Client: Stream events or return final wait result
+    else Standard App State Operation
+        ConnThread->>App: Send `ApiRequestMessage` over `api_tx`
+        App->>App: `handle_api_request_after_internal_events_drained()`
+        App->>EventHub: `emit_event(...)` (if state mutated)
+        App-->>ConnThread: JSON response string via `respond_to` channel
+        ConnThread-->>Client: Write JSON line + newline
+    end
+```
+
+#### 2.3 Complete Operation Catalog (102 Operations)
+Declared in `src/api/schema.rs` via `define_operations!`. Each operation defines:
+- `changes_ui`: Marks UI render state dirty when `true`.
+- `client_shell`: Permits invocation over the Client-Owned Shell command lane (`ClientShellEndpointRequest`) when `true`.
+
+##### Server, Session & Client Control
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `ping` | `PingParams` | `pong` | `false` | `false` | Returns server `version`, `protocol` (`22`), and `ServerCapabilities`. |
+| `server.stop` | `EmptyParams` | `ok` | `false` | `false` | Initiates graceful server shutdown (`ShutdownReason::ApiStop`). |
+| `server.live_handoff` | `ServerLiveHandoffParams` | `ok` | `false` | `false` | Transfers live PTYs and session state to a newly upgraded Herdr binary. |
+| `server.reload_config` | `EmptyParams` | `config_reload` | `true` | `true` | Reloads `config.toml` and returns status + diagnostics. |
+| `server.ssh_agent.register` | `ServerSshAgentRegisterParams` | `ok` (held open) | `false` | `false` | Registers a remote forwarded SSH agent socket for the lifetime of the API connection. |
+| `server.agent_manifests` | `EmptyParams` | `agent_manifest_status` | `false` | `false` | Lists active agent detection manifests, versions, overrides, and remote check status. |
+| `server.reload_agent_manifests` | `EmptyParams` | `agent_manifest_reload` | `true` | `false` | Reloads detection manifests from disk and resets active detectors. |
+| `notification.show` | `NotificationShowParams` | `notification_show` | `true` | `false` | Shows a toast (`title`, optional `body`, `position`, `sound`); rate-limited to 1/sec. |
+| `product_announcement.dismiss` | `ProductAnnouncementDismissParams` | `ok` | `true` | `true` | Dismisses an active product announcement matching `(version, id)`. |
+| `release_notes.dismiss` | `ReleaseNotesDismissParams` | `ok` | `true` | `true` | Marks release notes for `version` as seen. |
+| `command.invoke` | `CommandInvokeParams` | `ok` | `true` | `true` | Executes a configured custom command or keybinding action by `command_id`. |
+| `client.window_title.set` | `ClientWindowTitleSetParams` | `client_window_title` | `false` | `false` | Overrides the foreground client's outer terminal window title via OSC 0. |
+| `client.window_title.clear` | `EmptyParams` | `client_window_title` | `false` | `false` | Restores automatic window title management (`ui.window_title`). |
+| `client_shell.surface.set` | `ClientShellSurfaceSetParams` | `client_shell_surface_set` | `false` | `true` | Toggles whether a client-shell connection receives active pane surface frames (`active: bool`). |
+| `session.snapshot` | `EmptyParams` | `session_snapshot` | `false` | `false` | Returns a complete `SessionSnapshot` (workspaces, tabs, panes, layouts, agents). |
+| `popup.close` | `EmptyParams` | `ok` | `true` | `false` | Closes the currently open modal popup terminal, if any. |
+
+##### Workspaces & Git Worktrees
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `workspace.create` | `WorkspaceCreateParams` | `workspace_created` | `true` | `true` | Creates a workspace (`cwd`, `label`, `focus`, `env`) and returns workspace, tab, and root pane. |
+| `workspace.list` | `EmptyParams` | `workspace_list` | `false` | `false` | Lists all open `WorkspaceInfo` records. |
+| `workspace.get` | `WorkspaceTarget` | `workspace_info` | `false` | `false` | Inspects a single workspace by ID (`w1` or `1`). |
+| `workspace.focus` | `WorkspaceTarget` | `workspace_info` | `true` | `true` | Switches active focus to the target workspace. |
+| `workspace.rename` | `WorkspaceRenameParams` | `workspace_info` | `true` | `true` | Sets a custom label on a workspace. |
+| `workspace.move` | `WorkspaceMoveParams` | `workspace_list` | `true` | `true` | Moves a single workspace to `insert_index`. |
+| `workspace.move_block` | `WorkspaceMoveBlockParams` | `workspace_list` | `true` | `true` | Atomically reorders a block of `workspace_ids` before `before_workspace_id`. |
+| `workspace.report_metadata` | `WorkspaceReportMetadataParams` | `workspace_info` | `true` | `false` | Patches display tokens (`$key`) on a workspace with optional `seq` and `ttl_ms`. |
+| `workspace.close` | `WorkspaceCloseParams` | `ok` | `true` | `true` | Closes a workspace (requires `close_group: true` if primary checkout has open linked worktrees). |
+| `worktree.list` | `WorktreeListParams` | `worktree_list` | `false` | `true` | Discovers Git worktrees for a workspace or `cwd` asynchronously. |
+| `worktree.create` | `WorktreeCreateParams` | `worktree_created` | `true` | `true` | Creates/checks out a linked Git worktree and opens it as a Herdr workspace. |
+| `worktree.open` | `WorktreeOpenParams` | `worktree_opened` | `true` | `true` | Opens an existing Git worktree by `path` or `branch` as a Herdr workspace. |
+| `worktree.remove` | `WorktreeRemoveParams` | `worktree_removed` | `true` | `true` | Runs `git worktree remove` on a linked worktree workspace without deleting its branch. |
+
+##### Tabs & Layouts
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `tab.create` | `TabCreateParams` | `tab_created` | `true` | `true` | Creates a new tab in a workspace (`workspace_id`, `cwd`, `label`, `focus`, `env`). |
+| `tab.list` | `TabListParams` | `tab_list` | `false` | `false` | Lists tabs (all or filtered by `workspace_id`). |
+| `tab.get` | `TabTarget` | `tab_info` | `false` | `false` | Gets `TabInfo` for `tab_id` (e.g. `w1:t1`). |
+| `tab.focus` | `TabTarget` | `tab_info` | `true` | `true` | Focuses the specified tab. |
+| `tab.rename` | `TabRenameParams` | `tab_info` | `true` | `true` | Renames a tab. |
+| `tab.move` | `TabMoveParams` | `tab_list` | `true` | `true` | Moves a tab to `insert_index` within its workspace. |
+| `tab.close` | `TabTarget` | `ok` | `true` | `true` | Closes a tab and its panes. |
+| `layout.export` | `LayoutExportParams` | `layout_export` | `false` | `false` | Exports a portable BSP tree (`LayoutDescription`) for a tab. |
+| `layout.apply` | `LayoutApplyParams` | `layout_apply` | `true` | `false` | Creates or replaces a tab from a declarative `LayoutNode` tree. |
+| `layout.set_split_ratio` | `LayoutSetSplitRatioParams` | `layout_split_ratio_set` | `true` | `true` | Updates the split ratio at a binary tree `path` (`Vec<bool>`). |
+
+##### Panes
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `pane.list` | `PaneListParams` | `pane_list` | `false` | `false` | Lists panes (all or scoped to `workspace_id`). |
+| `pane.current` | `PaneCurrentParams` | `pane_current` | `false` | `false` | Returns `caller_pane_id` if given, or the currently focused pane. |
+| `pane.get` | `PaneTarget` | `pane_info` | `false` | `false` | Returns `PaneInfo` for `pane_id` (e.g. `w1:p1`). |
+| `pane.focus` | `PaneTarget` | `pane_info` | `true` | `true` | Focuses a pane (and its containing workspace/tab). |
+| `pane.focus_direction` | `PaneFocusDirectionParams` | `pane_focus_direction` | `true` | `true` | Moves focus `left`, `right`, `up`, or `down` within the tab layout. |
+| `pane.split` | `PaneSplitParams` | `pane_info` | `true` | `true` | Splits a pane `right` or `down` with optional `ratio`, `cwd`, `focus`, `right_click`, `env`. |
+| `pane.swap` | `PaneSwapParams` | `pane_swap` | `true` | `true` | Swaps two panes in the same tab (by direction or explicit IDs). |
+| `pane.move` | `PaneMoveParams` | `pane_move` | `true` | `false` | Moves a live pane to another tab, a new tab, or a new workspace without killing its PTY. |
+| `pane.zoom` | `PaneZoomParams` | `pane_zoom` | `true` | `true` | Toggles, enables, or disables single-pane zoom on a tab. |
+| `pane.resize` | `PaneResizeParams` | `pane_resize` | `true` | `true` | Resizes a pane boundary in `direction` by `amount`. |
+| `pane.layout` | `PaneLayoutParams` | `pane_layout` | `false` | `true` (added) | Returns `PaneLayoutSnapshot` with cell rects for panes and splits. |
+| `pane.neighbor` | `PaneNeighborParams` | `pane_neighbor` | `false` | `false` | Finds the neighboring pane in `direction` plus the layout snapshot. |
+| `pane.edges` | `PaneEdgesParams` | `pane_edges` | `false` | `false` | Reports which outer edges (`left`, `right`, `up`, `down`) have neighbors. |
+| `pane.process_info` | `PaneProcessInfoParams` | `pane_process_info` | `false` | `false` | Inspects shell PID, foreground process group, TTY, and foreground process tree. |
+| `pane.scroll` | `PaneScrollParams` | `pane_info` | `true` | `true` | Scrolls a pane viewport to `offset_from_bottom`. |
+| `pane.clear` | `PaneTarget` | `ok` | `true` | `true` | Clears screen and scrollback for a pane. |
+| `pane.edit_scrollback` | `PaneTarget` | `ok` | `true` | `true` | Opens the pane's scrollback buffer in `$EDITOR` inside an overlay pane. |
+| `pane.selection.read` | `PaneSelectionReadParams` | `pane_selection` | `false` | `true` | Reads selected text between `anchor` and `cursor` validated against `content_revision`. |
+| `pane.copy_motion` | `PaneCopyMotionParams` | `pane_copy_motion` | `false` | `true` | Computes vim-style word/line/paragraph copy-mode cursor motion on the server buffer. |
+| `pane.copy_search` | `PaneCopySearchParams` | `pane_copy_search` | `false` | `true` | Searches scrollback content in copy mode and returns match ranges. |
+| `pane.input.set` | `PaneInputSetParams` | `pane_info` | `true` | `true` | Sets right-click behavior (`herdr` menu vs `pane` mouse passthrough). |
+| `pane.link.resolve` | `PaneLinkActivateParams` | `pane_link_resolved` | `false` | `true` | Resolves clickable URL/OSC8/plugin link regions at `(viewport_row, col)`. |
+| `pane.link.activate` | `PaneLinkActivateParams` | `pane_link_activated` | `false` | `true` | Activates a link at `(viewport_row, col)` (via plugin link handler or URL opener). |
+| `pane.rename` | `PaneRenameParams` | `pane_info` | `true` | `true` | Sets or clears a custom pane label. |
+| `pane.send_text` | `PaneSendTextParams` | `ok` | `false` | `true` (added) | Writes literal text into a pane's PTY input queue. |
+| `pane.send_keys` | `PaneSendKeysParams` | `ok` | `false` | `true` (added) | Encodes and sends key chords (`Enter`, `Esc`, `ctrl+c`, `shift+tab`, etc.) to a pane. |
+| `pane.send_input` | `PaneSendInputParams` | `ok` | `false` | `true` (added) | Sends text followed by key chords (backing `herdr pane run`). |
+| `pane.read` | `PaneReadParams` | `pane_read` | `false` | `true` (added) | Reads terminal text/ANSI from `visible`, `recent`, `recent_unwrapped`, or `detection` buffer. |
+| `pane.wait_for_output` | `PaneWaitForOutputParams` | `output_matched` | `false` | `false` | Blocks until a substring or regex matches in the pane's output buffer or `timeout_ms` elapses. |
+| `pane.report_agent` | `PaneReportAgentParams` | `pane_info` | `true` | `false` | Reports authoritative semantic agent state (`idle`, `working`, `blocked`, `unknown`) and optional session/resume argv. |
+| `pane.report_agent_session` | `PaneReportAgentSessionParams` | `pane_info` | `true` | `false` | Reports native session ID/path and optional `resume_argv` without claiming state authority. |
+| `pane.report_metadata` | `PaneReportMetadataParams` | `pane_info` | `true` | `false` | Patches display-only `title`, `display_agent`, `state_labels`, and `$tokens` with optional `ttl_ms` and `seq`. |
+| `pane.clear_agent_authority` | `PaneClearAgentAuthorityParams` | `pane_info` | `true` | `false` | Clears hook state authority on a pane so screen detection resumes. |
+| `pane.release_agent` | `PaneReleaseAgentParams` | `pane_info` | `true` | `false` | Releases an agent's ownership of a pane on graceful exit. |
+| `pane.close` | `PaneTarget` | `ok` | `true` | `true` | Closes a pane (and its tab/workspace if it was the last pane). |
+
+##### Coding Agents
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `agent.list` | `EmptyParams` | `agent_list` | `false` | `true` (added) | Lists all detected or hook-registered coding agents (`AgentInfo`). |
+| `agent.get` | `AgentTarget` | `agent_info` | `false` | `true` (added) | Resolves an agent by handle name, `pane_id`, or `terminal_id`. |
+| `agent.read` | `AgentReadParams` | `pane_read` | `false` | `true` (added) | Reads terminal output from the target agent's pane. |
+| `agent.explain` | `AgentTarget` | `agent_explain` | `false` | `false` | Evaluates the server's active detection manifest against the pane's bottom-buffer snapshot and explains rule gates. |
+| `agent.send_keys` | `AgentSendKeysParams` | `ok` | `true` | `true` (added) | Sends key chords to a resolved agent pane. |
+| `agent.rename` | `AgentRenameParams` | `agent_info` | `true` | `true` (added) | Assigns or clears a unique handle name on an agent. |
+| `agent.focus` | `AgentTarget` | `agent_info` | `true` | `true` (added) | Focuses the workspace, tab, and pane of the target agent. |
+| `agent.start` | `AgentStartParams` | `agent_started` | `true` | `false` | Launches a supported coding agent CLI in an idle shell pane, assigns `name`, and waits for interactive readiness. |
+| `agent.prompt` | `AgentPromptParams` | `agent_prompted` | `true` | `true` (added) | Submits a prompt to an agent (rejecting if `blocked`) and optionally waits for a settled target state (`until`, `timeout_ms`) in one atomic call. |
+| `agent.wait` | `AgentWaitParams` | `agent_info` | `false` | `false` | Pins the resolved agent occupant (`terminal_id`) and waits until its status matches `until` (`idle`, `done`, `blocked`, `working`). |
+| `agent.view.set` | `AgentViewSetParams` | `agent_view` | `true` | `false` | Installs a declarative filter/sort projection (`AgentViewFilter`, `AgentViewSort`) for the UI Agents list. |
+| `agent.view.clear` | `AgentViewClearParams` | `agent_view` | `true` | `false` | Clears the active agent view projection (unconditionally or if owned by `source`). |
+
+##### Events, Integrations & Plugins
+| Method | Params Struct | Response `result.type` | `changes_ui` | `client_shell` | Description |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `events.subscribe` | `EventsSubscribeParams` | `subscription_started` | `false` | `false` | Acknowledges with `subscription_started`, then streams matching `EventEnvelope` / `SubscriptionEventEnvelope` lines until disconnect. |
+| `events.wait` | `EventsWaitParams` | `wait_matched` | `false` | `false` | Blocks until a single matching event occurs or `timeout_ms` elapses. |
+| `integration.list` | `EmptyParams` | `integration_list` | `false` | `true` | Lists all 17 built-in coding agent integrations (`IntegrationTarget`) and their installation state. |
+| `integration.install` | `IntegrationInstallParams` | `integration_install` | `false` | `true` | Installs Herdr hook scripts/configs for a target agent CLI. |
+| `integration.uninstall` | `IntegrationUninstallParams` | `integration_uninstall` | `false` | `false` | Removes Herdr hook scripts/configs for a target agent CLI. |
+| `plugin.link` | `PluginLinkParams` | `plugin_linked` | `false` | `false` | Links a `herdr-plugin.toml` manifest into `plugins.json` and runs startup hooks if enabled. |
+| `plugin.list` | `PluginListParams` | `plugin_list` | `false` | `false` | Lists installed plugins, their manifests, source metadata, and warnings. |
+| `plugin.unlink` | `PluginUnlinkParams` | `plugin_unlinked` | `true` | `false` | Unlinks a plugin and removes its owned views/panes. |
+| `plugin.enable` | `PluginSetEnabledParams` | `plugin_enabled` | `false` | `false` | Enables a linked plugin. |
+| `plugin.disable` | `PluginSetEnabledParams` | `plugin_disabled` | `true` | `false` | Disables a linked plugin. |
+| `plugin.action.list` | `PluginActionListParams` | `plugin_action_list` | `false` | `false` | Lists actions declared across installed plugins. |
+| `plugin.action.invoke` | `PluginActionInvokeParams` | `plugin_action_invoked` | `true` | `false` | Spawns a plugin action command with `HERDR_PLUGIN_CONTEXT_JSON` and logs execution. |
+| `plugin.log.list` | `PluginLogListParams` | `plugin_log_list` | `false` | `false` | Returns recent plugin action/hook execution logs (`stdout`, `stderr`, `exit_code`). |
+| `plugin.pane.open` | `PluginPaneOpenParams` | `plugin_pane_opened` / `ok` | `true` | `false` | Opens a plugin `[[panes]]` entrypoint as `overlay`, `popup`, `split`, `tab`, or `zoomed`. |
+| `plugin.pane.focus` | `PluginPaneFocusParams` | `plugin_pane_focused` | `true` | `false` | Focuses an open plugin pane. |
+| `plugin.pane.close` | `PluginPaneCloseParams` | `plugin_pane_closed` | `true` | `false` | Closes an open plugin pane. |
+
+---
+
+### 3. Event Hub, Subscriptions & Waits
+
+1. **Bounded Ring Buffer (`EventHub`, `src/api/event_hub.rs`):**
+   - Stores up to **512** (`EventHub::MAX_EVENTS`) `EventEnvelope` items with a monotonic `u64` sequence number.
+   - Emits 26 lifecycle event kinds (`workspace.*`, `worktree.*`, `tab.*`, `pane.*`, `layout.updated`).
+2. **Overrun Detection (`events_lost`):**
+   - If a subscriber falls more than 512 events behind, `events_after_checked` returns `EventHistoryError::Lost`.
+   - The server writes an error response with `error.code: "events_lost"` and closes the subscription connection so clients never silently operate on stale state.
+   - **Recovery Pattern:** Open a new `events.subscribe` stream, wait for `subscription_started`, fetch `session.snapshot` on a separate connection, and treat subsequent events as invalidation signals.
+3. **Occupant-Pinned Agent Waits (`src/api/wait.rs`):**
+   - `agent.wait` pins `terminal_id`, `name`, and `agent` kind. If the process exits or is replaced, it fails fast with `agent_not_running`.
+   - `agent.prompt` with `wait` atomically submits the prompt, verifies transition to `working` or `blocked` within 5,000 ms (`AGENT_PROMPT_EFFECT_TIMEOUT_MS`), and then waits for the settled target status (`idle`, `done`, `blocked`).
+
+---
+
+### 4. Client-Owned Shell Endpoint Protocol (Generation 1)
+
+Defined in `src/protocol/endpoint.rs` and `src/protocol/wire.rs`, Generation 1 decouples client UI builds from server runtime builds across Local, SSH, and Cloud connections.
+
+#### 4.1 Framing & Handshake
+All messages on `herdr-client.sock` (and `herdr remote-client-bridge`) use `[u32LE length][bincode payload]` framing (`MAX_FRAME_SIZE` = 2 MiB, or `MAX_GRAPHICS_FRAME_SIZE` = 32 MiB when Kitty graphics are active).
+
+1. **Client → Server (`EndpointClientHello`):**
+   Sent inside `ClientMessage::EndpointControl { kind: "endpoint.hello.v1", data }`:
+   ```json
+   {
+     "generation": 1,
+     "cell_width_px": 18,
+     "cell_height_px": 36,
+     "surface_size": { "cols": 140, "rows": 42 },
+     "pixel_mouse": true,
+     "direct_graphics": false,
+     "endpoint_keybindings": false,
+     "mouse_capture": true,
+     "surface_active": true,
+     "surface_reuse": true,
+     "surface_delta": true,
+     "surface_scroll": true,
+     "snapshot_codecs": ["shell.snapshot.v1"],
+     "surface_codecs": ["shell.surface.v1"],
+     "input_codecs": ["shell.input.semantic.v1"],
+     "blob_codecs": ["shell.blob.v1"]
+   }
+   ```
+2. **Server → Client (`EndpointServerWelcome`):**
+   Sent inside `ServerMessage::EndpointControl { kind: "endpoint.welcome.v1", data }`:
+   - Negotiates the four core codecs (`shell.snapshot.v1`, `shell.surface.v1`, `shell.input.semantic.v1`, `shell.blob.v1`).
+   - Lists supported `methods` (`client_shell_method_names()`).
+   - Advertises `capabilities`:
+     - `surface_reuse`, `surface_delta`, `surface_scroll`
+     - `surface_interest`
+     - `presentation_effects_fence`
+     - `health_check`
+     - `agent_view_projection`
+     - `agent_completions`
+
+#### 4.2 Ongoing Control, Surface, and Input Streams
+- **Shell State Snapshots (`shell.snapshot.v1`):**
+  Delivered via `ServerMessage::EndpointControl { kind: "shell.snapshot.v1", data }`. Contains `ClientShellSnapshot`:
+  - `boot_id` and monotonic `revision`
+  - `focused_workspace_id`, `focused_tab_id`, `focused_pane_id`
+  - `workspaces: Vec<ClientShellWorkspace>` (with Git branch, ahead/behind, worktree info, tokens, `agent_status`)
+  - `tabs: Vec<ClientShellTab>` (with `zoomed`, `focused`, `agent_status`)
+  - `panes: Vec<ClientShellPane>` (with `cwd`, `foreground_cwd`, `right_click_passthrough`)
+  - `agents: Vec<ClientShellAgent>` (with `agent_status`, `state_change_seq`, `state_labels`, `tokens`)
+  - `commands: Vec<ClientShellCommand>` (custom commands & keybindings)
+- **Active Tab Surface (`PaneSurfaceFrame` & Deltas):**
+  - Full surfaces arrive via `ServerMessage::PaneSurface(PaneSurfaceFrame)` or `ServerMessage::EndpointControl { kind: "endpoint.surface-reuse.v1", data }` (UTF-8 JSON `SurfaceReuse<PaneSurfaceFrame>` retaining the baseline cell grid).
+  - Incremental updates arrive via `ServerMessage::PaneSurfacePatch(PaneSurfacePatch)`, `"endpoint.surface-delta.v1"` (unpadded Base64 of `bincode`-serialized `SurfaceDelta`), or `"endpoint.surface-scroll.v1"` (unpadded Base64 of `u8` scroll count + `10-byte` `SurfaceScroll` shift headers + framed `ServerMessage::PaneSurfacePatch`).
+  - When `presentation_effects_fence` is negotiated and the server sends `"endpoint.presentation.sync.v1"`, the client commits the first coherent `PaneSurfaceFrame` for the new epoch and replies with `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }`.
+  - Includes origin-relative `FrameData` cells, `panes: Vec<PaneSurfacePane>` (exact `rect`, `inner_rect`, `scrollbar_rect`, `scroll` metrics, `mouse_reporting`), `splits: Vec<PaneSurfaceSplit>` (`hit_rect` and BSP `path`), `popup: Option<Box<ClientShellPopupSurface>>`, and `graphics: SurfaceGraphicsScene` (Kitty RGBA/PNG assets and placements).
+- **Semantic Input (`ClientShellPaneInput` & `ClientShellPopupInput`):**
+  - Sends `Vec<ClientPaneInputEvent>` (`Key`, `TextCommit`, `Mouse`, `Paste`) directly to a target `pane_id` or popup `terminal_id` (works even while `surface_active == false` for background notification actions).
+- **Client-Shell Command Lane (`ClientShellEndpointRequest`) & Control Sideband (`herdr remote-api-bridge`):**
+  - Invokes any `client_shell`-enabled API method over the existing client connection (`ClientMessage::ClientShellEndpointRequest { boot_id, request }`, serialized one-in-flight at a time while `surface_active == true`) and receives chunked JSON responses via `ServerMessage::ClientShellEndpointResponseChunk`.
+  - In addition, `herdr remote-api-bridge` over `herdr.sock` provides full multiplexed access to all 102 JSON-RPC operations (`events.subscribe`, `session.snapshot`, `pane.layout`, `agent.read`, `pane.read`, `agent.prompt`, `pane.send_input`) against both updated and unmodified Herdr servers.
+
+---
+
+## Part III: Android & Tablet Client UX Design — "Zen Canvas" (Design 2)
+
+### 1. Edge-to-Edge "Zen Canvas" Layout with Floating HUDs (Jetpack Compose)
+
+The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet display is dedicated to the full-bleed hardware-accelerated terminal grid**, with zero permanent sidebars or bulky toolbars stealing columns or rows. All multi-machine navigation, workspace/tab switching, agent triage, and touch modifiers live in **translucent floating HUD pills, a slide-over Agent Command Drawer, and ergonomic split-thumb clusters**:
+
+```
++----------------------------------------------------------------------------------------------------+
+|  ( ● workbox · MOSH UDP :60004 · 11ms › herdr-core (1/3) ▾ )   ( 🔴 1 Blocked · ☰ Agents ) ( ◫ )  |
+|                                                                +----------------------------------+|
+|  ╭─ Claude Code · Pane #1 (Focused) ────────────────────────╮  | Federated Agent Command Center ✕ ||
+|  │ Host: workbox (Mosh UDP SSP :60004) · Local Echo: ON     │  | ┌──────────────────────────────┐ ||
+|  ╰──────────────────────────────────────────────────────────╯  | │ 🔴 Claude Code · workbox #1  │ ||
+|                                                                | │ Allow Bash: `just test`?     │ ||
+|  ● Inspecting platform/android/di/SshModule.kt                 | │ [ ✓ Approve ]  [ ✕ Reject ]  │ ||
+|  ● Verified Kodein bindSingleton wiring for MoshUdpEngine      | └──────────────────────────────┘ ||
+|                                                                | ┌──────────────────────────────┐ ||
+|  ⚠ Permission Prompt — Pane #1                                 | │ 🟠 Codex CLI · gpu-rig #2    │ ||
+|    Run `./gradlew :app:android:assembleDebug`?                 | │ Compiling libghostty-vt...   │ ||
+|    ❯ [1] Approve (Enter)   [2] Always allow   [3] Cancel (Esc) | └──────────────────────────────┘ ||
+|                                                                +----------------------------------+|
+|  Prompt > █                                                    | $ mosh-server new -s -c 256      ||
+|                                                                | MOSH CONNECT 60004 4k9X2vL8...   ||
+|                                                                | ✓ Zero-drop UDP roaming armed.   ||
+|                                                                                                    |
+|  [Esc][Tab][Ctrl][Alt][^C]   ( ❯ Approve and run tests... [✓ Approve] [Send ⏎] )   [←][↓][↑][→][⏎] |
++----------------------------------------------------------------------------------------------------+
+```
+
+1. **Full-Bleed Terminal Canvas (96%+ Screen Area):**
+   - Renders the multi-pane BSP split grid edge-to-edge across the entire tablet screen, with a crisp `2.dp` accent focus border on the active pane.
+   - Floating top-And-bottom HUD elements use translucent Material 3 glass surfaces (`backdrop-filter` / `Surface` with alpha + `1.dp` border) that sit over padding zones or auto-fade to 40% opacity while typing.
+2. **Floating Top HUD Islands:**
+   - **Left Host & Space Switcher Pill (`● workbox · MOSH UDP :60004 · 11ms › herdr-core (1/3) ▾`):**
+     - Displays the active host, live transport backbone badge (`MOSH · UDP`, `MOSH ROAMED`, or `SSH · TCP`), RTT latency, active workspace/worktree, and tab index.
+     - Tapping opens a compact floating popover sheet to switch hosts (`workbox`, `gpu-rig`, `cloud-vm`), switch/create workspaces & Git worktrees (`workspace.focus`, `workspace.create`, `worktree.create`), or switch tabs (`tab.focus`, `tab.create`).
+   - **Right Agent Attention Pill (`🔴 1 Blocked · 1 Working · ☰ Agents`) & Split Pill (`◫ Splits`):**
+     - Pulses when any agent across any federated machine enters `Blocked` or finishes (`Done`).
+     - Tapping toggles the **Slide-Over Floating Agent Command Center Drawer** on the right side of the canvas without leaving or resizing the underlying terminal panes.
+     - The **Slide-Over Agent Command Center** lists all active agents across all connected machines sorted by priority (`Blocked` → `Done` → `Working` → `Idle`), fetching live bottom-buffer snippets via `agent.read` / `pane.read` and providing **inline one-tap `[ ✓ Approve ]` (`agent.send_keys` / `ClientShellPaneInput`), `[ ✕ Reject ]`, and `[ Jump to Pane ]` (`pane.focus` / `agent.focus`) buttons**.
+3. **Ergonomic Split-Thumb Floating Bottom Controls:**
+   - Designed specifically for holding a tablet with two hands (or typing on a split/floating keyboard):
+   - **Left Thumb Cluster:** `[Esc]`, `[Tab]`, sticky/chorded `[Ctrl]`, `[Alt]`, `[^C]` (plus customizable quick keys like `[^B]`, `[/]`, `[|]`).
+   - **Right Thumb Cluster:** Swipeable directional arrow cluster `[←]`, `[↓]`, `[↑]`, `[→]` + `[⏎ Enter]`.
+   - **Center Floating Prompt Composer Pill (`❯ ... [✓ Approve] [Send ⏎]`):**
+     - Sits ergonomically between the left and right thumb pads.
+     - Shows contextual one-tap **`[ ✓ Approve ]`** / **`[ ✕ Reject ]`** buttons whenever the focused pane's agent is `Blocked`.
+     - Tapping the prompt input expands into a multi-line native Compose `OutlinedTextField` card supporting **Gboard swipe typing, Android Voice Dictation, multi-line editing, image clipboard paste (`ClientMessage::ClipboardImage`), and offline Mosh roaming queue**.
+     - Submitting sends the prompt atomically (`agent.prompt` with optional `until` wait, `pane.send_input`, or `ClientShellPaneInput` `Paste` + `Enter`).
+
+---
+
+### 2. Touch-First Split & Viewport Gestures
+
+1. **Direct BSP Divider Dragging:**
+   - `PaneSurfaceFrame.splits` (and `PaneLayoutSnapshot.splits` from `pane.layout` when running on the Mosh UDP backbone) provides the exact cell `hit_rect` and binary tree `path: Vec<bool>` for every split divider.
+   - The Compose overlay inflates each divider's touch target to `24.dp`. Dragging renders a live preview splitter line and sends `layout.set_split_ratio` on release.
+2. **Double-Tap / Spread to Zoom a Pane:**
+   - Double-tapping a pane header or performing a two-finger expand gesture inside a split pane invokes `pane.zoom { pane_id, mode: "toggle" }`, maximizing that pane across the full Zen Canvas.
+3. **Per-Host Pinch-to-Zoom Font Size:**
+   - Two-finger pinch adjusts the terminal cell font size (`cell_width_px`, `cell_height_px`), dynamically recalculating `ClientSurfaceSize { cols, rows }` and sending `ClientMessage::ClientShellResize` (and Mosh UDP window resize).
+4. **Inertial Touch Scrollback & Selection:**
+   - One-finger vertical swipe scrolls the pane with native Android fling physics via `pane.scroll { pane_id, offset_from_bottom }`.
+   - Long-pressing text enters native touch selection mode backed by `pane.selection.read` and `pane.copy_search`.
+
+---
+
+### 3. Built-in Color Themes (`Gruvbox Dark` Default + All 18 Herdr Palettes & `OLED Pitch Black` in Settings)
+
+All 18 color palettes from Herdr's `src/app/state.rs` (`Palette`) plus `OLED Pitch Black` (`oled-black`) are built into `:core:common/theme` and selectable in **User Settings** (persisted in `AppSettingsStore` via `:core:store`), with **`Gruvbox Dark` (`gruvbox`) as the default out-of-the-box theme**. Since the Android app acts as the outer terminal host, each theme also defines an explicit `Terminal BG` token alongside Herdr's `Palette` tokens:
+
+| Theme ID | Display Name | Variant | Default? | Panel BG | Terminal BG | Accent | Text | Green | Red | Mauve / Secondary |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **`gruvbox`** | **Gruvbox Dark** | Dark | **✓ Default** | `#282828` | `#1d2021` | `#d79921` | `#ebdbb2` | `#b8bb26` | `#fb4934` | `#d3869b` |
+| `catppuccin` | Catppuccin Mocha | Dark | Option | `#181825` | `#11111b` | `#89b4fa` | `#cdd6f4` | `#a6e3a1` | `#f38ba8` | `#cba6f7` |
+| `tokyo-night` | Tokyo Night | Dark | Option | `#1a1b26` | `#13141c` | `#7aa2f7` | `#c0caf5` | `#9ece6a` | `#f7768e` | `#bb9af7` |
+| `vesper` | Vesper (Minimal) | Dark | Option | `#1a1a1a` | `#101010` | `#ffc799` | `#ffffff` | `#99ffe4` | `#ff8080` | `#ffd1a8` |
+| `rose-pine` | Rosé Pine | Dark | Option | `#191724` | `#12101b` | `#c4a7e7` | `#e0def4` | `#31748f` | `#eb6f92` | `#c4a7e7` |
+| `kanagawa` | Kanagawa Wave | Dark | Option | `#1f1f28` | `#16161d` | `#7e9cd8` | `#dcd7ba` | `#76946a` | `#c34043` | `#957fb8` |
+| `nord` | Nord Frost | Dark | Option | `#2e3440` | `#242933` | `#88c0d0` | `#eceff4` | `#a3be8c` | `#bf616a` | `#b48ead` |
+| `dracula` | Dracula | Dark | Option | `#282a36` | `#1e1f29` | `#bd93f9` | `#f8f8f2` | `#50fa7b` | `#ff5555` | `#ff79c6` |
+| `one-dark` | One Dark | Dark | Option | `#282c34` | `#1e222a` | `#61afef` | `#abb2bf` | `#98c379` | `#e06c75` | `#c678dd` |
+| `solarized` | Solarized Dark | Dark | Option | `#002b36` | `#001e26` | `#268bd2` | `#93a1a1` | `#859900` | `#dc322f` | `#d33682` |
+| `oled-black` | OLED Pitch Black | Dark | Option | `#050508` | `#000000` | `#60a5fa` | `#f1f5f9` | `#34d399` | `#fb7185` | `#c084fc` |
+| `terminal` | Classic 16-Color | Dark | Option | `#121212` | `#000000` | `#5c9cff` | `#e5e5e5` | `#00cd00` | `#ff5555` | `#cd00cd` |
+| `gruvbox-light` | Gruvbox Light | Light | Option | `#fbf1c7` | `#f9f5d7` | `#076678` | `#3c3836` | `#79740e` | `#9d0006` | `#8f3f71` |
+| `catppuccin-latte` | Catppuccin Latte | Light | Option | `#eff1f5` | `#ffffff` | `#1e66f5` | `#4c4f69` | `#40a02b` | `#d20f39` | `#8839ef` |
+| `tokyo-night-day` | Tokyo Night Day | Light | Option | `#e1e2e7` | `#f0f1f5` | `#2e7de9` | `#3760bf` | `#587539` | `#f52a65` | `#7847bd` |
+| `one-light` | One Light | Light | Option | `#fafafa` | `#ffffff` | `#4078f2` | `#383a42` | `#50a14f` | `#e45649` | `#a626a4` |
+| `solarized-light` | Solarized Light | Light | Option | `#fdf6e3` | `#fefbf1` | `#268bd2` | `#657b83` | `#859900` | `#dc322f` | `#d33682` |
+| `kanagawa-lotus` | Kanagawa Lotus | Light | Option | `#f2ecbc` | `#f7f3d7` | `#4d699b` | `#545464` | `#6f894e` | `#c84053` | `#624c83` |
+| `rose-pine-dawn` | Rosé Pine Dawn | Light | Option | `#faf4ed` | `#fffaf3` | `#907aa9` | `#464261` | `#286983` | `#b4637a` | `#907aa9` |
+
+- **Per-Host Theme Override (Optional):** Users can set their global theme in Settings (defaulting to `Gruvbox Dark`) and optionally assign a distinct theme per machine (e.g., `Gruvbox Dark` on `workbox`, `Tokyo Night` on `gpu-rig`, `Rosé Pine` on `prod-bastion`) for instant visual context awareness.
+
+---
+
+## Part IV: Mosh UDP Connection Backbone, Always-On Backgrounding & Roaming
+
+### 1. Mosh (`mosh-server` / UDP SSP) as the Primary Connection Backbone
+
+When `mosh-server` is available on the remote machine and UDP is reachable, **Mosh is used as the primary connection backbone**, paired with Herdr's control API (`herdr remote-api-bridge`). When `mosh-server` is unavailable or UDP is blocked by a captive portal/firewall, the app automatically falls back to Herdr's SSH Endpoint Bridge (`herdr remote-client-bridge`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Tablet as Herdr Tablet App (Mosh + Control Engine)
+    participant SSH as Remote sshd (TCP :22)
+    participant MoshSrv as Remote mosh-server (UDP :60000-61000)
+    participant HerdrSrv as Remote Herdr Daemon (herdr.sock)
+
+    Note over Tablet,HerdrSrv: Phase 1: SSH Bootstrap & Mosh Discovery
+    Tablet->>SSH: SSH Exec: probe `command -v mosh-server` + launch `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -- herdr` (with headless/pane-only chrome env)
+    SSH->>MoshSrv: Spawns detached mosh-server attached to `herdr`
+    MoshSrv-->>SSH: Prints `MOSH CONNECT <udp_port> <base64_aes_ocb_key>`
+    SSH-->>Tablet: Returns `<udp_port>` + `<aes_ocb_key>`
+
+    Note over Tablet,HerdrSrv: Phase 2: Mosh UDP SSP Backbone Active (Primary)
+    Tablet->>MoshSrv: Encrypted UDP SSP Datagrams (AES-128-OCB)\nTerminal frames (parsed via libghostty-vt), keystrokes, resize, & predictive echo
+    MoshSrv<<->>HerdrSrv: Attached to Herdr Session (`herdr-client.sock`)
+
+    Note over Tablet,HerdrSrv: Phase 3: Multiplexed Herdr Control Sideband
+    Tablet->>SSH: `herdr remote-api-bridge` (`events.subscribe` NDJSON stream + JSON-RPC)
+    SSH<<->>HerdrSrv: Streams workspace/tab/pane/agent state + `pane.layout` geometry + executes split/send/focus RPCs
+
+    Note over Tablet,MoshSrv: Phase 4: Tablet Roams (Wi-Fi -> 5G) or Sleeps/Wakes
+    Tablet->>MoshSrv: Next UDP packet from new IP:port immediately updates peer address (0ms reconnect!)
+    Tablet->>SSH: Re-establishes lightweight API sideband in background without interrupting terminal
+```
+
+#### Why Mosh Backbone + Herdr Sideband is the Ultimate Tablet Architecture
+1. **True Zero-Handshake UDP Roaming (Mosh SSP):**
+   - Once bootstrapped via SSH (`MOSH CONNECT <port> <key>`), the Mosh session runs purely over **UDP** using Mosh's State Synchronization Protocol (SSP) encrypted with AES-128-OCB.
+   - When you walk out of Wi-Fi range onto 5G, switch VPNs/Tailscale, or close the tablet cover for hours, the very first UDP datagram sent from the tablet's new IP address updates `mosh-server`'s source address. **The terminal never disconnects, never re-runs SSH key exchange, and never drops a keystroke.**
+2. **Client-Side Predictive Echo on High-Latency Links:**
+   - Mosh's SSP engine predicts printable typing and cursor movement locally on the tablet and underlines tentative predictions until acknowledged by the remote frame diff—eliminating typing lag on cellular or cross-continent connections.
+3. **Unified `PaneSurfaceFrame` Synthesis (Inner TUI Chrome Hidden + `pane.layout` Geometry):**
+   - When launched by the tablet under `mosh-server`, `herdr` suppresses its inner text-mode sidebar and tab bar so 100% of the Mosh terminal grid is dedicated to the active tab's panes.
+   - Inside `rust/herdr-mobile-core`, the Mosh SSP framebuffer is parsed through `libghostty-vt` and combined with the Control Sideband's `pane.layout` (`PaneLayoutSnapshot`) to emit a standard `PaneSurfaceFrame` onto `PaneSurfaceBus`. As a result, **the Compose Zen Canvas UI, split-divider dragging, and touch overlays work identically whether connected via Mosh UDP or the SSH Endpoint fallback.**
+   - By pairing the **Mosh UDP Backbone** with the **Herdr Control Sideband** (`herdr remote-api-bridge`), the tablet gets **both**:
+     - **Mosh UDP Backbone:** Unbreakable terminal rendering, instant wake-from-sleep, and local predictive echo.
+     - **Herdr Control Sideband:** Full native tablet HUD (`session.snapshot`, `workspace.list`, `tab.list`, `pane.list`), live multi-agent status subscriptions (`events.subscribe` for `pane.agent_status_changed` / `layout.updated`), background agent prompt previews (`agent.read` / `pane.read`), native pane split/zoom gestures (`pane.split`, `pane.zoom`, `layout.set_split_ratio`), and structured prompt injection (`agent.prompt`, `pane.send_input`).
+   - **Graceful Degradation During Network Transitions:** If a network switch temporarily breaks the TCP control sideband, **the Mosh UDP terminal remains 100% live and interactive** while the background service transparently reconnects the TCP sideband.
+
+#### Automatic Transport Negotiation & Fallback (`AutoPreferMosh`)
+Each `HostMachine` profile supports a configurable `TransportMode` (`AutoPreferMosh` default, `MoshOnly`, or `SshEndpointOnly`) plus optional custom `moshServerPath` and `moshUdpPortRange` (`60000..61000` default):
+
+| Step | Action | Outcome |
+|---|---|---|
+| **1. Probe & Bootstrap** | Over the initial SSH session, run `command -v mosh-server` (or configured custom path). If found, invoke `mosh-server new -s -c 256 -p <port_range> -- herdr` and parse `MOSH CONNECT <port> <key>`. | Obtains UDP port and 128-bit AES-OCB session key. |
+| **2. UDP Reachability Handshake (`1,500 ms` budget)** | Send initial Mosh SSP heartbeat datagram to `<host>:<udp_port>` and await SSP ack. | If acked within `1.5s`, **lock in `TransportActive.MoshBackbone`** (badge: `MOSH · UDP`). |
+| **3. Automatic SSH Endpoint Fallback** | If `mosh-server` is not installed on the remote host, or if a strict corporate/hotel firewall drops UDP packets on `60000–61000`: | Immediately fall back to **`TransportActive.SshEndpoint`** (`herdr remote-client-bridge` over SSH TCP with `surface_delta` + `NetworkCallback` roaming) and show a non-intrusive status badge (`SSH · TCP (Mosh UDP unavailable)`). |
+
+---
+
+### 2. Connection Lifecycle State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> ConnectingBootstrap: Connect Requested
+    
+    state ConnectingBootstrap {
+        [*] --> SshAuthAndProbe
+        SshAuthAndProbe: Authenticate SSH + Probe `mosh-server`
+        SshAuthAndProbe --> MoshUdpHandshake: `MOSH CONNECT <port> <key>` received
+        SshAuthAndProbe --> SshEndpointActive: `mosh-server` missing or disabled
+        MoshUdpHandshake --> MoshBackboneActive: UDP SSP Ack (<1.5s)
+        MoshUdpHandshake --> SshEndpointActive: UDP Blocked / Timeout -> Fallback
+    }
+
+    state ForegroundActive {
+        MoshBackboneActive: Primary: Mosh UDP SSP + Herdr API Sideband\nInstant UDP IP Roaming + Predictive Echo
+        SshEndpointActive: Fallback: Herdr Endpoint Gen 1 over SSH\nsurface_delta + surface_reuse + surface_scroll
+    }
+
+    ForegroundActive --> BackgroundParked: App Backgrounded (onStop)
+    
+    state BackgroundParked {
+        [*] --> ControlOnlyLease
+        ControlOnlyLease: Android ForegroundService Active\nMosh UDP: zero-traffic idle suspend (session stays alive on server)\nHerdr Endpoint: client_shell.surface.set(active: false)\nReceives SemanticNotifications & Agent Events
+    }
+
+    BackgroundParked --> ForegroundActive: App Resumed (onStart)\nMosh UDP: single datagram wakes stream (<20ms)\nEndpoint: surface.set(active: true) (<50ms)
+
+    ForegroundActive --> RoamingHandoff: Wi-Fi / Cellular / Tailscale Switch
+    BackgroundParked --> RoamingHandoff: Network Change Detected
+
+    state RoamingHandoff {
+        [*] --> SeamlessResume
+        SeamlessResume: Mosh Backbone: Next UDP packet updates server peer IP (0ms downtime)\nSSH Fallback / Control Sideband: Retain screen state + NetworkCallback fast reconnect
+    }
+
+    RoamingHandoff --> ForegroundActive: Stream Synced
+```
+
+### 3. Zero-Bandwidth Background Parking (`Mosh Suspend` + `surface_interest`)
+
+Both transport backbones are engineered so backgrounding the tablet app consumes **zero terminal rendering bandwidth** while never losing your session:
+
+1. **When Connected via Mosh UDP Backbone (`MoshBackboneActive`):**
+   - Mosh's SSP protocol is naturally pull/ack-driven: when the tablet app enters `BackgroundParked` (`onStop()`), the Mosh client stops sending frame acknowledgments and pauses its UDP heartbeat timer.
+   - `mosh-server` on the remote host immediately pauses frame diff transmission (consuming 0 bytes/sec on cellular) while keeping the `herdr` session and `mosh-server` process alive indefinitely.
+   - The instant the user wakes the tablet (`onStart()`), a single UDP SSP datagram resumes synchronization from the last acknowledged state number and paints the latest screen in `<20ms`.
+2. **When Connected via SSH Endpoint Fallback (`SshEndpointActive`):**
+   - Sends `{"id": "bg_lease", "method": "client_shell.surface.set", "params": {"active": false}}`.
+   - On the Herdr server (`src/server/headless/surface_interest.rs`), `set_client_shell_surface_active(client_id, false)` stops all `PaneSurfaceFrame` / `PaneSurfacePatch` rendering traffic while keeping the control socket open.
+   - On `onStart()`, sending `client_shell.surface.set { active: true }` pushes a fresh coherent `PaneSurfaceFrame` in `<50ms` without re-running the SSH handshake, followed by `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }` once the frame is committed to release the server's `presentation_effects_fence`.
+3. **Actionable Android System Notifications (`HerdrConnectionService`):**
+   - Runs as a persistent `connectedDevice` / `specialUse` `ForegroundService` (*"Herdr: 2 machines (Mosh UDP) · 1 agent working"*).
+   - When an agent transitions to `Blocked` or `Done` (`SemanticNotification` or `events.subscribe` `pane.agent_status_changed`), posts a native Android notification with direct `PendingIntent` actions:
+     - **Approve (`Enter`)** — sends `Enter` to the blocked pane in the background (via `ClientMessage::ClientShellPaneInput` or `pane.send_keys` / `agent.send_keys`).
+     - **Inline Reply (`RemoteInput`)** — lets the user type or dictate a reply directly from the notification shade or smartwatch.
+
+### 4. Roaming & Network Handoff Resilience
+
+1. **Instant IP Roaming on Mosh UDP:**
+   - Switching from home Wi-Fi to 5G cellular, or toggling a Tailscale/WireGuard tunnel, requires **zero reconnection** on the Mosh UDP backbone. Mosh's SSP layer authenticates each datagram via its AES-128-OCB sequence number and transparently migrates the remote peer endpoint.
+2. **Proactive `ConnectivityManager.NetworkCallback` for Control Sideband & SSH Fallback:**
+   - TCP streams (used by the Herdr API control sideband and the SSH Endpoint fallback) normally stall for 30–120 seconds when the tablet's source IP changes.
+   - `HerdrConnectionService` registers a `ConnectivityManager.NetworkCallback`. Whenever `onAvailable` or `onLinkPropertiesChanged` fires for a new default network:
+     - It immediately sends a Mosh UDP wakeup datagram on the new network interface so `mosh-server` learns the new IP right away.
+     - It proactively recycles the background TCP control sideband (or SSH fallback stream) without waiting for kernel TCP retransmit timeouts.
+3. **Retained Surface Store & Optimistic Prompt Queueing:**
+   - The last terminal frame and `ClientShellSnapshot` remain rendered on screen at all times—never blanked out by a modal disconnect screen.
+   - Prompts submitted in the **Native Prompt Composer** during a network handoff are queued locally per `(machine_id, pane_id)` and flushed automatically as soon as the stream acknowledges.
+
+---
+
+## Part V: Technical Stack, Project Structure (`SnapshotPB` Pattern) & Kodein DI
+
+The Android/KMP client follows the exact multi-module architecture, Gradle build-logic conventions, state management patterns, and **Kodein (`org.kodein.di`)** dependency injection structure established in `SnapshotPB`.
+
+### 1. Layered Module Graph & Directory Structure
+
+Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")`), the root of `/home/ian/workspace/herdr-tablet` hosts the Gradle multi-module project (`composite/`, `app/android/`, `core/*`, `platform/android/*`), while the upstream `herdrdev/herdr` Rust codebase and the JNI bridge crate live under `rust/`:
+
+- **App Target Strategy:** `:app:android` (plus `:app:android:baseline`) is the sole `app/` target built right now, while **all `:core:*` modules use `kotlinMultiplatform` (`commonMain` / `commonTest`)** so the vast majority of the codebase remains 100% platform-agnostic and portable to Desktop, iOS, or Web later without refactoring.
+
+```text
+/home/ian/workspace/herdr-tablet/
+├── settings.gradle.kts               # Root Gradle settings (TYPESAFE_PROJECT_ACCESSORS)
+├── build.gradle.kts                  # Root plugin declarations & Git-derived projectVersion
+├── gradle/libs.versions.toml         # Version catalog (Kotlin 2.3.20, Compose 1.10.3, Kodein 7.31.0, Nav3)
+├── composite/                        # Pre-published build-logic plugin (composite/m2) with SHA-256 source digest version
+│   └── src/main/kotlin/com/herdr/composite/
+│       ├── CompositePlugin.kt
+│       ├── task/LocalizationCheckTask.kt
+│       └── util/
+│           ├── OptIn.kt              # Central configureOptIns() for KMP & Android modules
+│           ├── StringResource.kt
+│           └── Version.kt            # Calendar/Git-derived projectVersion & projectVersionCode()
+├── rust/
+│   ├── herdr/                        # Upstream herdrdev/herdr Rust repository
+│   │   └── crates/
+│   │       ├── ghostty-vt/           # Vendored libghostty-vt bindings (with Android NDK zig target mappings)
+│   │       └── herdr-protocol/       # Extracted pure protocol crate (Endpoint Gen 1, wire, surface_delta/reuse/scroll)
+│   └── herdr-mobile-core/            # Hybrid Rust JNI crate (links herdr-protocol + ghostty-vt + Mosh UDP SSP client)
+├── app/
+│   └── android/                      # Android app entry (Application, MainActivity, HerdrConnectionService)
+│       ├── baseline/                 # Android Baseline Profile generator (:app:android:baseline)
+│       ├── src/main/kotlin/com/herdr/app/
+│       │   ├── Application.kt        # DIAware root, binds Application & StoreIOProviderAndroid(overrides = true)
+│       │   ├── AppModule.kt          # Imports coreDiModule, platformModule, screenModule, debugModule
+│       │   ├── AppTheme.kt
+│       │   ├── activity/MainActivity.kt
+│       │   ├── service/HerdrConnectionService.kt
+│       │   └── screen/ScreenModule.kt
+│       ├── src/debug/kotlin/com/herdr/app/
+│       │   ├── activity/DemoActivity.kt   # Launches MainActivity with EXTRA_FAKE_SERVER
+│       │   └── debug/DebugModule.kt       # Imports fakeServerModule (debug-only compile guarantee)
+│       └── src/release/kotlin/com/herdr/app/
+│           └── debug/DebugModule.kt       # Binds inert NoDebugServer (zero fake code in release APK)
+├── core/                             # All :core:* modules are Kotlin Multiplatform (commonMain / commonTest)
+│   ├── app-version/                  # Leaf KMP module with generated AppVersion stamp (avoids invalidating :core:common)
+│   ├── common/                       # Shared Compose UI ("Zen Canvas" Design 2), Themes (Gruvbox default), Nav3, ViewModels, Delegates
+│   ├── debug-server/                 # DebugServer seam (+ inert NoDebugServer); always on classpath
+│   ├── fake-server/                  # FakeHerdrServer behind DebugServer seam; debugImplementation only!
+│   ├── di/                           # Kodein DI root (coreDiModule -> sshCoreModule, storeModule, viewModelModule)
+│   ├── model/                        # @Serializable domain models (HostMachine, SshAuthMethod, ProxyJumpConfig, AppSettings, ...)
+│   ├── protocol/                     # KMP wrapper over rust/herdr-mobile-core (Endpoint Gen 1 JSON/Bincode & Surface Delta assembler)
+│   ├── resources/                    # Compose Multiplatform resources (strings.xml, icons, JetBrains Mono NerdFont)
+│   ├── ssh/                          # KMP Transport abstractions: SshRequestManager, SshStateManager, MoshSessionEngine, HardwareKeySigner
+│   ├── store/                        # MachineStore, AppSettingsStore, StoreIOProvider, AppJson (atomic Mutex + kotlinx-io)
+│   └── util/                         # Shared pure KMP utilities
+└── platform/
+    └── android/
+        ├── di/                       # Android platformModule (imports sshModule)
+        ├── ssh/                      # Android MoshUdpEngine (JNI), SshTransportManager, Keystore, YubiKey/FIDO2 NFC+USB, ProxyJump
+        └── store/                    # StoreIOProviderAndroid (Context file IO + ContentResolver)
+```
+
+#### Strict Layered Dependency Flow
+```mermaid
+flowchart TD
+    AppAndroid[":app:android"] --> CoreDi[":core:di"]
+    AppAndroid --> PlatformAndroidDi[":platform:android:di"]
+    AppAndroid -.->|"debugImplementation only"| CoreFakeServer[":core:fake-server"]
+    PlatformAndroidDi --> PlatformAndroidSsh[":platform:android:ssh"]
+    PlatformAndroidDi --> PlatformAndroidStore[":platform:android:store"]
+    PlatformAndroidSsh --> CoreSsh[":core:ssh"]
+    PlatformAndroidStore --> CoreStore[":core:store"]
+    CoreDi --> CoreCommon[":core:common"]
+    CoreDi --> CoreSsh
+    CoreDi --> CoreStore
+    CoreCommon --> CoreModel[":core:model"]
+    CoreCommon --> CoreStore
+    CoreCommon --> CoreSsh
+    CoreCommon --> CoreProtocol[":core:protocol"]
+    CoreCommon --> CoreResources[":core:resources"]
+    CoreSsh --> CoreProtocol
+    CoreSsh --> CoreModel
+    CoreFakeServer --> CoreDebugServer[":core:debug-server"]
+    CoreFakeServer --> CoreSsh
+```
+- **Rule:** `core/*` modules **never** import from `platform/*` or `app/*`. Shared code declares interfaces and event buses; platform code provides implementations wired via **Kodein** at runtime.
+- **`core:di` depends on `core:common`** (to bind ViewModels and Delegates), never the reverse.
+
+---
+
+### 2. Dependency Injection with Kodein (`org.kodein.di`)
+
+All dependency injection uses **Kodein** (`kodein-di`, `kodein-di-framework-compose`, `kodein-di-framework-compose-runtime`), matching `SnapshotPB`:
+
+#### A. Root Core Module (`:core:di` — `DI.kt`, `SshCoreModule.kt`, `StoreModule.kt`)
+```kotlin
+// core/di/src/commonMain/kotlin/com/herdr/di/DI.kt
+package com.herdr.di
+
+import com.herdr.store.appJson
+import org.kodein.di.DI
+import org.kodein.di.bindSingleton
+
+val coreDiModule = DI.Module("coreDiModule") {
+    import(sshCoreModule)
+    import(storeIOProviderModule)
+    import(storeModule)
+    import(viewModelModule)
+
+    // App-wide Json singleton configured with ignoreUnknownKeys = true and coerceInputValues = true
+    // so new optional server fields or unknown enum values in Endpoint Gen 1 never fail deserialization.
+    bindSingleton { appJson }
+}
+```
+
+```kotlin
+// core/di/src/commonMain/kotlin/com/herdr/di/SshCoreModule.kt
+package com.herdr.di
+
+import com.herdr.ssh.EndpointSnapshotBus
+import com.herdr.ssh.PaneSurfaceBus
+import com.herdr.ssh.SemanticNotificationBus
+import com.herdr.ssh.SshDebugLog
+import com.herdr.ssh.SshRequestManager
+import com.herdr.ssh.SshStateManager
+import org.kodein.di.DI
+import org.kodein.di.bindSingletonOf
+
+val sshCoreModule = DI.Module("sshCoreModule") {
+    bindSingletonOf(::SshStateManager)
+    bindSingletonOf(::SshRequestManager)
+    bindSingletonOf(::SshDebugLog)
+    bindSingletonOf(::EndpointSnapshotBus)
+    bindSingletonOf(::PaneSurfaceBus)
+    bindSingletonOf(::SemanticNotificationBus)
+}
+```
+
+```kotlin
+// core/di/src/commonMain/kotlin/com/herdr/di/StoreModule.kt
+package com.herdr.di
+
+import com.herdr.store.MachineStore
+import org.kodein.di.DI
+import org.kodein.di.bindSingleton
+import org.kodein.di.instance
+
+expect val storeIOProviderModule: DI.Module
+
+internal val storeModule = DI.Module("storeModule") {
+    bindSingleton {
+        MachineStore(
+            storeIOProvider = instance(),
+            json = instance(),
+        )
+    }
+}
+```
+
+#### B. ViewModel & Delegate Module (`:core:di` — `ViewModelModule.kt`)
+ViewModels stay thin and receive runtime navigation arguments via Kodein's `bindFactory`, while shared business logic lives in singleton Delegate interfaces (`MachineViewModelDelegate`, `AgentActionDelegate`, `SurfaceSessionDelegate`):
+
+```kotlin
+// core/di/src/commonMain/kotlin/com/herdr/di/ViewModelModule.kt
+package com.herdr.di
+
+import com.herdr.common.screen.delegate.AgentActionDelegate
+import com.herdr.common.screen.delegate.AgentActionDelegateImpl
+import com.herdr.common.screen.delegate.MachineViewModelDelegate
+import com.herdr.common.screen.delegate.MachineViewModelDelegateImpl
+import com.herdr.common.screen.machine.ConfigureMachineViewModel
+import com.herdr.common.screen.machine.ConnectingMachineViewModel
+import com.herdr.common.screen.workspace.WorkspaceTerminalViewModel
+import org.kodein.di.DI
+import org.kodein.di.bindFactory
+import org.kodein.di.bindSingleton
+import org.kodein.di.instance
+
+val viewModelModule = DI.Module("viewModelModule") {
+    bindFactory<String, WorkspaceTerminalViewModel> { machineId: String ->
+        WorkspaceTerminalViewModel(
+            machineId = machineId,
+            machineStore = instance(),
+            sshStateManager = instance(),
+            paneSurfaceBus = instance(),
+            machineViewModelDelegate = instance(),
+            agentActionDelegate = instance(),
+        )
+    }
+    bindFactory<String, ConfigureMachineViewModel> { machineId: String ->
+        ConfigureMachineViewModel(
+            machineId = machineId,
+            machineStore = instance(),
+            machineViewModelDelegate = instance(),
+        )
+    }
+    bindFactory<String, ConnectingMachineViewModel> { machineId: String ->
+        ConnectingMachineViewModel(
+            machineId = machineId,
+            sshStateManager = instance(),
+            machineStore = instance(),
+            machineViewModelDelegate = instance(),
+        )
+    }
+    bindSingleton<MachineViewModelDelegate> {
+        MachineViewModelDelegateImpl(
+            machineStore = instance(),
+            sshRequestManager = instance(),
+            endpointSnapshotBus = instance(),
+        )
+    }
+    bindSingleton<AgentActionDelegate> {
+        AgentActionDelegateImpl(
+            sshRequestManager = instance(),
+            semanticNotificationBus = instance(),
+        )
+    }
+}
+```
+
+#### C. Platform Android DI Module (`:platform:android:di` — `PlatformModule.kt`, `SshModule.kt`)
+```kotlin
+// platform/android/di/src/main/kotlin/com/herdr/di/PlatformModule.kt
+package com.herdr.di
+
+import org.kodein.di.DI
+
+val platformModule = DI.Module("platformModule") {
+    import(sshModule)
+}
+
+// platform/android/di/src/main/kotlin/com/herdr/di/SshModule.kt
+internal val sshModule = DI.Module("sshModule") {
+    bindSingleton {
+        MoshUdpEngine(
+            sshDebugLog = instance(),
+            paneSurfaceBus = instance(),
+        )
+    }
+    bindSingleton {
+        SshTransportManager(
+            context = instance<android.app.Application>(),
+            moshUdpEngine = instance(),
+            sshStateManager = instance(),
+            sshDebugLog = instance(),
+            endpointSnapshotBus = instance(),
+            paneSurfaceBus = instance(),
+            semanticNotificationBus = instance(),
+        )
+    }
+}
+```
+
+#### D. Android Application, Activity & Compose Wiring (`:app:android`)
+```kotlin
+// app/android/src/main/kotlin/com/herdr/app/Application.kt
+package com.herdr.app
+
+import com.herdr.store.StoreIOProvider
+import com.herdr.store.StoreIOProviderAndroid
+import com.toxicbakery.logging.Arbor
+import com.toxicbakery.logging.LogCatSeedling
+import org.kodein.di.DI
+import org.kodein.di.DIAware
+import org.kodein.di.bindProvider
+import org.kodein.di.instance
+
+class Application : android.app.Application(), DIAware {
+
+    override val di: DI by DI.lazy {
+        bindProvider<Application> { this@Application }
+        import(appModule)
+
+        // Inject Android-specific StoreIOProvider
+        bindProvider<StoreIOProvider>(overrides = true) {
+            StoreIOProviderAndroid(
+                context = instance<Application>()
+            )
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            Arbor.sow(LogCatSeedling())
+        }
+        log.d { "Herdr Application started" }
+    }
+
+    companion object {
+        private val log = Arbor.tag("Application")
+    }
+}
+```
+
+In `MainActivity.kt`, `closestDI()` resolves the `Application`'s Kodein container, and `withDI(di)` exposes it to the Compose tree so any `@Composable` can use `rememberInstance()` and `rememberViewModel(arg = ...)`:
+
+```kotlin
+// Inside MainActivity.onCreate:
+setContent {
+    withDI(di) {
+        AppTheme {
+            Box(Modifier.safeDrawingPadding()) {
+                App(onExitRequested = { finish() })
+            }
+        }
+    }
+}
+
+// Inside any @Composable screen in :core:common:
+@Composable
+fun WorkspaceTerminalScreen(
+    navigationController: NavigationController,
+    machineId: String,
+) {
+    val viewModel: WorkspaceTerminalViewModel by rememberViewModel(arg = machineId)
+    val machineStore: MachineStore by rememberInstance()
+    // ...
+}
+```
+
+---
+
+### 3. Core Architectural Patterns (`SnapshotPB` Conventions)
+
+#### A. `SshRequestManager` + `SshStateManager` Cross-Layer Bus Pattern
+Just as `SnapshotPB` isolates BLE behind `BluetoothRequestManager` and `BluetoothStateManager`, shared code in `:core:common` never touches Android services, sockets, or `ConnectivityManager` directly:
+- **`SshRequestManager`** exposes a `SharedFlow<SshRequest>` event bus:
+  - `SshRequest.Connect(machineId)`
+  - `SshRequest.Disconnect(machineId)`
+  - `SshRequest.SetSurfaceLease(machineId, active: Boolean)`
+  - `SshRequest.SendEndpointCommand(machineId, request: ClientShellEndpointRequest)`
+  - `SshRequest.SendPaneInput(machineId, paneId, event: ClientPaneInputEvent)`
+  - `SshRequest.ResizeShell(machineId, cols: UShort, rows: UShort)`
+- **`HerdrConnectionService` / `MainActivity`** collects `sshRequestManager.bus` inside `runCatching` (re-throwing `CancellationException` so one failed request never kills the collector coroutine) and dispatches to `debugServer.handle(request)` or `sshTransportManager`.
+- **`SshStateManager`** exposes reactive `StateFlow`s consumed by ViewModels:
+  - `connectedMachines: StateFlow<Set<String>>`
+  - `activeTransportBackbone: StateFlow<Map<String, ActiveBackbone>>` (`MoshUdp(udpPort, rttMs, localEchoEnabled)` primary when `mosh-server` is available, or `SshEndpoint(rttMs)` fallback)
+  - `connectionProgress: StateFlow<Map<String, ConnectionProgress>>` (4-step progress: `AuthenticatingSsh` → `BootstrappingMoshOrBridge` → `VerifyingUdpOrHello` → `SyncingHerdrSnapshot`, surfaced in `ConnectingMachineScreen`)
+  - `roamingState: StateFlow<Map<String, RoamingStatus>>` (`Healthy`, `SurfaceParked`, `RoamingReconnect`)
+
+#### B. Atomic `MachineStore` with `Mutex`, `kotlinx-io`, and `awaitLoaded()`
+Modeled directly on `SnapshotPB`'s `DeviceStore`:
+- Holds `knownMachines: StateFlow<List<HostMachine>>` and mutates it exclusively via side-effect-free `MutableStateFlow.update {}` CAS blocks.
+- Tracks initial load completion via `private val initialLoad = CompletableDeferred<Unit>()` and exposes `suspend fun awaitLoaded()` + `isLoaded: StateFlow<Boolean>` so background services (`HerdrConnectionService`) never mistake an uninitialized store for an empty host list.
+- Serializes disk writes with a coroutine `Mutex` on `storeIoDispatcher` (`expect`/`actual`), writing atomically to a temporary file before moving over `machines.json`, and moving corrupt files aside without clobbering user data.
+
+#### C. Compile-Time Isolated Simulated Server (`:core:debug-server` + `:core:fake-server`)
+Modeled on `SnapshotPB`'s `DebugBoard` / `FakeBoard`:
+- `:core:debug-server` defines the `DebugServer` interface and `NoDebugServer` inert object.
+- `:core:fake-server` implements `FakeHerdrServer`, simulating multiple SSH hosts (`workbox`, `gpu-rig`), workspaces, BSP split layouts, live terminal cell animations, and coding agents (`claude`, `codex`) cycling through `working`, `blocked` (with permission prompts), and `done`.
+- `:app:android` depends on `:core:fake-server` via `debugImplementation(projects.core.fakeServer)`.
+- In debug builds, tapping the **Herdr Demo** launcher icon (`DemoActivity`) launches `MainActivity` with `EXTRA_FAKE_SERVER = true`. Release builds bind `NoDebugServer` in `src/release/kotlin/.../DebugModule.kt`, guaranteeing at compile time that no fake server code ships in production.
+
+#### D. Type-Safe Navigation with `androidx.navigation3`
+Modeled on `SnapshotPB/core/common/.../navigation/Screens.kt` and `Controller.kt`:
+```kotlin
+sealed class ScreenKey : NavKey
+
+@Serializable
+data object ScreenKeyMachineFederation : ScreenKey()
+
+@Serializable
+data class ScreenKeyWorkspaceTerminal(
+    val machineId: String,
+    val workspaceId: UInt? = null,
+) : ScreenKey()
+
+@Serializable
+data class ScreenKeyConnectingMachine(
+    val machineId: String,
+) : ScreenKey()
+
+@Serializable
+data class ScreenKeyMachineConfigure(
+    val machineId: String,
+) : ScreenKey()
+```
+- `App.kt` hosts `NavDisplay` with `rememberNavBackStack`, `rememberSaveableStateHolderNavEntryDecorator()`, and `rememberViewModelStoreNavEntryDecorator()`.
+- Responsive tablet layout uses `fitsTwoPanes(maxWidth, maxHeight)` (`maxWidth > maxHeight && maxWidth >= 600.dp`) to automatically adapt between landscape multi-pane tablet mode and compact single-column mode.
+
+#### E. Hybrid Rust JNI Core, SSH Authentication Suite & Rendering Subsystems
+
+1. **Hybrid Rust JNI Core (`rust/herdr-mobile-core` → `:core:protocol` & `:platform:android:ssh`):**
+   - Links the extracted pure **`rust/herdr/crates/herdr-protocol`** crate (avoiding desktop daemon dependencies like `zbus`, `portable-pty`, `interprocess`, and `crossterm`) and **`rust/herdr/crates/ghostty-vt`** (with Android NDK `aarch64-linux-android` / `x86_64-linux-android` target mappings in `build.rs`) to provide zero-drift Endpoint Generation 1 handshake (`endpoint.hello.v1` / `endpoint.welcome.v1`), `ClientShellSnapshot` (`shell.snapshot.v1`), and stateful cell buffer reconstruction (`PaneSurfaceFrame` + `endpoint.surface-delta.v1` / `endpoint.surface-reuse.v1` / `endpoint.surface-scroll.v1`).
+   - Includes the native **Mosh UDP SSP (`AES-128-OCB`) client engine** with client-side predictive echo, instant source-IP roaming, and `PaneSurfaceFrame` synthesis from `libghostty-vt` + `pane.layout`.
+
+2. **Full v1 SSH Authentication, ProxyJump & Hardware Key Suite (`:core:ssh` + `:platform:android:ssh`):**
+   - **Android Keystore Private Keys:** On-device generation and PEM/OpenSSH import of `Ed25519`, `RSA` (2048/4096), and `ECDSA` keys backed by hardware `AndroidKeyStore` (with optional biometric prompt unlock).
+   - **Password & Key Passphrase Authentication:** Encrypted credential storage plus interactive keyboard-interactive / passphrase prompts.
+   - **Tailscale / WireGuard & SSH Jump Hosts (`ProxyJump`):** Direct connection over Tailscale `100.x.y.z` / MagicDNS hostnames, plus multi-hop SSH bastion tunneling (`ProxyJump` / `direct-tcpip` channel forwarding) for both the SSH bootstrap and Herdr Control Sideband.
+   - **Hardware Security Keys (YubiKey / FIDO2 over NFC & USB-C):** Supports OpenSSH FIDO2 resident and non-resident keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) and PIV smartcard authentication via Android NFC / USB CTAP2/PIV. When a hardware key signature is requested during SSH auth, `SshRequest.PromptHardwareKeyTouch` triggers a floating sheet prompting the user to tap or touch their YubiKey.
+
+3. **Hardware-Accelerated Compose Terminal Canvas (`:core:common/.../terminal/`):**
+   - Renders `FrameData` cells using pre-shaped monospace glyph atlases, truecolor RGB (`0x02_RR_GG_BB`), 256-color palette (`0x01_00_00_XX`), curly underlines, Kitty graphics placements (`SurfaceGraphicsAsset`), and interactive split-handle overlays.
+
+---
+
+## Part VI: Implementation Phasing & Roadmap
+
+### Phase 1: Workspace Restructure (`rust/herdr`), KMP Multi-Module Scaffold & Kodein DI Graph
+- Move the cloned `herdrdev/herdr` Rust repo into `rust/herdr/`, extract the shared `rust/herdr/crates/herdr-protocol` crate, enable `client_shell = true` on agent/pane read & prompt operations in `rust/herdr/src/api/schema.rs`, and add Android NDK target mappings to `rust/herdr/crates/ghostty-vt/build.rs`.
+- Scaffold the KMP Gradle root in `/home/ian/workspace/herdr-tablet` (`settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml`, and `composite/` build-logic plugin).
+- Scaffold KMP `:core:*` modules (`:core:model`, `:core:store` with `MachineStore` + `AppSettingsStore` defaulting to `Gruvbox Dark`, `:core:ssh`, `:core:protocol`, `:core:debug-server`, `:core:fake-server`, `:core:resources`, `:core:common`, `:core:di`) and Android modules (`:platform:android:store`, `:platform:android:ssh`, `:platform:android:di`, `:app:android`, `:app:android:baseline`).
+
+### Phase 2: Hybrid Rust JNI Core (`rust/herdr-mobile-core`), Mosh UDP Backbone & SSH Auth Suite
+- Create `rust/herdr-mobile-core` exposing Herdr's Endpoint Generation 1 `bincode` / `surface_delta` state machine and the Mosh UDP SSP + `libghostty-vt` client over JNI.
+- Implement SSH bootstrap (`command -v mosh-server` + `mosh-server new -s -c 256 -- herdr` with inner TUI chrome hidden), `MOSH CONNECT <port> <key>` parser, `herdr remote-api-bridge` multiplexed control sideband, automatic fallback to `herdr remote-client-bridge`, and the full SSH authentication suite (Android Keystore Ed25519/RSA/ECDSA, Password/Passphrase, Tailscale + `ProxyJump` bastion hopping, and YubiKey/FIDO2 NFC/USB signing).
+- Implement `HerdrConnectionService` (`ForegroundService`), `ConnectivityManager.NetworkCallback` roaming supervisor, and zero-bandwidth background parking (`Mosh Suspend` + `client_shell.surface.set` + `endpoint.presentation.ready.v1`).
+
+### Phase 3: "Zen Canvas" (Design 2) UI, Terminal Renderer & All 19 Color Themes (`:core:common`)
+- Build the hardware-accelerated Compose `TerminalSurfaceCanvas` (cells, cursor shapes, scrollbars, Kitty graphics, and touch hit-testing) and wire all 18 Herdr color palettes from `src/app/state.rs` + `OLED Pitch Black` with **`Gruvbox Dark` as default**.
+- Build the **Design 2 ("Zen Canvas")** floating chrome: Top Host/Mosh/Workspace HUD Pill, Right Agent Attention Pill + Slide-Over Federated Agent Command Center Drawer, and draggable BSP split dividers (`layout.set_split_ratio`, `pane.zoom`, `pane.split`).
+
+### Phase 4: Split-Thumb Floating Controls, Prompt Composer & Notifications
+- Build the ergonomic **Left & Right Split-Thumb Floating Key Clusters** (sticky/chorded `Ctrl`/`Alt`/`Shift`/`Esc`/`Tab` + swipe arrow trackpad).
+- Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste, and offline Mosh roaming queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
