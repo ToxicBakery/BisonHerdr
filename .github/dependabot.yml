@@ -1,0 +1,27 @@
+# Dependabot keeps the GitHub Actions in .github/workflows and Gradle dependencies up to date.
+# The third-party actions are pinned to full commit SHAs, with the tag in a trailing comment.
+# Dependabot changes the SHA and the comment together when a new release comes out.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: "gradle"
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    groups:
+      gradle:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(deps)"

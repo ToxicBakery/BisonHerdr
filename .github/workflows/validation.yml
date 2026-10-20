@@ -1,0 +1,157 @@
+name: Validate Pull Request
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, reopened, synchronize ]
+  # A push to main runs the same matrix and writes the Gradle caches. A PR job restores
+  # the newest entry that has the same job id, workflow name and matrix values, so each
+  # target reads the entry that its own main run wrote.
+  push:
+    branches: [ main ]
+
+# Cancel an in-flight PR matrix when the PR gets a new push, because the older commit is
+# superseded. Do not cancel a run on main: it writes the Gradle caches that the PR jobs read,
+# and a cancelled main run leaves the PR jobs with an older cache.
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Each job gets only the token scopes that it needs.
+permissions:
+  contents: read
+
+jobs:
+  # The scripts under scripts/ have unit tests (e.g. cut_version.py). release.yml runs
+  # the tests before it cuts a tag. This job runs them on a PR that changes scripts/ too,
+  # so that a defect shows before the release day.
+  scripts:
+    name: Validate (release scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # A PR checks out its merge commit. Depth 2 also gets the two parents of that commit,
+          # so the next step can compare the PR with its base without a second fetch.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Find changes under scripts/
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # A push to main or a manual run always runs the tests. A PR runs them only when
+          # it changes a file under scripts/ or this workflow.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only HEAD^1 HEAD | grep -qE '^(scripts/|\.github/workflows/validation\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v7
+        if: steps.changes.outputs.run == 'true'
+        with:
+          python-version: '3.x'
+
+      - name: Test the release scripts
+        if: steps.changes.outputs.run == 'true'
+        run: python3 -m unittest discover -s scripts/tests
+
+  validate:
+    name: Validate (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # setup-gradle writes a PR comment when a job fails (add-job-summary-as-pr-comment).
+      # GitHub Actions cannot set a permission from an expression, so a push run on main
+      # also gets this scope. The push run writes no comment.
+      pull-requests: write
+    strategy:
+      # One target failing shouldn't cancel the others — surface every target's result in one run.
+      fail-fast: false
+      matrix:
+        # Each target family builds on its OWN runner:
+        #   jvm     — composite build-logic unit tests, :core:resources:localizationCheck, and all
+        #             KMP/JVM unit tests across :core:* modules
+        #   android — :app:android debug and release APKs, compile checks of the baseline profile
+        #             generator and Android instrumented tests, unit tests for :platform:android:ssh
+        #             and :app:android, plus `lint` across all modules
+        include:
+          - target: jvm
+            tasks: ":core:app-version:check :core:common:check :core:di:check :core:fake-server:check :core:model:check :core:protocol:check :core:resources:localizationCheck :core:ssh:check :core:store:check :core:util:check"
+          - target: android
+            tasks: ":app:android:assembleDebug :app:android:assembleRelease :app:android:baseline:compileBenchmarkReleaseKotlin :app:android:compileDebugAndroidTestKotlin :platform:android:ssh:testDebugUnitTest :app:android:testDebugUnitTest lint"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          lfs: 'true'
+          submodules: 'true'
+          # The build runs third-party Gradle plugins. Do not keep the token in .git/config.
+          persist-credentials: false
+
+      # The JetBrains JDK, not Temurin: gradle/gradle-daemon-jvm.properties makes the Gradle
+      # daemon run on a JetBrains JDK 21. With a different JDK here, Gradle downloads that
+      # JDK through the foojay API, and only the Gradle cache hides a failure of that
+      # download. On 2026-10-08 foojay had no JetBrains JDK 21.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: 'jetbrains'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          # The action's default package list still asks for the obsolete 'tools' package, which
+          # Google removed from the SDK repository. sdkmanager then fails the job before Gradle runs.
+          packages: 'platform-tools'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          # Only a run on main writes the caches. A PR run reads them, so parallel PR jobs
+          # cannot evict the main entries, and every PR job skips the slow cache-save step.
+          # The configuration cache is not stored: setup-gradle stores it only with an
+          # encryption key, and the entry would be invalid on the next commit in any case,
+          # because resolveProjectVersion() puts the `git describe` output into the build inputs.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          add-job-summary-as-pr-comment: 'on-failure'
+
+      # `composite` is a SEPARATE Gradle build with its own settings.gradle.kts, consumed as a
+      # pre-published jar from composite/m2 rather than via includeBuild. No root task reaches it,
+      # so its unit tests would never run. They guard the rules that decide whether
+      # :core:resources:localizationCheck fails the build, the version mapping, and the parity
+      # of the two buildLogicVersion() copies, so run them on the jvm target.
+      # --no-daemon: the composite build has different org.gradle.jvmargs, so it cannot reuse
+      # the daemon of the root build. Without this flag a second daemon stays in memory for the
+      # full jvm build.
+      - name: Test build logic (composite)
+        if: matrix.target == 'jvm'
+        run: ./gradlew -p composite test --no-daemon --stacktrace -Dorg.gradle.console=plain
+
+      - name: Build ${{ matrix.target }}
+        run: ./gradlew ${{ matrix.tasks }} --stacktrace -Dorg.gradle.console=plain
+
+      # The console gives only the name of a failed test. The reports hold the message and the
+      # stack trace, so a failed job keeps them. The glob also gets the reports of the composite
+      # build. The artifact needs no token scope, and this job reads no secret, so the reports
+      # hold none.
+      - name: Upload the test and lint reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-${{ matrix.target }}
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+            **/build/reports/lint-results-*
+            !**/node_modules/**
+          if-no-files-found: ignore
+          retention-days: 14
