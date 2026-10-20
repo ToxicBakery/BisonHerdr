@@ -1,8 +1,5 @@
 package com.toxicbakery.app.bison.common.screen.workspace
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +19,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -84,58 +84,20 @@ fun WorkspaceTerminalScreen(
     BisonTheme(palette = themePalette) {
         val palette = LocalBisonPalette.current
         val fontSizeSp = activeMachine?.fontSizeSp ?: appSettings.defaultFontSizeSp
-        val hudOpacity = if (state.isTypingHudFaded && appSettings.autoFadeHudWhileTyping) 0.42f else 1f
+        val hudOpacity = if (state.isTypingHudFaded && appSettings.autoFadeHudWhileTyping) 0.85f else 1f
+        var keyboardTriggerCount by remember { mutableIntStateOf(0) }
         val focusedAgent = activeSnapshot?.let { snap ->
             val fPaneId = snap.focusedPaneId ?: activeSurfaceFrame?.panes?.firstOrNull { it.focused }?.paneId
             snap.agents.firstOrNull { it.paneId == fPaneId } ?: snap.agents.firstOrNull { it.focused }
         }
 
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(palette.terminalBg)
                 .testTag("workspaceTerminalScreen"),
         ) {
-            // 1. Full-Bleed 120Hz Hardware-Accelerated Terminal Surface Canvas (96%+ Screen Area)
-            TerminalSurfaceCanvas(
-                surfaceFrame = activeSurfaceFrame,
-                fontSizeSp = fontSizeSp,
-                predictiveEchoUnderlines = appSettings.predictiveEchoUnderlines,
-                onPaneFocus = { paneId ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.FocusPane(paneId))
-                },
-                onPaneZoomToggle = { paneId ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.TogglePaneZoom(paneId))
-                },
-                onSplitRatioChanged = { path, ratio ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.UpdateSplitRatio(path, ratio))
-                },
-                onFontSizeChange = { newFontSize ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.UpdateFontSize(newFontSize))
-                },
-                onSurfaceResize = { cols, rows, cellW, cellH ->
-                    viewModel.onEvent(
-                        WorkspaceTerminalViewModel.Event.ResizeViewport(
-                            cols = cols,
-                            rows = rows,
-                            cellWidthPx = cellW,
-                            cellHeightPx = cellH,
-                        )
-                    )
-                },
-                onPaneScroll = { paneId, offsetFromBottom ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.ScrollPane(paneId, offsetFromBottom))
-                },
-                onSelectionChanged = { selection ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.SelectionChanged(selection))
-                },
-                onCopySelectionRequest = { selection ->
-                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.CopySelection(selection))
-                },
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            // 2. Floating Top HUD Islands
+            // 1. Non-Overlapping Top Workspace ("Terminal Group") & Tab Bar
             ZenCanvasTopHud(
                 activeMachine = activeMachine ?: HostMachine(
                     id = state.activeMachineId,
@@ -148,8 +110,10 @@ fun WorkspaceTerminalScreen(
                 roamingStatus = roamingStatus,
                 workspaces = activeSnapshot?.workspaces.orEmpty(),
                 tabs = activeSnapshot?.tabs.orEmpty(),
+                panes = activeSnapshot?.panes.orEmpty(),
                 focusedWorkspaceId = activeSnapshot?.focusedWorkspaceId,
                 focusedTabId = activeSnapshot?.focusedTabId,
+                focusedPaneId = activeSnapshot?.focusedPaneId,
                 federatedAgents = federatedAgents,
                 hudOpacity = hudOpacity,
                 onSelectMachine = { id ->
@@ -176,6 +140,9 @@ fun WorkspaceTerminalScreen(
                 onCloseTab = { id ->
                     viewModel.onEvent(WorkspaceTerminalViewModel.Event.CloseTab(id))
                 },
+                onFocusPane = { id ->
+                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.FocusPane(id))
+                },
                 onSplitRight = {
                     viewModel.onEvent(WorkspaceTerminalViewModel.Event.SplitPane("right"))
                 },
@@ -191,37 +158,88 @@ fun WorkspaceTerminalScreen(
                 onToggleAgentDrawer = {
                     viewModel.onEvent(WorkspaceTerminalViewModel.Event.ToggleAgentDrawer)
                 },
-                modifier = Modifier.align(Alignment.TopCenter),
+                onRequestKeyboard = {
+                    keyboardTriggerCount++
+                },
             )
 
-            // 3. Slide-Over Floating Agent Command Center Drawer (Right Edge)
-            AnimatedVisibility(
-                visible = state.isAgentDrawerOpen,
-                enter = slideInHorizontally(initialOffsetX = { it }),
-                exit = slideOutHorizontally(targetOffsetX = { it }),
-                modifier = Modifier.align(Alignment.CenterEnd),
+            // 2. Unobstructed Hardware-Accelerated Terminal Surface Canvas + Slide-Over Agent Drawer
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
             ) {
-                AgentCommandCenterDrawer(
-                    agents = federatedAgents,
-                    onApproveAgent = { item ->
-                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.ApproveFederatedAgent(item))
+                TerminalSurfaceCanvas(
+                    surfaceFrame = activeSurfaceFrame,
+                    fontSizeSp = fontSizeSp,
+                    predictiveEchoUnderlines = appSettings.predictiveEchoUnderlines,
+                    keyboardTriggerCount = keyboardTriggerCount,
+                    onPaneFocus = { paneId ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.FocusPane(paneId))
                     },
-                    onRejectAgent = { item ->
-                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.RejectFederatedAgent(item))
+                    onPaneZoomToggle = { paneId ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.TogglePaneZoom(paneId))
                     },
-                    onJumpToAgentPane = { item ->
-                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.JumpToFederatedAgent(item))
+                    onSplitRatioChanged = { path, ratio ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.UpdateSplitRatio(path, ratio))
                     },
-                    onRefreshAgentSnippet = { item ->
-                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.RefreshAgentSnippet(item))
+                    onFontSizeChange = { newFontSize ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.UpdateFontSize(newFontSize))
                     },
-                    onCloseDrawer = {
-                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.SetAgentDrawerOpen(false))
+                    onSurfaceResize = { cols, rows, cellW, cellH ->
+                        viewModel.onEvent(
+                            WorkspaceTerminalViewModel.Event.ResizeViewport(
+                                cols = cols,
+                                rows = rows,
+                                cellWidthPx = cellW,
+                                cellHeightPx = cellH,
+                            )
+                        )
                     },
+                    onPaneScroll = { paneId, offsetFromBottom ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.ScrollPane(paneId, offsetFromBottom))
+                    },
+                    onSelectionChanged = { selection ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.SelectionChanged(selection))
+                    },
+                    onCopySelectionRequest = { selection ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.CopySelection(selection))
+                    },
+                    onTextInput = { typedText ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.TypeText(typedText))
+                    },
+                    onSpecialKey = { keyCode ->
+                        viewModel.onEvent(WorkspaceTerminalViewModel.Event.PressSpecialKey(keyCode))
+                    },
+                    modifier = Modifier.fillMaxSize(),
                 )
+
+                // Slide-Over Floating Agent Command Center Drawer (Right Edge)
+                if (state.isAgentDrawerOpen) {
+                    Box(modifier = Modifier.align(Alignment.CenterEnd)) {
+                        AgentCommandCenterDrawer(
+                            agents = federatedAgents,
+                            onApproveAgent = { item ->
+                                viewModel.onEvent(WorkspaceTerminalViewModel.Event.ApproveFederatedAgent(item))
+                            },
+                            onRejectAgent = { item ->
+                                viewModel.onEvent(WorkspaceTerminalViewModel.Event.RejectFederatedAgent(item))
+                            },
+                            onJumpToAgentPane = { item ->
+                                viewModel.onEvent(WorkspaceTerminalViewModel.Event.JumpToFederatedAgent(item))
+                            },
+                            onRefreshAgentSnippet = { item ->
+                                viewModel.onEvent(WorkspaceTerminalViewModel.Event.RefreshAgentSnippet(item))
+                            },
+                            onCloseDrawer = {
+                                viewModel.onEvent(WorkspaceTerminalViewModel.Event.SetAgentDrawerOpen(false))
+                            },
+                        )
+                    }
+                }
             }
 
-            // 4. Ergonomic Split-Thumb Floating Bottom Controls & Center Native Prompt Composer Pill
+            // 3. Non-Overlapping Ergonomic Split-Thumb Bottom Controls & Prompt Composer Bar
             if (appSettings.splitThumbLayoutEnabled) {
                 SplitThumbBottomBar(
                     modifierKeyState = state.modifierKeyState,
@@ -254,11 +272,10 @@ fun WorkspaceTerminalScreen(
                     onSubmitPrompt = { prompt, target ->
                         viewModel.onEvent(WorkspaceTerminalViewModel.Event.SubmitPrompt(prompt, target))
                     },
-                    modifier = Modifier.align(Alignment.BottomCenter),
                 )
             }
 
-            // 5. YubiKey / FIDO2 Hardware Security Key Touch Sheet
+            // 4. YubiKey / FIDO2 Hardware Security Key Touch Sheet
             val touchPrompt = hardwareKeyPrompt
             if (touchPrompt != null) {
                 HardwareSecurityKeyPromptSheet(

@@ -16,6 +16,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,21 +30,35 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.IntOffset
@@ -51,6 +68,7 @@ import com.toxicbakery.app.bison.common.theme.BisonThemePalette
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.CellData
+import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.CursorShape
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
@@ -91,6 +109,7 @@ fun TerminalSurfaceCanvas(
     surfaceFrame: PaneSurfaceFrame?,
     fontSizeSp: Float,
     predictiveEchoUnderlines: Boolean = true,
+    keyboardTriggerCount: Int = 0,
     onPaneFocus: (paneId: String) -> Unit = {},
     onPaneZoomToggle: (paneId: String) -> Unit = {},
     onSplitRatioChanged: (path: List<Boolean>, ratio: Float) -> Unit = { _, _ -> },
@@ -99,11 +118,23 @@ fun TerminalSurfaceCanvas(
     onPaneScroll: (paneId: String, offsetFromBottom: Int) -> Unit = { _, _ -> },
     onSelectionChanged: (TerminalSelectionRange?) -> Unit = {},
     onCopySelectionRequest: (TerminalSelectionRange) -> Unit = {},
+    onTextInput: (text: String) -> Unit = {},
+    onSpecialKey: (keyCode: ClientKeyCode) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalBisonPalette.current
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer(cacheSize = 512)
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var imeBuffer by remember { mutableStateOf(TextFieldValue(text = " ", selection = TextRange(1))) }
+
+    LaunchedEffect(keyboardTriggerCount) {
+        if (keyboardTriggerCount > 0) {
+            runCatching { focusRequester.requestFocus() }
+            keyboardController?.show()
+        }
+    }
 
     val baseTextStyle = remember(fontSizeSp, palette.text) {
         TextStyle(
@@ -149,6 +180,112 @@ fun TerminalSurfaceCanvas(
         val effectiveCellWidth = if (frameCols > 0) canvasWidthPx / frameCols else cellWidthPx.toFloat()
         val effectiveCellHeight = if (frameRows > 0) canvasHeightPx / frameRows else cellHeightPx.toFloat()
 
+        // Hidden IME receiver so tapping the terminal or pressing keys types directly into the focused pane
+        BasicTextField(
+            value = imeBuffer,
+            onValueChange = { updated ->
+                val raw = updated.text
+                when {
+                    raw.isEmpty() -> {
+                        onSpecialKey(ClientKeyCode.Backspace)
+                    }
+                    raw.startsWith(" ") && raw.length > 1 -> {
+                        val delta = raw.substring(1)
+                        if (delta == "\n" || delta == "\r") {
+                            onSpecialKey(ClientKeyCode.Enter)
+                        } else {
+                            onTextInput(delta)
+                        }
+                    }
+                    raw != " " -> {
+                        if (raw == "\n" || raw == "\r") {
+                            onSpecialKey(ClientKeyCode.Enter)
+                        } else {
+                            onTextInput(raw)
+                        }
+                    }
+                }
+                imeBuffer = TextFieldValue(text = " ", selection = TextRange(1))
+            },
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.None,
+                autoCorrectEnabled = false,
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Send,
+            ),
+            keyboardActions = KeyboardActions(
+                onSend = { onSpecialKey(ClientKeyCode.Enter) },
+                onDone = { onSpecialKey(ClientKeyCode.Enter) },
+                onGo = { onSpecialKey(ClientKeyCode.Enter) },
+            ),
+            modifier = Modifier
+                .size(1.dp)
+                .alpha(0.01f)
+                .focusRequester(focusRequester)
+                .testTag("terminalImeInput")
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.type == KeyEventType.KeyDown) {
+                        when (keyEvent.key) {
+                            Key.Enter, Key.NumPadEnter -> {
+                                onSpecialKey(ClientKeyCode.Enter)
+                                true
+                            }
+                            Key.Backspace -> {
+                                onSpecialKey(ClientKeyCode.Backspace)
+                                true
+                            }
+                            Key.Delete -> {
+                                onSpecialKey(ClientKeyCode.Delete)
+                                true
+                            }
+                            Key.Tab -> {
+                                onSpecialKey(ClientKeyCode.Tab)
+                                true
+                            }
+                            Key.Escape -> {
+                                onSpecialKey(ClientKeyCode.Escape)
+                                true
+                            }
+                            Key.DirectionUp -> {
+                                onSpecialKey(ClientKeyCode.Up)
+                                true
+                            }
+                            Key.DirectionDown -> {
+                                onSpecialKey(ClientKeyCode.Down)
+                                true
+                            }
+                            Key.DirectionLeft -> {
+                                onSpecialKey(ClientKeyCode.Left)
+                                true
+                            }
+                            Key.DirectionRight -> {
+                                onSpecialKey(ClientKeyCode.Right)
+                                true
+                            }
+                            Key.MoveHome -> {
+                                onSpecialKey(ClientKeyCode.Home)
+                                true
+                            }
+                            Key.MoveEnd -> {
+                                onSpecialKey(ClientKeyCode.End)
+                                true
+                            }
+                            Key.PageUp -> {
+                                onSpecialKey(ClientKeyCode.PageUp)
+                                true
+                            }
+                            Key.PageDown -> {
+                                onSpecialKey(ClientKeyCode.PageDown)
+                                true
+                            }
+                            else -> false
+                        }
+                    } else {
+                        false
+                    }
+                },
+        )
+
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
@@ -165,6 +302,8 @@ fun TerminalSurfaceCanvas(
                             if (tappedPane != null && !tappedPane.focused) {
                                 onPaneFocus(tappedPane.paneId)
                             }
+                            runCatching { focusRequester.requestFocus() }
+                            keyboardController?.show()
                         },
                         onDoubleTap = { offset ->
                             val col = (offset.x / effectiveCellWidth).toInt()
@@ -252,11 +391,8 @@ fun TerminalSurfaceCanvas(
                 surfaceFrame.panes.forEach { pane ->
                     drawPaneChrome(
                         pane = pane,
-                        totalPanes = surfaceFrame.panes.size,
                         cellWidth = effectiveCellWidth,
                         cellHeight = effectiveCellHeight,
-                        baseTextStyle = baseTextStyle,
-                        textMeasurer = textMeasurer,
                         palette = palette,
                     )
                 }
@@ -561,11 +697,8 @@ private fun DrawScope.drawCurlyUnderline(
 
 private fun DrawScope.drawPaneChrome(
     pane: PaneSurfacePane,
-    totalPanes: Int,
     cellWidth: Float,
     cellHeight: Float,
-    baseTextStyle: TextStyle,
-    textMeasurer: TextMeasurer,
     palette: BisonThemePalette,
 ) {
     val left = pane.rect.x.toInt() * cellWidth
@@ -590,44 +723,6 @@ private fun DrawScope.drawPaneChrome(
         size = Size(max(0f, width - strokeWidth), max(0f, height - strokeWidth)),
         style = Stroke(width = strokeWidth),
     )
-
-    // Draw subtle pane badge when split into multiple panes or when an agent is active
-    if (totalPanes > 1 || pane.title.isNotBlank()) {
-        val statusPrefix = when (pane.agentStatus) {
-            AgentStatus.Blocked -> "🔴 "
-            AgentStatus.Working -> "🟠 "
-            AgentStatus.Done -> "🟢 "
-            else -> ""
-        }
-        val badgeText = buildString {
-            append(statusPrefix)
-            append(pane.title.ifBlank { pane.paneId })
-            if (pane.zoomed) append(" [ZOOM]")
-        }
-        val badgeStyle = baseTextStyle.copy(
-            fontSize = 10.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = if (pane.focused) palette.terminalBg else palette.text,
-        )
-        val measured = textMeasurer.measure(badgeText, style = badgeStyle)
-        val padH = 6.dp.toPx()
-        val padV = 2.dp.toPx()
-        val badgeW = measured.size.width + padH * 2
-        val badgeH = measured.size.height + padV * 2
-        val badgeX = (left + width - badgeW - 8.dp.toPx()).coerceAtLeast(left + 4.dp.toPx())
-        val badgeY = top + 4.dp.toPx()
-
-        drawRoundRect(
-            color = if (pane.focused) borderColor else palette.panelBg.copy(alpha = 0.88f),
-            topLeft = Offset(badgeX, badgeY),
-            size = Size(badgeW, badgeH),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(6.dp.toPx()),
-        )
-        drawText(
-            textLayoutResult = measured,
-            topLeft = Offset(badgeX + padH, badgeY + padV),
-        )
-    }
 
     // Per-pane scrollbar when scrollback exists
     val maxScrollback = pane.scroll.maxScrollback.toInt()

@@ -182,10 +182,18 @@ class BisonSessionService : Service(), DIAware {
         }
 
         machineStore.awaitLoaded()
-        val machine = when (request) {
-            is SshRequest.Connect -> machineStore.getMachine(request.machineId)
-            else -> null
+        val targetMachineId = when (request) {
+            is SshRequest.Connect -> request.machineId
+            is SshRequest.Disconnect -> request.machineId
+            is SshRequest.SetSurfaceLease -> request.machineId
+            is SshRequest.SendEndpointCommand -> request.machineId
+            is SshRequest.SendPaneInput -> request.machineId
+            is SshRequest.SubmitAgentPrompt -> request.machineId
+            is SshRequest.ResizeShell -> request.machineId
+            is SshRequest.TriggerNetworkRoam -> request.machineId
+            is SshRequest.PromptHardwareKeyTouch -> request.machineId
         }
+        val machine = targetMachineId?.let { machineStore.getMachine(it) }
         sshTransportManager.handleRequest(request, machine)
     }
 

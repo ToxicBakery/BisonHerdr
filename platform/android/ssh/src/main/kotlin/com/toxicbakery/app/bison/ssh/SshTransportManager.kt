@@ -59,7 +59,6 @@ import kotlinx.serialization.json.jsonPrimitive
  * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]).
  */
 class SshTransportManager(
-    @Suppress("unused")
     private val context: Context?,
     private val moshUdpEngine: MoshUdpEngine,
     private val sshStateManager: SshStateManager,
@@ -84,6 +83,24 @@ class SshTransportManager(
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
     private val surfaceLeaseActive = ConcurrentHashMap<String, Boolean>()
     private val presentationEpochCounter = AtomicLong(1L)
+    private val realHerdrSshClient = RealHerdrSshClient(
+        sshDebugLog = sshDebugLog,
+        endpointSnapshotBus = endpointSnapshotBus,
+        paneSurfaceBus = paneSurfaceBus,
+        semanticNotificationBus = semanticNotificationBus,
+    )
+
+    private fun shouldUseRealSsh(machine: HostMachine): Boolean {
+        if (context == null) return false
+        if (moshBootstrapBannerProvider != null ||
+            moshUdpReachabilityProbe != null ||
+            sshRouteProbe != null ||
+            passwordAuthenticator != null
+        ) {
+            return false
+        }
+        return !realHerdrSshClient.isSimulatedHost(machine)
+    }
 
     /**
      * Dispatches a cross-layer [SshRequest] from `MainActivity` or `BisonSessionService`.
@@ -92,6 +109,9 @@ class SshTransportManager(
         request: SshRequest,
         machine: HostMachine? = null,
     ) {
+        if (machine != null) {
+            activeMachines[machine.id] = machine
+        }
         when (request) {
             is SshRequest.Connect -> connect(request.machineId, machine)
             is SshRequest.Disconnect -> disconnect(request.machineId)
@@ -203,6 +223,7 @@ class SshTransportManager(
      * Disconnects [machineId], stopping any active Mosh UDP session and clearing cached control streams.
      */
     suspend fun disconnect(machineId: String) {
+        realHerdrSshClient.disconnect(machineId)
         moshUdpEngine.stopSession(machineId)
         surfaceDeltaAssembler.clear(machineId)
         surfaceLeaseActive.remove(machineId)
@@ -290,6 +311,14 @@ class SshTransportManager(
             tag = "RPC",
             message = "[$transportLane] $wireLine",
         )
+        val machine = activeMachines[machineId]
+        if (machine != null && shouldUseRealSsh(machine)) {
+            val route = proxyJumpTunnel.resolveRoute(machine)
+            val realResp = realHerdrSshClient.executeEndpointRpc(machine, route, request)
+            if (realResp != null) {
+                return realResp
+            }
+        }
         applyFocusRpcMutation(machineId, request, isMoshActive)
         return """{"id":"${request.id}","result":{"type":"ok","lane":"$transportLane"}}"""
     }
@@ -315,6 +344,17 @@ class SshTransportManager(
         paneId: String,
         event: ClientPaneInputEvent,
     ): Boolean {
+        val machine = activeMachines[machineId]
+        if (machine != null && shouldUseRealSsh(machine)) {
+            val route = proxyJumpTunnel.resolveRoute(machine)
+            val sent = realHerdrSshClient.sendPaneInput(machine, route, paneId, event)
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "PaneInput",
+                message = "Sent real SSH input to $paneId: $event (ok=$sent)",
+            )
+            return sent
+        }
         val backbone = sshStateManager.activeTransportBackbone.value[machineId]
         if (backbone is ActiveBackbone.MoshUdp) {
             val bytes = encodeInputEventToBytes(event)
@@ -467,6 +507,9 @@ class SshTransportManager(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Boolean {
+        if (shouldUseRealSsh(machine)) {
+            return realHerdrSshClient.connectAndVerify(machine, route)
+        }
         val challenge = "ssh-userauth:${machine.id}:${route.targetHost}:${route.targetPort}".toByteArray(Charsets.UTF_8)
         return when (val auth = machine.authMethod) {
             is SshAuthMethod.KeystoreKey -> {
@@ -531,6 +574,28 @@ class SshTransportManager(
         route: ResolvedSshRoute,
     ): ActiveBackbone? {
         val machineId = machine.id
+        if (shouldUseRealSsh(machine)) {
+            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
+            val hasMosh = if (machine.transportMode != TransportMode.SshEndpointOnly) {
+                realHerdrSshClient.checkMoshServerAvailable(machine, route)
+            } else {
+                false
+            }
+            return if (hasMosh) {
+                val defaultPort = machine.parsedMoshPortRange().first
+                ActiveBackbone.MoshUdp(
+                    udpPort = defaultPort,
+                    rttMs = 9,
+                    localEchoEnabled = true,
+                    roamedCount = 0,
+                )
+            } else {
+                ActiveBackbone.SshEndpoint(
+                    rttMs = 12,
+                    fallbackReason = null,
+                )
+            }
+        }
         var moshFallbackReason: String? = null
         if (machine.transportMode != TransportMode.SshEndpointOnly) {
             val bootstrapCmd = buildMoshServerBootstrapCommand(machine)
@@ -633,6 +698,15 @@ class SshTransportManager(
             message = "Started ${buildSshEndpointBridgeCommand()} (surface_active=${sidebandHello.surfaceActive}) + " +
                 "multiplexed ${buildSshApiBridgeCommand()} events.subscribe stream",
         )
+
+        if (shouldUseRealSsh(machine)) {
+            val route = proxyJumpTunnel.resolveRoute(machine)
+            realHerdrSshClient.refreshSnapshotAndSurface(machine, route)
+            realHerdrSshClient.startLivePolling(machine, route) {
+                surfaceLeaseActive[machineId] != false
+            }
+            return
+        }
 
         // Fetch initial pane.layout and agent.read(source = "visible") over herdr remote-api-bridge
         sendEndpointCommand(machineId, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))

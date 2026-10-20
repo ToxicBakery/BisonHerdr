@@ -24,6 +24,7 @@ dependencies {
     implementation(projects.core.store)
 
     implementation(libs.arbor)
+    implementation(libs.jsch)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.core)

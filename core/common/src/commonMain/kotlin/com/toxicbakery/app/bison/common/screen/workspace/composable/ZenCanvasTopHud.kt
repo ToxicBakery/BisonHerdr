@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.common.screen.workspace.composable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,8 +15,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
@@ -38,6 +41,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -47,36 +51,27 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.AgentStatus
+import com.toxicbakery.app.bison.protocol.ClientShellPane
 import com.toxicbakery.app.bison.protocol.ClientShellTab
 import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
 import com.toxicbakery.app.bison.resources.Res
-import com.toxicbakery.app.bison.resources.common_cancel
 import com.toxicbakery.app.bison.resources.common_close
-import com.toxicbakery.app.bison.resources.hud_agents_blocked_count
-import com.toxicbakery.app.bison.resources.hud_agents_done_count
 import com.toxicbakery.app.bison.resources.hud_agents_pill_label
-import com.toxicbakery.app.bison.resources.hud_agents_working_count
 import com.toxicbakery.app.bison.resources.hud_pane_close
 import com.toxicbakery.app.bison.resources.hud_pane_zoom_toggle
-import com.toxicbakery.app.bison.resources.hud_rtt_ms
 import com.toxicbakery.app.bison.resources.hud_split_down
 import com.toxicbakery.app.bison.resources.hud_split_right
 import com.toxicbakery.app.bison.resources.hud_splits_pill_label
 import com.toxicbakery.app.bison.resources.hud_tab_create
 import com.toxicbakery.app.bison.resources.hud_workspace_create
 import com.toxicbakery.app.bison.resources.hud_worktree_create
-import com.toxicbakery.app.bison.resources.roaming_status_parked
-import com.toxicbakery.app.bison.resources.roaming_status_reconnecting
-import com.toxicbakery.app.bison.resources.transport_badge_mosh_roamed
-import com.toxicbakery.app.bison.resources.transport_badge_mosh_udp_port
-import com.toxicbakery.app.bison.resources.transport_badge_ssh_fallback
-import com.toxicbakery.app.bison.resources.transport_badge_ssh_tcp
 import org.jetbrains.compose.resources.stringResource
 
 /**
- * Floating Top HUD Islands for the "Zen Canvas" (Design 2) layout:
- * - Left Host & Space Switcher Pill (`● workbox · MOSH UDP :60004 · 11ms › herdr-core (1/3) ▾`)
- * - Right Agent Attention Pill (`🔴 1 Blocked · 1 Working · ☰ Agents`) & Split Pill (`◫ Splits`).
+ * Non-overlapping Top Workspace & Tab Bar for the Workspace Terminal Screen:
+ * - Row 1: Back to Hosts (`‹ Hosts`), compact Host status badge (`● epyc · 11ms`),
+ *   horizontally scrollable 1-tap Workspace ("Terminal Group") pills, and `[⌨]`, `[◫ Splits]`, `[☰ Agents]` actions.
+ * - Row 2: Horizontally scrollable 1-tap Tab pills within the active workspace + Pane pills when split.
  */
 @Composable
 fun ZenCanvasTopHud(
@@ -86,8 +81,10 @@ fun ZenCanvasTopHud(
     roamingStatus: RoamingStatus,
     workspaces: List<ClientShellWorkspace>,
     tabs: List<ClientShellTab>,
+    panes: List<ClientShellPane> = emptyList(),
     focusedWorkspaceId: String?,
     focusedTabId: String?,
+    focusedPaneId: String? = null,
     federatedAgents: List<FederatedAgentItem>,
     hudOpacity: Float = 1f,
     onSelectMachine: (machineId: String) -> Unit,
@@ -98,11 +95,13 @@ fun ZenCanvasTopHud(
     onFocusTab: (tabId: String) -> Unit,
     onCreateTab: (label: String?) -> Unit,
     onCloseTab: (tabId: String) -> Unit,
+    onFocusPane: (paneId: String) -> Unit = {},
     onSplitRight: () -> Unit,
     onSplitDown: () -> Unit,
     onTogglePaneZoom: () -> Unit,
     onClosePane: () -> Unit,
     onToggleAgentDrawer: () -> Unit,
+    onRequestKeyboard: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalBisonPalette.current
@@ -114,232 +113,425 @@ fun ZenCanvasTopHud(
         ?: workspaces.firstOrNull()
     val workspaceTabs = tabs.filter { activeWorkspace == null || it.workspaceId == activeWorkspace.workspaceId }
         .ifEmpty { tabs }
-    val activeTabIndex = workspaceTabs.indexOfFirst { it.tabId == focusedTabId || it.focused }
-        .let { if (it >= 0) it + 1 else 1 }
-    val totalTabs = workspaceTabs.size.coerceAtLeast(1)
+    val activeTab = workspaceTabs.firstOrNull { it.tabId == focusedTabId }
+        ?: workspaceTabs.firstOrNull { it.focused }
+        ?: workspaceTabs.firstOrNull()
+    val activeTabPanes = panes.filter { activeTab == null || it.tabId == activeTab.tabId }
 
     val blockedCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Blocked }
     val workingCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Working }
     val doneCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Done }
 
-    Row(
+    Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .background(palette.panelBg)
             .alpha(hudOpacity),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Left Host & Space Switcher Pill
-        Surface(
-            modifier = Modifier
-                .clip(RoundedCornerShape(24.dp))
-                .clickable { showHostWorkspaceSheet = true }
-                .testTag("hudHostSwitcherPill"),
-            shape = RoundedCornerShape(24.dp),
-            color = palette.panelBg.copy(alpha = 0.88f),
-            tonalElevation = 4.dp,
-        ) {
-            Row(
-                modifier = Modifier
-                    .border(1.dp, palette.text.copy(alpha = 0.18f), RoundedCornerShape(24.dp))
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                // Status dot
-                val dotColor = when (roamingStatus) {
-                    RoamingStatus.Healthy -> palette.green
-                    RoamingStatus.SurfaceParked -> palette.accent
-                    RoamingStatus.RoamingReconnect -> palette.red
-                }
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .background(dotColor, CircleShape)
-                )
-                Spacer(Modifier.width(8.dp))
-
-                Text(
-                    text = activeMachine?.name ?: "workbox",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = palette.text,
-                    fontWeight = FontWeight.Bold,
-                )
-
-                Text(
-                    text = " · ",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = palette.text.copy(alpha = 0.55f),
-                )
-
-                // Transport & Roaming badge
-                val transportLabel = when {
-                    roamingStatus == RoamingStatus.RoamingReconnect ->
-                        stringResource(Res.string.roaming_status_reconnecting)
-                    roamingStatus == RoamingStatus.SurfaceParked ->
-                        stringResource(Res.string.roaming_status_parked)
-                    activeBackbone is ActiveBackbone.MoshUdp && activeBackbone.roamedCount > 0 ->
-                        stringResource(Res.string.transport_badge_mosh_roamed)
-                    activeBackbone is ActiveBackbone.MoshUdp ->
-                        stringResource(Res.string.transport_badge_mosh_udp_port, activeBackbone.udpPort)
-                    activeBackbone is ActiveBackbone.SshEndpoint && activeBackbone.fallbackReason != null ->
-                        stringResource(Res.string.transport_badge_ssh_fallback)
-                    else ->
-                        stringResource(Res.string.transport_badge_ssh_tcp)
-                }
-                val badgeAccent = when {
-                    roamingStatus == RoamingStatus.RoamingReconnect -> palette.red
-                    activeBackbone is ActiveBackbone.MoshUdp -> palette.green
-                    else -> palette.accent
-                }
-
-                Box(
-                    modifier = Modifier
-                        .background(badgeAccent.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                ) {
-                    Text(
-                        text = transportLabel,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = badgeAccent,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-
-                if (activeBackbone != null) {
-                    Text(
-                        text = " · " + stringResource(Res.string.hud_rtt_ms, activeBackbone.rttMs),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = palette.text.copy(alpha = 0.72f),
-                    )
-                }
-
-                Text(
-                    text = " › ${activeWorkspace?.label ?: "main"} ($activeTabIndex/$totalTabs) ▾",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = palette.accent,
-                )
-            }
-        }
-
-        // Right Agent Attention Pill & Split Pill
+        // Row 1: Back | Host Pill | 1-Tap Workspace ("Terminal Group") Pills | Keyboard, Splits, Agents
         Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            // Agent Attention Pill
-            val agentBorderColor = when {
-                blockedCount > 0 -> palette.red
-                doneCount > 0 -> palette.green
-                workingCount > 0 -> palette.accent
-                else -> palette.text.copy(alpha = 0.22f)
-            }
+            // Back to Hosts button
             Surface(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(24.dp))
-                    .clickable { onToggleAgentDrawer() }
-                    .testTag("hudAgentAttentionPill"),
-                shape = RoundedCornerShape(24.dp),
-                color = palette.panelBg.copy(alpha = 0.88f),
-                tonalElevation = 4.dp,
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onOpenMachineFederation() }
+                    .testTag("hudBackToHostsButton"),
+                shape = RoundedCornerShape(10.dp),
+                color = palette.terminalBg,
+            ) {
+                Text(
+                    text = "‹ Hosts",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = palette.accent,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                )
+            }
+
+            // Compact Host & Transport Pill
+            Surface(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { showHostWorkspaceSheet = true }
+                    .testTag("hudHostSwitcherPill"),
+                shape = RoundedCornerShape(10.dp),
+                color = palette.terminalBg,
             ) {
                 Row(
                     modifier = Modifier
-                        .border(1.2.dp, agentBorderColor, RoundedCornerShape(24.dp))
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                        .border(1.dp, palette.text.copy(alpha = 0.16f), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (blockedCount > 0) {
-                        Text(
-                            text = "🔴 " + stringResource(Res.string.hud_agents_blocked_count, blockedCount) + " · ",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = palette.red,
-                            fontWeight = FontWeight.Bold,
-                        )
+                    val dotColor = when (roamingStatus) {
+                        RoamingStatus.Healthy -> palette.green
+                        RoamingStatus.SurfaceParked -> palette.accent
+                        RoamingStatus.RoamingReconnect -> palette.red
                     }
-                    if (workingCount > 0) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .background(dotColor, CircleShape)
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        text = activeMachine?.name ?: "host",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.text,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                    )
+                    if (activeBackbone != null) {
                         Text(
-                            text = "🟠 " + stringResource(Res.string.hud_agents_working_count, workingCount) + " · ",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = palette.accent,
-                        )
-                    } else if (doneCount > 0) {
-                        Text(
-                            text = "🟢 " + stringResource(Res.string.hud_agents_done_count, doneCount) + " · ",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = palette.green,
+                            text = " · ${activeBackbone.rttMs}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.text.copy(alpha = 0.65f),
+                            maxLines = 1,
                         )
                     }
                     Text(
-                        text = "☰ " + stringResource(Res.string.hud_agents_pill_label),
-                        style = MaterialTheme.typography.labelLarge,
-                        color = palette.text,
+                        text = " ▾",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent,
                     )
                 }
             }
 
-            // Split Pill (`◫ Splits`)
-            Box {
+            // Horizontally Scrollable 1-Tap Workspace ("Terminal Group") Pills
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                workspaces.forEachIndexed { idx, ws ->
+                    val isFocused = ws.workspaceId == (activeWorkspace?.workspaceId ?: focusedWorkspaceId)
+                    val wsStatusColor = when (ws.agentStatus) {
+                        AgentStatus.Blocked -> palette.red
+                        AgentStatus.Working -> palette.accent
+                        AgentStatus.Done -> palette.green
+                        else -> null
+                    }
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onFocusWorkspace(ws.workspaceId) }
+                            .testTag("hudWorkspacePill_${ws.workspaceId}"),
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (isFocused) palette.accent else palette.terminalBg,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isFocused) palette.accent else (wsStatusColor ?: palette.text.copy(alpha = 0.16f)),
+                                    shape = RoundedCornerShape(10.dp),
+                                )
+                                .padding(horizontal = 9.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            if (wsStatusColor != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .background(
+                                            if (isFocused) palette.terminalBg else wsStatusColor,
+                                            CircleShape,
+                                        )
+                                )
+                            }
+                            Text(
+                                text = "${idx + 1}: ${ws.label}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (isFocused) palette.terminalBg else palette.text,
+                                fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+
+                // Quick + Workspace button
                 Surface(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
-                        .clickable { showSplitMenu = true }
-                        .testTag("hudSplitPill"),
-                    shape = RoundedCornerShape(24.dp),
-                    color = palette.panelBg.copy(alpha = 0.88f),
-                    tonalElevation = 4.dp,
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { onCreateWorkspace("space-${workspaces.size + 1}") }
+                        .testTag("hudNewWorkspacePill"),
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.terminalBg,
                 ) {
-                    Row(
+                    Text(
+                        text = "+ Group",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.accent,
                         modifier = Modifier
-                            .border(1.dp, palette.text.copy(alpha = 0.20f), RoundedCornerShape(24.dp))
-                            .padding(horizontal = 12.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                            .border(1.dp, palette.accent.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                    )
+                }
+            }
+
+            // Right Action Buttons: Keyboard | Splits | Agents
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                // Soft Keyboard Button
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { onRequestKeyboard() }
+                        .testTag("hudKeyboardButton"),
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.terminalBg,
+                ) {
+                    Text(
+                        text = "⌨ Keybd",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.text,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .border(1.dp, palette.text.copy(alpha = 0.20f), RoundedCornerShape(10.dp))
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                    )
+                }
+
+                // Split Pill (`◫ Splits`)
+                Box {
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { showSplitMenu = true }
+                            .testTag("hudSplitPill"),
+                        shape = RoundedCornerShape(10.dp),
+                        color = palette.terminalBg,
                     ) {
                         Text(
                             text = "◫ " + stringResource(Res.string.hud_splits_pill_label),
-                            style = MaterialTheme.typography.labelLarge,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = palette.text,
+                            modifier = Modifier
+                                .border(1.dp, palette.text.copy(alpha = 0.20f), RoundedCornerShape(10.dp))
+                                .padding(horizontal = 8.dp, vertical = 5.dp),
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = showSplitMenu,
+                        onDismissRequest = { showSplitMenu = false },
+                        modifier = Modifier.background(palette.panelBg),
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("◫ " + stringResource(Res.string.hud_split_right), color = palette.text) },
+                            onClick = {
+                                showSplitMenu = false
+                                onSplitRight()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("⊟ " + stringResource(Res.string.hud_split_down), color = palette.text) },
+                            onClick = {
+                                showSplitMenu = false
+                                onSplitDown()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("⤢ " + stringResource(Res.string.hud_pane_zoom_toggle), color = palette.accent) },
+                            onClick = {
+                                showSplitMenu = false
+                                onTogglePaneZoom()
+                            },
+                        )
+                        HorizontalDivider(color = palette.text.copy(alpha = 0.14f))
+                        DropdownMenuItem(
+                            text = { Text("✕ " + stringResource(Res.string.hud_pane_close), color = palette.red) },
+                            onClick = {
+                                showSplitMenu = false
+                                onClosePane()
+                            },
+                        )
+                    }
+                }
+
+                // Agent Attention Pill
+                val agentBorderColor = when {
+                    blockedCount > 0 -> palette.red
+                    doneCount > 0 -> palette.green
+                    workingCount > 0 -> palette.accent
+                    else -> palette.text.copy(alpha = 0.22f)
+                }
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { onToggleAgentDrawer() }
+                        .testTag("hudAgentAttentionPill"),
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.terminalBg,
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .border(1.2.dp, agentBorderColor, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (blockedCount > 0) {
+                            Text(
+                                text = "🔴$blockedCount ",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = palette.red,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        if (workingCount > 0) {
+                            Text(
+                                text = "🟠$workingCount ",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = palette.accent,
+                            )
+                        } else if (doneCount > 0) {
+                            Text(
+                                text = "🟢$doneCount ",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = palette.green,
+                            )
+                        }
+                        Text(
+                            text = "☰ " + stringResource(Res.string.hud_agents_pill_label),
+                            style = MaterialTheme.typography.labelMedium,
                             color = palette.text,
                         )
                     }
                 }
+            }
+        }
 
-                DropdownMenu(
-                    expanded = showSplitMenu,
-                    onDismissRequest = { showSplitMenu = false },
-                    modifier = Modifier.background(palette.panelBg),
+        // Row 2: Tabs within the Active Workspace + Panes within the Active Tab
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(palette.terminalBg.copy(alpha = 0.55f))
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Tabs:",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.text.copy(alpha = 0.55f),
+                )
+                workspaceTabs.forEach { tab ->
+                    val isTabFocused = tab.tabId == (activeTab?.tabId ?: focusedTabId)
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onFocusTab(tab.tabId) }
+                            .testTag("hudTabPill_${tab.tabId}"),
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (isTabFocused) palette.accent.copy(alpha = 0.22f) else palette.panelBg,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.14f),
+                                    shape = RoundedCornerShape(8.dp),
+                                )
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "${tab.number}: ${tab.label}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.85f),
+                                fontWeight = if (isTabFocused) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                            )
+                            if (workspaceTabs.size > 1 && isTabFocused) {
+                                Text(
+                                    text = "✕",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.red,
+                                    modifier = Modifier.clickable { onCloseTab(tab.tabId) },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // + Tab button
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onCreateTab(null) }
+                        .testTag("hudNewTabPill"),
+                    shape = RoundedCornerShape(8.dp),
+                    color = palette.panelBg,
                 ) {
-                    DropdownMenuItem(
-                        text = { Text("◫ " + stringResource(Res.string.hud_split_right), color = palette.text) },
-                        onClick = {
-                            showSplitMenu = false
-                            onSplitRight()
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("⊟ " + stringResource(Res.string.hud_split_down), color = palette.text) },
-                        onClick = {
-                            showSplitMenu = false
-                            onSplitDown()
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("⤢ " + stringResource(Res.string.hud_pane_zoom_toggle), color = palette.accent) },
-                        onClick = {
-                            showSplitMenu = false
-                            onTogglePaneZoom()
-                        },
-                    )
-                    HorizontalDivider(color = palette.text.copy(alpha = 0.14f))
-                    DropdownMenuItem(
-                        text = { Text("✕ " + stringResource(Res.string.hud_pane_close), color = palette.red) },
-                        onClick = {
-                            showSplitMenu = false
-                            onClosePane()
-                        },
+                    Text(
+                        text = "+ Tab",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent,
+                        modifier = Modifier
+                            .border(1.dp, palette.accent.copy(alpha = 0.30f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
                     )
                 }
             }
+
+            // If active tab has multiple panes, show 1-tap pane switcher pills
+            if (activeTabPanes.size > 1) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 8.dp),
+                ) {
+                    Text(
+                        text = "Panes:",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.text.copy(alpha = 0.55f),
+                    )
+                    activeTabPanes.forEachIndexed { idx, pane ->
+                        val isPaneFocused = pane.paneId == focusedPaneId || pane.focused
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onFocusPane(pane.paneId) }
+                                .testTag("hudPanePill_${pane.paneId}"),
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (isPaneFocused) palette.accent else palette.panelBg,
+                        ) {
+                            Text(
+                                text = "#${idx + 1} ${pane.label.ifBlank { pane.paneId }}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isPaneFocused) palette.terminalBg else palette.text,
+                                fontWeight = if (isPaneFocused) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                            )
+                        }
+                    }
+                }
+            }
         }
+
+        HorizontalDivider(color = palette.text.copy(alpha = 0.14f), thickness = 1.dp)
     }
 
     if (showHostWorkspaceSheet) {
@@ -420,6 +612,7 @@ private fun HostWorkspacePopoverSheet(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {

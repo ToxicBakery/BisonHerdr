@@ -19,6 +19,7 @@ compose-hot-reload = "1.0.0"
 compose-material-icons = "1.7.3"
 compose-multiplatform = "1.10.3"
 jna = "5.14.0"
+jsch = "2.27.7"
 kodein = "7.31.0"
 kotlin = "2.3.20"
 kotlinx-coroutines = "1.10.2"
@@ -72,6 +73,7 @@ arbor = { module = "com.toxicbakery.logging:arbor", version.ref = "arbor" }
 arbor-android = { module = "com.toxicbakery.logging:arbor-android", version.ref = "arbor" }
 coil = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+jsch = { module = "com.github.mwiede:jsch", version.ref = "jsch" }
 
 # Kodein
 kodein = { module = "org.kodein.di:kodein-di", version.ref = "kodein" }

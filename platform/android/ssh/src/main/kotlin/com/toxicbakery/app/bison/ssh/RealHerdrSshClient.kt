@@ -1,0 +1,1031 @@
+package com.toxicbakery.app.bison.ssh
+
+import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
+import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.SshAuthMethod
+import com.toxicbakery.app.bison.protocol.AgentStatus
+import com.toxicbakery.app.bison.protocol.CellData
+import com.toxicbakery.app.bison.protocol.ClientKeyCode
+import com.toxicbakery.app.bison.protocol.ClientKeyEvent
+import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
+import com.toxicbakery.app.bison.protocol.ClientShellAgent
+import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
+import com.toxicbakery.app.bison.protocol.ClientShellPane
+import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
+import com.toxicbakery.app.bison.protocol.ClientShellTab
+import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
+import com.toxicbakery.app.bison.protocol.CursorShape
+import com.toxicbakery.app.bison.protocol.CursorState
+import com.toxicbakery.app.bison.protocol.FrameData
+import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import com.toxicbakery.app.bison.protocol.PaneLayoutPane
+import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
+import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
+import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
+import com.toxicbakery.app.bison.protocol.PaneSurfacePane
+import com.toxicbakery.app.bison.protocol.PaneSurfaceScroll
+import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
+import com.toxicbakery.app.bison.protocol.SurfaceRect
+import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
+import java.io.ByteArrayOutputStream
+import java.util.Properties
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
+import kotlin.math.min
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.floatOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+
+/**
+ * Live SSH2 client (powered by JSch) that connects to unmodified upstream Herdr servers,
+ * fetches real `herdr api snapshot` topology (workspaces, tabs, panes, coding agents, BSP layouts),
+ * streams visible ANSI pane buffers via `herdr remote-api-bridge` (`pane.read`), and dispatches
+ * real interactive keystrokes (`pane.send_text`, `pane.send_keys`, `pane.send_input`), prompts,
+ * and workspace/tab/pane focus mutations.
+ */
+internal class RealHerdrSshClient(
+    private val sshDebugLog: SshDebugLog,
+    private val endpointSnapshotBus: EndpointSnapshotBus,
+    private val paneSurfaceBus: PaneSurfaceBus,
+    private val semanticNotificationBus: SemanticNotificationBus,
+) {
+    private data class ClientSelectionState(
+        var focusedWorkspaceId: String? = null,
+        var focusedTabId: String? = null,
+        var focusedPaneId: String? = null,
+    )
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessions = ConcurrentHashMap<String, Session>()
+    private val sessionLocks = ConcurrentHashMap<String, Mutex>()
+    private val pollJobs = ConcurrentHashMap<String, Job>()
+    private val selectionState = ConcurrentHashMap<String, ClientSelectionState>()
+    private val revisionCounter = AtomicLong(10L)
+
+    fun isSimulatedHost(machine: HostMachine): Boolean {
+        val host = machine.hostname.trim().lowercase()
+        val bastion = machine.proxyJump?.bastionHost?.trim()?.lowercase().orEmpty()
+        if (host.isEmpty()) return true
+        if (host.endsWith(".local") || host.endsWith(".example.com") || host.endsWith(".invalid")) return true
+        if (host.endsWith(".ts.net") || host.startsWith("100.64.")) return true
+        if (bastion.endsWith(".example.com") || bastion.endsWith(".invalid") || bastion.startsWith("100.64.")) return true
+        return false
+    }
+
+    private fun mutexFor(machineId: String): Mutex =
+        sessionLocks.computeIfAbsent(machineId) { Mutex() }
+
+    suspend fun connectAndVerify(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ): Boolean = withContext(Dispatchers.IO) {
+        mutexFor(machine.id).withLock {
+            runCatching {
+                val session = getOrOpenSessionLocked(machine, route)
+                val out = execCommandOnSession(session, "herdr --version || true")
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
+                )
+                true
+            }.getOrElse { err ->
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: ${err.message}",
+                    isError = true,
+                )
+                false
+            }
+        }
+    }
+
+    suspend fun checkMoshServerAvailable(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ): Boolean = withContext(Dispatchers.IO) {
+        mutexFor(machine.id).withLock {
+            runCatching {
+                val session = getOrOpenSessionLocked(machine, route)
+                val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
+                val out = execCommandOnSession(session, "command -v $moshBin")
+                out.trim().isNotEmpty()
+            }.getOrDefault(false)
+        }
+    }
+
+    fun startLivePolling(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        isSurfaceActive: () -> Boolean,
+    ) {
+        pollJobs.remove(machine.id)?.cancel()
+        val job = scope.launch {
+            while (isActive) {
+                if (isSurfaceActive()) {
+                    runCatching {
+                        refreshSnapshotAndSurface(machine, route)
+                    }.onFailure { err ->
+                        sshDebugLog.record(
+                            machineId = machine.id,
+                            tag = "RealSSH",
+                            message = "Live poll warning: ${err.message}",
+                            isError = true,
+                        )
+                    }
+                }
+                delay(400L)
+            }
+        }
+        pollJobs[machine.id] = job
+    }
+
+    fun disconnect(machineId: String) {
+        pollJobs.remove(machineId)?.cancel()
+        selectionState.remove(machineId)
+        sessions.remove(machineId)?.let { session ->
+            runCatching { session.disconnect() }
+        }
+    }
+
+    suspend fun refreshSnapshotAndSurface(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val rawSnapshotJson = mutexFor(machine.id).withLock {
+            val session = getOrOpenSessionLocked(machine, route)
+            execCommandOnSession(session, "herdr api snapshot")
+        }
+        val rootObj = runCatching {
+            val firstJsonLine = rawSnapshotJson.lineSequence()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("{") && it.endsWith("}") }
+                ?: rawSnapshotJson.trim()
+            json.parseToJsonElement(firstJsonLine).jsonObject
+        }.getOrNull() ?: return@withContext false
+
+        val snapshotObj = rootObj["result"]?.jsonObject?.get("snapshot")?.jsonObject
+            ?: return@withContext false
+
+        val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
+        val parsed = parseSnapshotObject(machine.id, snapshotObj, sel)
+        endpointSnapshotBus.publish(machine.id, parsed.snapshot)
+
+        // Read visible ANSI output for all panes in the focused tab
+        val activeTabId = parsed.snapshot.focusedTabId
+        val activeLayout = parsed.layoutsByTab[activeTabId]
+            ?: parsed.layoutsByTab.values.firstOrNull()
+        val visiblePaneIds = activeLayout?.panes?.map { it.paneId }
+            ?.takeIf { it.isNotEmpty() }
+            ?: parsed.snapshot.panes
+                .filter { activeTabId == null || it.tabId == activeTabId }
+                .map { it.paneId }
+                .ifEmpty { listOfNotNull(parsed.snapshot.focusedPaneId) }
+
+        if (visiblePaneIds.isEmpty()) return@withContext true
+
+        val ndjsonBatch = visiblePaneIds.joinToString("\n") { paneId ->
+            buildJsonObject {
+                put("id", "read_$paneId")
+                put("method", "pane.read")
+                put(
+                    "params",
+                    buildJsonObject {
+                        put("pane_id", paneId)
+                        put("source", "visible")
+                        put("format", "ansi")
+                    },
+                )
+            }.toString()
+        }
+
+        val batchResponse = mutexFor(machine.id).withLock {
+            val session = getOrOpenSessionLocked(machine, route)
+            execApiBridgeBatchLocked(session, ndjsonBatch)
+        }
+
+        val ansiByPane = mutableMapOf<String, String>()
+        batchResponse.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .forEach { line ->
+                runCatching {
+                    val obj = json.parseToJsonElement(line).jsonObject
+                    val readObj = obj["result"]?.jsonObject?.get("read")?.jsonObject
+                    val pId = readObj?.get("pane_id")?.jsonPrimitive?.content
+                    val text = readObj?.get("text")?.jsonPrimitive?.content
+                    if (!pId.isNullOrBlank() && text != null) {
+                        ansiByPane[pId] = text
+                    }
+                }
+            }
+
+        // Update agent snippets from the read pane buffers
+        parsed.snapshot.agents.forEach { agent ->
+            val rawText = ansiByPane[agent.paneId]
+            if (!rawText.isNullOrBlank()) {
+                val cleanSnippet = stripAnsiCodes(rawText)
+                    .lineSequence()
+                    .map { it.trimEnd() }
+                    .filter { it.isNotBlank() }
+                    .toList()
+                    .takeLast(4)
+                    .joinToString("\n")
+                if (cleanSnippet.isNotBlank()) {
+                    semanticNotificationBus.updateAgentSnippet(
+                        machineId = machine.id,
+                        paneId = agent.paneId,
+                        snippet = cleanSnippet,
+                    )
+                }
+            }
+        }
+
+        val frame = buildCompositeSurfaceFrame(
+            machineId = machine.id,
+            snapshot = parsed.snapshot,
+            layout = activeLayout,
+            ansiByPane = ansiByPane,
+        )
+        paneSurfaceBus.publish(machine.id, frame)
+        true
+    }
+
+    suspend fun executeEndpointRpc(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        request: ClientShellEndpointRequest,
+    ): String? = withContext(Dispatchers.IO) {
+        val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
+        val paramsObj = runCatching { json.parseToJsonElement(request.paramsJson).jsonObject }
+            .getOrElse { JsonObject(emptyMap()) }
+
+        // Track client selection overrides immediately so switching workspaces/tabs/panes is instant
+        when (request.method) {
+            "workspace.focus" -> {
+                val wsId = paramsObj["workspace_id"]?.jsonPrimitive?.content
+                if (!wsId.isNullOrBlank()) {
+                    sel.focusedWorkspaceId = wsId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
+                    val ws = currentSnap?.workspaces?.firstOrNull { it.workspaceId == wsId }
+                    val targetTabId = ws?.activeTabId
+                        ?: currentSnap?.tabs?.firstOrNull { it.workspaceId == wsId }?.tabId
+                    if (!targetTabId.isNullOrBlank()) {
+                        sel.focusedTabId = targetTabId
+                        val targetPaneId = currentSnap?.panes
+                            ?.firstOrNull { it.tabId == targetTabId }?.paneId
+                        if (!targetPaneId.isNullOrBlank()) {
+                            sel.focusedPaneId = targetPaneId
+                        }
+                    }
+                }
+            }
+
+            "tab.focus" -> {
+                val tabId = paramsObj["tab_id"]?.jsonPrimitive?.content
+                if (!tabId.isNullOrBlank()) {
+                    sel.focusedTabId = tabId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
+                    val tab = currentSnap?.tabs?.firstOrNull { it.tabId == tabId }
+                    if (tab != null) {
+                        sel.focusedWorkspaceId = tab.workspaceId
+                    }
+                    val targetPaneId = currentSnap?.panes?.firstOrNull { it.tabId == tabId }?.paneId
+                    if (!targetPaneId.isNullOrBlank()) {
+                        sel.focusedPaneId = targetPaneId
+                    }
+                }
+            }
+
+            "pane.focus" -> {
+                val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
+                if (!paneId.isNullOrBlank()) {
+                    sel.focusedPaneId = paneId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
+                    val pane = currentSnap?.panes?.firstOrNull { it.paneId == paneId }
+                    if (pane != null) {
+                        sel.focusedWorkspaceId = pane.workspaceId
+                        sel.focusedTabId = pane.tabId
+                    }
+                }
+            }
+
+            "agent.focus" -> {
+                val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
+                if (!paneId.isNullOrBlank()) {
+                    sel.focusedPaneId = paneId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
+                    val pane = currentSnap?.panes?.firstOrNull { it.paneId == paneId }
+                    if (pane != null) {
+                        sel.focusedWorkspaceId = pane.workspaceId
+                        sel.focusedTabId = pane.tabId
+                    }
+                }
+            }
+        }
+
+        val ndjsonLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
+        val response = runCatching {
+            mutexFor(machine.id).withLock {
+                val session = getOrOpenSessionLocked(machine, route)
+                execApiBridgeBatchLocked(session, ndjsonLine)
+            }
+        }.getOrElse { err ->
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "RPC ${request.method} error: ${err.message}",
+                isError = true,
+            )
+            null
+        }
+
+        // Immediately refresh snapshot and visible pane ANSI buffer after any RPC
+        runCatching { refreshSnapshotAndSurface(machine, route) }
+        response
+    }
+
+    suspend fun sendPaneInput(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        paneId: String,
+        event: ClientPaneInputEvent,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val targetPaneId = paneId.takeIf { it.isNotBlank() }
+            ?: selectionState[machine.id]?.focusedPaneId
+            ?: endpointSnapshotBus.snapshotFor(machine.id)?.focusedPaneId
+            ?: return@withContext false
+
+        val rpcLine = when (event) {
+            is ClientPaneInputEvent.TextCommit -> {
+                buildJsonObject {
+                    put("id", "in_${revisionCounter.incrementAndGet()}")
+                    put("method", "pane.send_text")
+                    put(
+                        "params",
+                        buildJsonObject {
+                            put("pane_id", targetPaneId)
+                            put("text", event.text)
+                        },
+                    )
+                }.toString()
+            }
+
+            is ClientPaneInputEvent.Paste -> {
+                buildJsonObject {
+                    put("id", "paste_${revisionCounter.incrementAndGet()}")
+                    put("method", "pane.send_text")
+                    put(
+                        "params",
+                        buildJsonObject {
+                            put("pane_id", targetPaneId)
+                            put("text", event.text)
+                        },
+                    )
+                }.toString()
+            }
+
+            is ClientPaneInputEvent.Key -> {
+                val keySpec = mapKeyEventToHerdrKeySpec(event.event)
+                buildJsonObject {
+                    put("id", "key_${revisionCounter.incrementAndGet()}")
+                    put("method", "pane.send_keys")
+                    put(
+                        "params",
+                        buildJsonObject {
+                            put("pane_id", targetPaneId)
+                            put("keys", buildJsonArray { add(JsonPrimitive(keySpec)) })
+                        },
+                    )
+                }.toString()
+            }
+
+            is ClientPaneInputEvent.Mouse -> return@withContext true
+        }
+
+        val ok = runCatching {
+            mutexFor(machine.id).withLock {
+                val session = getOrOpenSessionLocked(machine, route)
+                execApiBridgeBatchLocked(session, rpcLine)
+            }
+            true
+        }.getOrElse { err ->
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "Failed to send input to $targetPaneId: ${err.message}",
+                isError = true,
+            )
+            false
+        }
+
+        if (ok) {
+            runCatching { refreshSnapshotAndSurface(machine, route) }
+        }
+        ok
+    }
+
+    private fun mapKeyEventToHerdrKeySpec(ev: ClientKeyEvent): String {
+        val base = when (ev.code) {
+            ClientKeyCode.Enter -> "Enter"
+            ClientKeyCode.Escape -> "Esc"
+            ClientKeyCode.Tab -> "Tab"
+            ClientKeyCode.Backspace -> "Backspace"
+            ClientKeyCode.Up -> "Up"
+            ClientKeyCode.Down -> "Down"
+            ClientKeyCode.Left -> "Left"
+            ClientKeyCode.Right -> "Right"
+            ClientKeyCode.Home -> "Home"
+            ClientKeyCode.End -> "End"
+            ClientKeyCode.PageUp -> "PageUp"
+            ClientKeyCode.PageDown -> "PageDown"
+            ClientKeyCode.Delete -> "Delete"
+            ClientKeyCode.CharC -> if (ev.ctrl) "C-c" else "c"
+            ClientKeyCode.CharB -> if (ev.ctrl) "C-b" else "b"
+            ClientKeyCode.CharD -> if (ev.ctrl) "C-d" else "d"
+            ClientKeyCode.CharZ -> if (ev.ctrl) "C-z" else "z"
+            ClientKeyCode.CharY -> "y"
+            ClientKeyCode.CharN -> "n"
+        }
+        if (base.startsWith("C-")) return base
+        return buildString {
+            if (ev.ctrl) append("C-")
+            if (ev.alt) append("M-")
+            append(base)
+        }
+    }
+
+    private fun getOrOpenSessionLocked(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ): Session {
+        val existing = sessions[machine.id]
+        if (existing != null && existing.isConnected) {
+            return existing
+        }
+        val jsch = JSch()
+        val session = jsch.getSession(
+            route.entryUsername.ifBlank { machine.username },
+            route.entryHost,
+            route.entryPort,
+        )
+        when (val auth = machine.authMethod) {
+            is SshAuthMethod.Password -> {
+                session.setPassword(auth.encryptedPasswordRef)
+            }
+            else -> {
+                // Publickey or keyboard-interactive fallback
+            }
+        }
+        val props = Properties().apply {
+            put("StrictHostKeyChecking", "no")
+            put("PreferredAuthentications", "password,keyboard-interactive,publickey")
+        }
+        session.setConfig(props)
+        session.connect(6_000)
+        sessions[machine.id] = session
+        return session
+    }
+
+    private fun execCommandOnSession(
+        session: Session,
+        command: String,
+    ): String {
+        val channel = session.openChannel("exec") as ChannelExec
+        val fullCmd = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; $command"
+        channel.setCommand(fullCmd)
+        val out = ByteArrayOutputStream()
+        val err = ByteArrayOutputStream()
+        channel.outputStream = out
+        channel.setErrStream(err)
+        channel.connect(5_000)
+        val deadline = System.currentTimeMillis() + 6_000L
+        while (!channel.isClosed && System.currentTimeMillis() < deadline) {
+            Thread.sleep(12L)
+        }
+        channel.disconnect()
+        return out.toString(Charsets.UTF_8.name())
+    }
+
+    private fun execApiBridgeBatchLocked(
+        session: Session,
+        ndjsonPayload: String,
+    ): String {
+        val channel = session.openChannel("exec") as ChannelExec
+        val fullCmd = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; herdr remote-api-bridge"
+        channel.setCommand(fullCmd)
+        val out = ByteArrayOutputStream()
+        val err = ByteArrayOutputStream()
+        channel.outputStream = out
+        channel.setErrStream(err)
+        val stdinBytes = (ndjsonPayload.trimEnd() + "\n").toByteArray(Charsets.UTF_8)
+        channel.setInputStream(stdinBytes.inputStream())
+        channel.connect(5_000)
+        val deadline = System.currentTimeMillis() + 6_000L
+        while (!channel.isClosed && System.currentTimeMillis() < deadline) {
+            Thread.sleep(12L)
+        }
+        channel.disconnect()
+        return out.toString(Charsets.UTF_8.name())
+    }
+
+    private data class ParsedSnapshotBundle(
+        val snapshot: ClientShellSnapshot,
+        val layoutsByTab: Map<String, PaneLayoutSnapshot>,
+    )
+
+    private fun parseSnapshotObject(
+        machineId: String,
+        snapshotObj: JsonObject,
+        sel: ClientSelectionState,
+    ): ParsedSnapshotBundle {
+        val serverFocusedWsId = snapshotObj["focused_workspace_id"]?.jsonPrimitive?.content
+        val serverFocusedTabId = snapshotObj["focused_tab_id"]?.jsonPrimitive?.content
+        val serverFocusedPaneId = snapshotObj["focused_pane_id"]?.jsonPrimitive?.content
+
+        val workspacesArray = snapshotObj["workspaces"] as? JsonArray ?: JsonArray(emptyList())
+        val tabsArray = snapshotObj["tabs"] as? JsonArray ?: JsonArray(emptyList())
+        val panesArray = snapshotObj["panes"] as? JsonArray ?: JsonArray(emptyList())
+        val agentsArray = snapshotObj["agents"] as? JsonArray ?: JsonArray(emptyList())
+        val layoutsArray = snapshotObj["layouts"] as? JsonArray ?: JsonArray(emptyList())
+
+        val rawWorkspaces = workspacesArray.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val id = (obj["workspace_id"] ?: obj["id"])?.jsonPrimitive?.content ?: return@mapNotNull null
+            val activeTabId = obj["active_tab_id"]?.jsonPrimitive?.content
+            val label = obj["label"]?.jsonPrimitive?.content ?: id
+            val branch = obj["branch"]?.jsonPrimitive?.content
+            val statusStr = (obj["agent_status"] ?: obj["state"])?.jsonPrimitive?.content
+            ClientShellWorkspace(
+                workspaceId = id,
+                activeTabId = activeTabId,
+                label = label,
+                branch = branch,
+                focused = obj["focused"]?.jsonPrimitive?.booleanOrNull ?: (id == serverFocusedWsId),
+                agentStatus = parseAgentStatus(statusStr),
+            )
+        }
+
+        val effectiveWsId = sel.focusedWorkspaceId?.takeIf { id -> rawWorkspaces.any { it.workspaceId == id } }
+            ?: serverFocusedWsId
+            ?: rawWorkspaces.firstOrNull()?.workspaceId
+        sel.focusedWorkspaceId = effectiveWsId
+
+        val rawTabs = tabsArray.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val id = (obj["tab_id"] ?: obj["id"])?.jsonPrimitive?.content ?: return@mapNotNull null
+            val wsId = obj["workspace_id"]?.jsonPrimitive?.content ?: effectiveWsId.orEmpty()
+            val number = obj["number"]?.jsonPrimitive?.intOrNull ?: 1
+            val label = obj["label"]?.jsonPrimitive?.content ?: id
+            val statusStr = (obj["agent_status"] ?: obj["state"])?.jsonPrimitive?.content
+            ClientShellTab(
+                tabId = id,
+                workspaceId = wsId,
+                number = number,
+                label = label,
+                focused = obj["focused"]?.jsonPrimitive?.booleanOrNull ?: (id == serverFocusedTabId),
+                agentStatus = parseAgentStatus(statusStr),
+            )
+        }
+
+        val wsTabs = rawTabs.filter { it.workspaceId == effectiveWsId }
+        val activeWorkspaceObj = rawWorkspaces.firstOrNull { it.workspaceId == effectiveWsId }
+        val effectiveTabId = sel.focusedTabId?.takeIf { id -> wsTabs.any { it.tabId == id } }
+            ?: activeWorkspaceObj?.activeTabId?.takeIf { id -> wsTabs.any { it.tabId == id } }
+            ?: serverFocusedTabId?.takeIf { id -> wsTabs.any { it.tabId == id } }
+            ?: wsTabs.firstOrNull()?.tabId
+            ?: rawTabs.firstOrNull()?.tabId
+        sel.focusedTabId = effectiveTabId
+
+        val rawPanes = panesArray.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val id = (obj["pane_id"] ?: obj["id"])?.jsonPrimitive?.content ?: return@mapNotNull null
+            val wsId = obj["workspace_id"]?.jsonPrimitive?.content ?: effectiveWsId.orEmpty()
+            val tId = obj["tab_id"]?.jsonPrimitive?.content ?: effectiveTabId.orEmpty()
+            val label = obj["label"]?.jsonPrimitive?.content ?: id
+            val cwd = obj["cwd"]?.jsonPrimitive?.content.orEmpty()
+            ClientShellPane(
+                paneId = id,
+                workspaceId = wsId,
+                tabId = tId,
+                label = label,
+                cwd = cwd,
+                focused = obj["focused"]?.jsonPrimitive?.booleanOrNull ?: (id == serverFocusedPaneId),
+            )
+        }
+
+        val tabPanes = rawPanes.filter { it.tabId == effectiveTabId }
+        val effectivePaneId = sel.focusedPaneId?.takeIf { id -> tabPanes.any { it.paneId == id } }
+            ?: serverFocusedPaneId?.takeIf { id -> tabPanes.any { it.paneId == id } }
+            ?: tabPanes.firstOrNull()?.paneId
+            ?: rawPanes.firstOrNull()?.paneId
+        sel.focusedPaneId = effectivePaneId
+
+        val agents = agentsArray.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val pId = obj["pane_id"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            val wsId = obj["workspace_id"]?.jsonPrimitive?.content.orEmpty()
+            val tId = obj["tab_id"]?.jsonPrimitive?.content.orEmpty()
+            val name = obj["name"]?.jsonPrimitive?.content
+            val agent = obj["agent"]?.jsonPrimitive?.content.orEmpty()
+            val displayAgent = obj["display_agent"]?.jsonPrimitive?.content ?: name ?: agent
+            val title = obj["title"]?.jsonPrimitive?.content
+            val terminalTitle = obj["terminal_title"]?.jsonPrimitive?.content
+            val terminalTitleStripped = obj["terminal_title_stripped"]?.jsonPrimitive?.content
+            val statusStr = (obj["agent_status"] ?: obj["state"])?.jsonPrimitive?.content
+            ClientShellAgent(
+                paneId = pId,
+                workspaceId = wsId,
+                tabId = tId,
+                name = name,
+                displayAgent = displayAgent,
+                agent = agent,
+                title = title,
+                terminalTitle = terminalTitle,
+                terminalTitleStripped = terminalTitleStripped,
+                agentStatus = parseAgentStatus(statusStr),
+                focused = pId == effectivePaneId,
+            )
+        }
+
+        // Propagate agent statuses up to workspaces and tabs so top bar pills show attention dots
+        val updatedPanes = rawPanes.map { p ->
+            p.copy(focused = p.paneId == effectivePaneId)
+        }
+        val updatedTabs = rawTabs.map { t ->
+            val topTabAgentStatus = agents
+                .filter { it.tabId == t.tabId }
+                .minByOrNull { it.agentStatus.priorityOrder }
+                ?.agentStatus
+            t.copy(
+                focused = t.tabId == effectiveTabId,
+                agentStatus = topTabAgentStatus?.takeIf { it != AgentStatus.Unknown } ?: t.agentStatus,
+            )
+        }
+        val updatedWorkspaces = rawWorkspaces.map { ws ->
+            val topWsAgentStatus = agents
+                .filter { it.workspaceId == ws.workspaceId }
+                .minByOrNull { it.agentStatus.priorityOrder }
+                ?.agentStatus
+            ws.copy(
+                focused = ws.workspaceId == effectiveWsId,
+                agentStatus = topWsAgentStatus?.takeIf { it != AgentStatus.Unknown } ?: ws.agentStatus,
+            )
+        }
+
+        val layoutsByTab = mutableMapOf<String, PaneLayoutSnapshot>()
+        layoutsArray.forEach { el ->
+            val obj = el as? JsonObject ?: return@forEach
+            val tabId = obj["tab_id"]?.jsonPrimitive?.content ?: return@forEach
+            val wsId = obj["workspace_id"]?.jsonPrimitive?.content ?: effectiveWsId.orEmpty()
+            val zoomed = obj["zoomed"]?.jsonPrimitive?.booleanOrNull ?: false
+            val lPanes = (obj["panes"] as? JsonArray)?.mapNotNull { pEl ->
+                val pObj = pEl as? JsonObject ?: return@mapNotNull null
+                val pId = pObj["pane_id"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val rectObj = pObj["rect"] as? JsonObject ?: return@mapNotNull null
+                PaneLayoutPane(
+                    paneId = pId,
+                    rect = parseSurfaceRect(rectObj),
+                    focused = pId == effectivePaneId,
+                )
+            }.orEmpty()
+            val lSplits = (obj["splits"] as? JsonArray)?.mapNotNull { sEl ->
+                val sObj = sEl as? JsonObject ?: return@mapNotNull null
+                val sId = sObj["id"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val dirStr = sObj["direction"]?.jsonPrimitive?.content ?: "vertical"
+                val ratio = sObj["ratio"]?.jsonPrimitive?.floatOrNull ?: 0.5f
+                val rectObj = sObj["rect"] as? JsonObject ?: return@mapNotNull null
+                PaneLayoutSplit(
+                    id = sId,
+                    direction = if (dirStr.equals("horizontal", ignoreCase = true)) {
+                        PaneSurfaceSplitDirection.Horizontal
+                    } else {
+                        PaneSurfaceSplitDirection.Vertical
+                    },
+                    ratio = ratio,
+                    rect = parseSurfaceRect(rectObj),
+                )
+            }.orEmpty()
+            layoutsByTab[tabId] = PaneLayoutSnapshot(
+                workspaceId = wsId,
+                tabId = tabId,
+                zoomed = zoomed,
+                panes = lPanes,
+                splits = lSplits,
+            )
+        }
+
+        val snapshot = ClientShellSnapshot(
+            bootId = "herdr-$machineId",
+            revision = revisionCounter.incrementAndGet().toULong(),
+            focusedWorkspaceId = effectiveWsId,
+            focusedTabId = effectiveTabId,
+            focusedPaneId = effectivePaneId,
+            workspaces = updatedWorkspaces,
+            tabs = updatedTabs,
+            panes = updatedPanes,
+            agents = agents,
+        )
+        return ParsedSnapshotBundle(snapshot = snapshot, layoutsByTab = layoutsByTab)
+    }
+
+    private fun buildCompositeSurfaceFrame(
+        machineId: String,
+        snapshot: ClientShellSnapshot,
+        layout: PaneLayoutSnapshot?,
+        ansiByPane: Map<String, String>,
+    ): PaneSurfaceFrame {
+        val layoutPanes = layout?.panes?.takeIf { it.isNotEmpty() } ?: run {
+            val fallbackPaneId = snapshot.focusedPaneId ?: snapshot.panes.firstOrNull()?.paneId ?: "w1:p1"
+            listOf(
+                PaneLayoutPane(
+                    paneId = fallbackPaneId,
+                    rect = SurfaceRect(0u, 0u, 120u, 40u),
+                    focused = true,
+                ),
+            )
+        }
+
+        val totalCols = layoutPanes.maxOf { (it.rect.x + it.rect.width).toInt() }.coerceIn(40, 240)
+        val totalRows = layoutPanes.maxOf { (it.rect.y + it.rect.height).toInt() }.coerceIn(12, 120)
+        val grid = Array(totalCols * totalRows) { CellData() }
+
+        var focusedCursor: CursorState? = null
+        val surfacePanes = layoutPanes.map { lp ->
+            val paneMeta = snapshot.panes.firstOrNull { it.paneId == lp.paneId }
+            val agentMeta = snapshot.agents.firstOrNull { it.paneId == lp.paneId }
+            val ansiText = ansiByPane[lp.paneId].orEmpty()
+            val isFocused = lp.paneId == snapshot.focusedPaneId || lp.focused
+
+            val cursorPos = renderAnsiIntoRect(
+                ansiText = ansiText,
+                rect = lp.rect,
+                grid = grid,
+                gridCols = totalCols,
+                gridRows = totalRows,
+            )
+            if (isFocused) {
+                focusedCursor = CursorState(
+                    x = cursorPos.first.toUShort(),
+                    y = cursorPos.second.toUShort(),
+                    shape = CursorShape.Block,
+                    visible = true,
+                )
+            }
+
+            PaneSurfacePane(
+                paneId = lp.paneId,
+                rect = lp.rect,
+                innerRect = lp.rect,
+                focused = isFocused,
+                zoomed = layout?.zoomed == true,
+                title = agentMeta?.displayAgent?.takeIf { it.isNotBlank() }
+                    ?: paneMeta?.label
+                    ?: lp.paneId,
+                agentStatus = agentMeta?.agentStatus ?: AgentStatus.Unknown,
+                scroll = PaneSurfaceScroll(
+                    viewportRows = lp.rect.height,
+                ),
+            )
+        }
+
+        val splits = if (layout != null) deriveSplitsFromLayout(layout) else emptyList()
+
+        return PaneSurfaceFrame(
+            bootId = snapshot.bootId,
+            revision = snapshot.revision,
+            frame = FrameData(
+                width = totalCols.toUShort(),
+                height = totalRows.toUShort(),
+                cells = grid.toList(),
+                cursor = focusedCursor,
+            ),
+            panes = surfacePanes,
+            splits = splits,
+        )
+    }
+
+    /**
+     * Parses ANSI SGR escape sequences (`\u001b[...m`) in [ansiText] and populates [grid]
+     * inside [rect], returning the final `(col, row)` cursor coordinates.
+     */
+    private fun renderAnsiIntoRect(
+        ansiText: String,
+        rect: SurfaceRect,
+        grid: Array<CellData>,
+        gridCols: Int,
+        gridRows: Int,
+    ): Pair<Int, Int> {
+        val startX = rect.x.toInt().coerceIn(0, max(0, gridCols - 1))
+        val startY = rect.y.toInt().coerceIn(0, max(0, gridRows - 1))
+        val maxW = rect.width.toInt().coerceAtLeast(1)
+        val maxH = rect.height.toInt().coerceAtLeast(1)
+        val endX = min(gridCols, startX + maxW)
+        val endY = min(gridRows, startY + maxH)
+
+        // Split lines and keep the bottom-most maxH visible lines if the output is longer than maxH
+        val rawLines = ansiText.replace("\r\n", "\n").split('\n')
+        val visibleLines = if (rawLines.size > maxH) {
+            rawLines.takeLast(maxH)
+        } else {
+            rawLines
+        }
+
+        var fg: UInt = 0u
+        var bg: UInt = 0u
+        var mod: UShort = 0u
+        var lastCol = startX
+        var lastRow = startY
+
+        for (lineIdx in visibleLines.indices) {
+            val row = startY + lineIdx
+            if (row >= endY) break
+            val line = visibleLines[lineIdx]
+            var col = startX
+            var i = 0
+            while (i < line.length) {
+                val ch = line[i]
+                if (ch == '\u001b') {
+                    if (i + 1 < line.length && line[i + 1] == '[') {
+                        // CSI sequence: \u001b[ ... <final byte 0x40..0x7E>
+                        var j = i + 2
+                        while (j < line.length && line[j].code !in 0x40..0x7E) {
+                            j++
+                        }
+                        if (j < line.length) {
+                            val finalChar = line[j]
+                            val paramsStr = line.substring(i + 2, j)
+                            if (finalChar == 'm') {
+                                val sgrState = applySgrCodes(paramsStr, fg, bg, mod)
+                                fg = sgrState.first
+                                bg = sgrState.second
+                                mod = sgrState.third
+                            }
+                            i = j + 1
+                            continue
+                        }
+                    } else if (i + 1 < line.length && line[i + 1] == ']') {
+                        // OSC sequence: skip until BEL (\u0007) or ST (\u001b\\)
+                        var j = i + 2
+                        while (j < line.length && line[j] != '\u0007') {
+                            if (line[j] == '\u001b' && j + 1 < line.length && line[j + 1] == '\\') {
+                                j++
+                                break
+                            }
+                            j++
+                        }
+                        i = (j + 1).coerceAtMost(line.length)
+                        continue
+                    }
+                    i++
+                    continue
+                }
+
+                if (ch == '\r') {
+                    col = startX
+                    i++
+                    continue
+                }
+                if (ch == '\t') {
+                    val nextStop = startX + (((col - startX) / 4) + 1) * 4
+                    col = min(endX - 1, nextStop)
+                    i++
+                    continue
+                }
+                if (ch.code < 32) {
+                    i++
+                    continue
+                }
+
+                if (col < endX && row < endY) {
+                    grid[row * gridCols + col] = CellData(
+                        symbol = ch.toString(),
+                        fg = fg,
+                        bg = bg,
+                        modifier = mod,
+                    )
+                    lastCol = col
+                    lastRow = row
+                }
+                col++
+                i++
+            }
+        }
+        return min(endX - 1, lastCol + 1) to lastRow
+    }
+
+    private fun applySgrCodes(
+        paramsStr: String,
+        currentFg: UInt,
+        currentBg: UInt,
+        currentMod: UShort,
+    ): Triple<UInt, UInt, UShort> {
+        if (paramsStr.isEmpty()) {
+            return Triple(0u, 0u, 0u)
+        }
+        val codes = paramsStr.split(';').map { it.toIntOrNull() ?: 0 }
+        var fg = currentFg
+        var bg = currentBg
+        var mod = currentMod.toInt()
+        var idx = 0
+        while (idx < codes.size) {
+            when (val c = codes[idx]) {
+                0 -> {
+                    fg = 0u
+                    bg = 0u
+                    mod = 0
+                }
+                1 -> mod = mod or 0x0001
+                2 -> mod = mod or 0x0002
+                3 -> mod = mod or 0x0004
+                4 -> mod = mod or 0x0008
+                7 -> mod = mod or 0x0040
+                9 -> mod = mod or 0x0100
+                22 -> mod = mod and (0x0001 or 0x0002).inv()
+                23 -> mod = mod and 0x0004.inv()
+                24 -> mod = mod and 0x0008.inv()
+                27 -> mod = mod and 0x0040.inv()
+                29 -> mod = mod and 0x0100.inv()
+                in 30..37 -> fg = 0x01_00_00_00u or (c - 30).toUInt()
+                39 -> fg = 0u
+                in 40..47 -> bg = 0x01_00_00_00u or (c - 40).toUInt()
+                49 -> bg = 0u
+                in 90..97 -> fg = 0x01_00_00_00u or (c - 90 + 8).toUInt()
+                in 100..107 -> bg = 0x01_00_00_00u or (c - 100 + 8).toUInt()
+                38 -> {
+                    if (idx + 2 < codes.size && codes[idx + 1] == 5) {
+                        val n = codes[idx + 2].coerceIn(0, 255)
+                        fg = 0x01_00_00_00u or n.toUInt()
+                        idx += 2
+                    } else if (idx + 4 < codes.size && codes[idx + 1] == 2) {
+                        val r = codes[idx + 2].coerceIn(0, 255)
+                        val g = codes[idx + 3].coerceIn(0, 255)
+                        val b = codes[idx + 4].coerceIn(0, 255)
+                        fg = 0x02_00_00_00u or (r.toUInt() shl 16) or (g.toUInt() shl 8) or b.toUInt()
+                        idx += 4
+                    }
+                }
+                48 -> {
+                    if (idx + 2 < codes.size && codes[idx + 1] == 5) {
+                        val n = codes[idx + 2].coerceIn(0, 255)
+                        bg = 0x01_00_00_00u or n.toUInt()
+                        idx += 2
+                    } else if (idx + 4 < codes.size && codes[idx + 1] == 2) {
+                        val r = codes[idx + 2].coerceIn(0, 255)
+                        val g = codes[idx + 3].coerceIn(0, 255)
+                        val b = codes[idx + 4].coerceIn(0, 255)
+                        bg = 0x02_00_00_00u or (r.toUInt() shl 16) or (g.toUInt() shl 8) or b.toUInt()
+                        idx += 4
+                    }
+                }
+            }
+            idx++
+        }
+        return Triple(fg, bg, mod.toUShort())
+    }
+
+    private fun stripAnsiCodes(text: String): String =
+        text.replace(Regex("\u001b\\[[0-9;?]*[ -/]*[@-~]"), "")
+            .replace(Regex("\u001b\\][^\u0007]*\u0007"), "")
+
+    private fun parseSurfaceRect(rectObj: JsonObject): SurfaceRect =
+        SurfaceRect(
+            x = (rectObj["x"]?.jsonPrimitive?.intOrNull ?: 0).coerceAtLeast(0).toUShort(),
+            y = (rectObj["y"]?.jsonPrimitive?.intOrNull ?: 0).coerceAtLeast(0).toUShort(),
+            width = (rectObj["width"]?.jsonPrimitive?.intOrNull ?: 80).coerceAtLeast(1).toUShort(),
+            height = (rectObj["height"]?.jsonPrimitive?.intOrNull ?: 24).coerceAtLeast(1).toUShort(),
+        )
+
+    private fun parseAgentStatus(raw: String?): AgentStatus =
+        when (raw?.trim()?.lowercase()) {
+            "blocked" -> AgentStatus.Blocked
+            "working", "running" -> AgentStatus.Working
+            "done", "completed" -> AgentStatus.Done
+            "idle" -> AgentStatus.Idle
+            else -> AgentStatus.Unknown
+        }
+}
