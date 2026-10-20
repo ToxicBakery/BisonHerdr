@@ -12,6 +12,7 @@ import com.toxicbakery.app.bison.common.terminal.TerminalSelectionRange
 import com.toxicbakery.app.bison.common.theme.BisonThemePalette
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.resolveTheme
+import com.toxicbakery.app.bison.common.version.VersionCheck
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.AppSettings
 import com.toxicbakery.app.bison.model.HostMachine
@@ -98,6 +99,7 @@ class WorkspaceTerminalViewModel(
         ) : Event
         data class SelectionChanged(val selection: TerminalSelectionRange?) : Event
         data class CopySelection(val selection: TerminalSelectionRange) : Event
+        data object AcknowledgeReleaseUpdate : Event
 
         companion object {
             fun SubmitComposerPrompt(
@@ -462,6 +464,16 @@ class WorkspaceTerminalViewModel(
                     )
                 }
             }
+
+            Event.AcknowledgeReleaseUpdate -> {
+                acknowledgeReleaseUpdate()
+            }
+        }
+    }
+
+    fun acknowledgeReleaseUpdate() {
+        viewModelScope.launch {
+            appSettingsStore?.updateSettings(VersionCheck::acknowledgeRelease)
         }
     }
 

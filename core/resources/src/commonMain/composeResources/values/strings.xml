@@ -123,6 +123,12 @@
     <string name="settings_section_mosh_roaming">Mosh UDP &amp; Background Parking</string>
     <string name="settings_predictive_echo_label">Mosh Local Predictive Echo</string>
     <string name="settings_surface_lease_label">Zero-Bandwidth Background Parking (surface_interest)</string>
+    <string name="settings_app_check_updates">Check for updates</string>
+    <string name="settings_app_check_updates_summary">Check GitHub for a new release at most once a day.</string>
+    <string name="settings_about_new">New</string>
+    <string name="settings_about_update_available">BisonHerdr %1$s is available.</string>
+    <string name="settings_about_open_release">View release on GitHub</string>
+    <string name="frame_update_available">Update %1$s</string>
 
     <!-- Foreground Service & Actionable System Notifications -->
     <string name="service_notification_channel_name">BisonHerdr Active Sessions</string>
