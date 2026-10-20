@@ -14,7 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -39,6 +39,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,12 +85,15 @@ fun ConnectingMachineScreen(
     val activeBackbone by viewModel.activeBackbone.collectAsState()
     val palette = LocalBisonPalette.current
 
+    var hasNavigatedOnConnect by remember(machineId) { mutableStateOf(false) }
+
     LaunchedEffect(machineId) {
         viewModel.onEvent(ConnectingMachineViewModel.Event.StartConnectIfNeeded)
     }
 
     LaunchedEffect(progress) {
-        if (progress == ConnectionProgress.Connected) {
+        if (progress == ConnectionProgress.Connected && !hasNavigatedOnConnect) {
+            hasNavigatedOnConnect = true
             onConnected(machineId)
         }
     }
@@ -95,7 +101,12 @@ fun ConnectingMachineScreen(
     LaunchedEffect(viewModel) {
         viewModel.actions.collect { action ->
             when (action) {
-                is ConnectingMachineViewModel.Action.Connected -> onConnected(action.machineId)
+                is ConnectingMachineViewModel.Action.Connected -> {
+                    if (!hasNavigatedOnConnect) {
+                        hasNavigatedOnConnect = true
+                        onConnected(action.machineId)
+                    }
+                }
                 ConnectingMachineViewModel.Action.Cancelled -> onCancel()
             }
         }
@@ -283,10 +294,16 @@ fun ConnectingMachineScreen(
                                         .padding(12.dp),
                                     verticalArrangement = Arrangement.spacedBy(4.dp),
                                 ) {
-                                    items(
+                                    itemsIndexed(
                                         items = logs,
-                                        key = { "${it.timestampEpochMs}-${it.tag}-${it.message.hashCode()}" },
-                                    ) { entry ->
+                                        key = { index, entry ->
+                                            if (entry.id != 0L) {
+                                                entry.id
+                                            } else {
+                                                "$index-${entry.timestampEpochMs}-${entry.tag}-${entry.message.hashCode()}"
+                                            }
+                                        },
+                                    ) { _, entry ->
                                         Text(
                                             text = "[${entry.tag}] ${entry.message}",
                                             style = MaterialTheme.typography.labelSmall,

@@ -58,9 +58,14 @@ class NavigationController(
     fun navigateToWorkspaceTerminal(machineId: String, workspaceId: String? = null) {
         val target = ScreenKeyWorkspaceTerminal(machineId = machineId, workspaceId = workspaceId)
         val current = backStack.lastOrNull()
+        if (current == target) {
+            return
+        }
         if (current is ScreenKeyWorkspaceTerminal || current is ScreenKeyConnectingMachine) {
             backStack.removeLastOrNull()
         }
-        backStack.add(target)
+        if (backStack.lastOrNull() != target) {
+            backStack.add(target)
+        }
     }
 }

@@ -4,6 +4,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.serialization.Serializable
 
 /**
@@ -11,6 +12,7 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 data class SshLogEntry(
+    val id: Long = 0L,
     val timestampEpochMs: Long = 0L,
     val machineId: String,
     val tag: String,
@@ -24,6 +26,7 @@ data class SshLogEntry(
 class SshDebugLog(
     private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
 ) {
+    private val nextId = MutableStateFlow(0L)
     private val _entries = MutableStateFlow<List<SshLogEntry>>(emptyList())
     val entries: StateFlow<List<SshLogEntry>> = _entries.asStateFlow()
 
@@ -35,6 +38,7 @@ class SshDebugLog(
         timestampEpochMs: Long = 0L,
     ) {
         val entry = SshLogEntry(
+            id = nextId.updateAndGet { it + 1L },
             timestampEpochMs = timestampEpochMs,
             machineId = machineId,
             tag = tag,

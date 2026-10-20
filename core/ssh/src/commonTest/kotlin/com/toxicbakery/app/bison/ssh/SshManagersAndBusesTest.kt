@@ -114,5 +114,13 @@ class SshManagersAndBusesTest {
         debugLog.log("workbox", "Step 4")
         assertEquals(3, debugLog.entries.value.size)
         assertEquals("Step 2", debugLog.entries.value.first().message)
+
+        // Identical messages recorded at the same timestamp must still receive unique monotonic IDs
+        debugLog.record(machineId = "lan-host", tag = "RealSSH", message = "SSH connection failed", isError = true, timestampEpochMs = 0L)
+        debugLog.record(machineId = "lan-host", tag = "RealSSH", message = "SSH connection failed", isError = true, timestampEpochMs = 0L)
+        val lanEntries = debugLog.entries.value.filter { it.machineId == "lan-host" }
+        assertEquals(2, lanEntries.size)
+        assertTrue(lanEntries[0].id > 0L)
+        assertTrue(lanEntries[1].id > lanEntries[0].id)
     }
 }

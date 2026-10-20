@@ -36,6 +36,8 @@ import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -82,12 +84,14 @@ class SshTransportManager(
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
     private val surfaceLeaseActive = ConcurrentHashMap<String, Boolean>()
+    private val connectLocks = ConcurrentHashMap<String, Mutex>()
     private val presentationEpochCounter = AtomicLong(1L)
     private val realHerdrSshClient = RealHerdrSshClient(
         sshDebugLog = sshDebugLog,
         endpointSnapshotBus = endpointSnapshotBus,
         paneSurfaceBus = paneSurfaceBus,
         semanticNotificationBus = semanticNotificationBus,
+        keystoreKeyManagerProvider = { keystoreKeyManager },
     )
 
     private fun shouldUseRealSsh(machine: HostMachine): Boolean {
@@ -164,7 +168,12 @@ class SshTransportManager(
     /**
      * Executes the 4-phase Connection Lifecycle State Machine for [machine].
      */
-    suspend fun connect(machine: HostMachine): Boolean {
+    suspend fun connect(machine: HostMachine): Boolean =
+        connectLocks.computeIfAbsent(machine.id) { Mutex() }.withLock {
+            connectInternal(machine)
+        }
+
+    private suspend fun connectInternal(machine: HostMachine): Boolean {
         val machineId = machine.id
         activeMachines[machineId] = machine
         surfaceLeaseActive[machineId] = true
