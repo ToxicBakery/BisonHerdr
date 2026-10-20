@@ -12,7 +12,6 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -55,9 +54,11 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -71,6 +72,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.toxicbakery.app.bison.common.theme.BisonThemePalette
@@ -188,21 +190,25 @@ fun TerminalSurfaceCanvas(
     var activeDragRatio by remember { mutableFloatStateOf(0.5f) }
     var activeSelection by remember { mutableStateOf<TerminalSelectionRange?>(null) }
     var scrollAccumulatorPx by remember { mutableFloatStateOf(0f) }
+    var canvasSizePx by remember { mutableStateOf(IntSize.Zero) }
 
-    BoxWithConstraints(
+    Box(
         modifier = modifier
             .fillMaxSize()
             .background(palette.terminalBg)
+            .onSizeChanged { canvasSizePx = it }
             .testTag("terminalSurfaceCanvas")
     ) {
-        val canvasWidthPx = with(density) { maxWidth.toPx() }
-        val canvasHeightPx = with(density) { maxHeight.toPx() }
+        val canvasWidthPx = (if (canvasSizePx.width > 0) canvasSizePx.width else 1920).toFloat()
+        val canvasHeightPx = (if (canvasSizePx.height > 0) canvasSizePx.height else 1200).toFloat()
 
         val computedCols = max(20, (canvasWidthPx / cellWidthPx).toInt()).toUShort()
         val computedRows = max(8, (canvasHeightPx / cellHeightPx).toInt()).toUShort()
 
-        LaunchedEffect(computedCols, computedRows, cellWidthPx, cellHeightPx) {
-            onSurfaceResize(computedCols, computedRows, cellWidthPx, cellHeightPx)
+        LaunchedEffect(computedCols, computedRows, cellWidthPx, cellHeightPx, canvasSizePx) {
+            if (canvasSizePx.width > 0 && canvasSizePx.height > 0) {
+                onSurfaceResize(computedCols, computedRows, cellWidthPx, cellHeightPx)
+            }
         }
 
         val frameCols = (surfaceFrame?.cols?.toInt()?.takeIf { it > 0 } ?: computedCols.toInt())
@@ -261,6 +267,15 @@ fun TerminalSurfaceCanvas(
                 fontWeight = FontWeight.Bold,
                 fontStyle = FontStyle.Italic,
                 textDecoration = TextDecoration.None,
+            )
+        }
+        val asciiGlyphCache = remember(normalStyle, boldStyle, italicStyle, boldItalicStyle, textMeasurer, density) {
+            AsciiGlyphCache.build(
+                textMeasurer = textMeasurer,
+                normalStyle = normalStyle,
+                boldStyle = boldStyle,
+                italicStyle = italicStyle,
+                boldItalicStyle = boldItalicStyle,
             )
         }
         val scratchPath = remember { Path() }
@@ -496,6 +511,7 @@ fun TerminalSurfaceCanvas(
                     boldStyle = boldStyle,
                     italicStyle = italicStyle,
                     boldItalicStyle = boldItalicStyle,
+                    asciiGlyphCache = asciiGlyphCache,
                     scratchPath = scratchPath,
                     textMeasurer = textMeasurer,
                     palette = palette,
@@ -783,6 +799,57 @@ fun TerminalSurfaceCanvas(
     }
 }
 
+@Immutable
+private class AsciiGlyphCache(
+    private val normal: Array<TextLayoutResult>,
+    private val bold: Array<TextLayoutResult>,
+    private val italic: Array<TextLayoutResult>,
+    private val boldItalic: Array<TextLayoutResult>,
+) {
+    fun lookup(
+        code: Int,
+        isBold: Boolean,
+        isItalic: Boolean,
+    ): TextLayoutResult? {
+        if (code !in FIRST_ASCII..LAST_ASCII) return null
+        val index = code - FIRST_ASCII
+        return when {
+            isBold && isItalic -> boldItalic[index]
+            isBold -> bold[index]
+            isItalic -> italic[index]
+            else -> normal[index]
+        }
+    }
+
+    companion object {
+        private const val FIRST_ASCII = 0x21
+        private const val LAST_ASCII = 0x7E
+        private const val COUNT = LAST_ASCII - FIRST_ASCII + 1
+        private val ASCII_STRINGS = Array(COUNT) { (FIRST_ASCII + it).toChar().toString() }
+
+        fun build(
+            textMeasurer: TextMeasurer,
+            normalStyle: TextStyle,
+            boldStyle: TextStyle,
+            italicStyle: TextStyle,
+            boldItalicStyle: TextStyle,
+        ): AsciiGlyphCache = AsciiGlyphCache(
+            normal = Array(COUNT) { i ->
+                textMeasurer.measure(text = ASCII_STRINGS[i], style = normalStyle, softWrap = false, maxLines = 1)
+            },
+            bold = Array(COUNT) { i ->
+                textMeasurer.measure(text = ASCII_STRINGS[i], style = boldStyle, softWrap = false, maxLines = 1)
+            },
+            italic = Array(COUNT) { i ->
+                textMeasurer.measure(text = ASCII_STRINGS[i], style = italicStyle, softWrap = false, maxLines = 1)
+            },
+            boldItalic = Array(COUNT) { i ->
+                textMeasurer.measure(text = ASCII_STRINGS[i], style = boldItalicStyle, softWrap = false, maxLines = 1)
+            },
+        )
+    }
+}
+
 private fun DrawScope.drawFrameCells(
     frame: FrameData,
     cellWidth: Float,
@@ -791,6 +858,7 @@ private fun DrawScope.drawFrameCells(
     boldStyle: TextStyle,
     italicStyle: TextStyle,
     boldItalicStyle: TextStyle,
+    asciiGlyphCache: AsciiGlyphCache,
     scratchPath: Path,
     textMeasurer: TextMeasurer,
     palette: BisonThemePalette,
@@ -905,18 +973,28 @@ private fun DrawScope.drawFrameCells(
                 }
             }
 
-            val glyphStyle = when {
-                cell.isBold && cell.isItalic -> boldItalicStyle
-                cell.isBold -> boldStyle
-                cell.isItalic -> italicStyle
-                else -> normalStyle
+            val layoutResult = if (symbol.length == 1) {
+                asciiGlyphCache.lookup(
+                    code = firstCode,
+                    isBold = cell.isBold,
+                    isItalic = cell.isItalic,
+                )
+            } else {
+                null
+            } ?: run {
+                val glyphStyle = when {
+                    cell.isBold && cell.isItalic -> boldItalicStyle
+                    cell.isBold -> boldStyle
+                    cell.isItalic -> italicStyle
+                    else -> normalStyle
+                }
+                textMeasurer.measure(
+                    text = symbol,
+                    style = glyphStyle,
+                    softWrap = false,
+                    maxLines = 1,
+                )
             }
-            val layoutResult = textMeasurer.measure(
-                text = symbol,
-                style = glyphStyle,
-                softWrap = false,
-                maxLines = 1,
-            )
             val offsetX = xPx + max(0f, (cellWidth - layoutResult.size.width) * 0.5f)
             val offsetY = yPx + (cellHeight - layoutResult.size.height) * 0.5f
             drawText(

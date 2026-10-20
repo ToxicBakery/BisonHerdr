@@ -36,6 +36,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -120,13 +121,37 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun collectSshRequests() {
+        val fastInteractiveQueue = Channel<SshRequest>(Channel.UNLIMITED)
+        val controlQueue = Channel<SshRequest>(Channel.UNLIMITED)
+
         serviceScope.launch {
-            sshRequestManager.bus.collect { request ->
+            for (request in fastInteractiveQueue) {
                 runCatching {
                     dispatchSshRequest(request)
                 }.onFailure { error ->
                     if (error is CancellationException) throw error
-                    log.e(error) { "Failed to handle SshRequest: $request" }
+                    log.e(error) { "Failed to handle fast interactive SshRequest: $request" }
+                }
+            }
+        }
+
+        serviceScope.launch {
+            for (request in controlQueue) {
+                runCatching {
+                    dispatchSshRequest(request)
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
+                    log.e(error) { "Failed to handle control SshRequest: $request" }
+                }
+            }
+        }
+
+        serviceScope.launch {
+            sshRequestManager.bus.collect { request ->
+                when (request) {
+                    is SshRequest.SendPaneInput,
+                    is SshRequest.ResizeShell -> fastInteractiveQueue.trySend(request)
+                    else -> controlQueue.trySend(request)
                 }
             }
         }

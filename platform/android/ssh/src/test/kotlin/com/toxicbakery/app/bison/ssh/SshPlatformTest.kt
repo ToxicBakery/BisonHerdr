@@ -8,6 +8,8 @@ import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.protocol.ClientKeyCode
+import com.toxicbakery.app.bison.protocol.ClientKeyEvent
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneLayoutPane
@@ -285,5 +287,120 @@ class SshPlatformTest {
         transport.onNetworkAvailable("workbox")
         val afterRoam = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
         assertEquals(1, afterRoam.roamedCount)
+    }
+
+    @Test
+    fun realHerdrSshClientAppliesInstantOptimisticEchoAndCoalescesInputOnDedicatedLane() = runTest {
+        val debugLog = SshDebugLog()
+        val snapshotBus = EndpointSnapshotBus()
+        val surfaceBus = PaneSurfaceBus()
+        val notificationBus = SemanticNotificationBus()
+
+        val recordedBatches = mutableListOf<Pair<RealHerdrSshClient.WorkerLane, List<RealHerdrSshClient.RemoteShellCommand>>>()
+        var remotePaneBuffer = "$ "
+
+        val client = RealHerdrSshClient(
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = snapshotBus,
+            paneSurfaceBus = surfaceBus,
+            semanticNotificationBus = notificationBus,
+            remoteBatchExecutor = { _, _, lane, commands ->
+                synchronized(recordedBatches) {
+                    recordedBatches.add(lane to commands)
+                }
+                buildString {
+                    for (cmd in commands) {
+                        when (cmd) {
+                            is RealHerdrSshClient.RemoteShellCommand.Exec -> {
+                                if (cmd.command.contains("herdr api snapshot")) {
+                                    appendLine(
+                                        """{"id":"snap","result":{"type":"session_snapshot","snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"%1","workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","label":"main","focused":true}],"tabs":[{"tab_id":"w1:t1","workspace_id":"w1","number":1,"label":"shell","focused":true}],"panes":[{"pane_id":"%1","workspace_id":"w1","tab_id":"w1:t1","label":"zsh","cwd":"~","focused":true}],"agents":[],"layouts":[{"workspace_id":"w1","tab_id":"w1:t1","zoomed":false,"panes":[{"pane_id":"%1","rect":{"x":0,"y":0,"width":80,"height":24},"focused":true}],"splits":[]}]}}}"""
+                                    )
+                                }
+                            }
+                            is RealHerdrSshClient.RemoteShellCommand.ApiBridgeLine -> {
+                                val line = cmd.ndjsonLine
+                                when {
+                                    line.contains("\"pane.send_text\"") || line.contains("\"pane.send_input\"") -> {
+                                        val textMatch = Regex("\"text\":\"([^\"]*)\"").find(line)
+                                        if (textMatch != null) {
+                                            remotePaneBuffer += textMatch.groupValues[1]
+                                        }
+                                        appendLine("""{"id":"in_1","result":{"type":"ok"}}""")
+                                    }
+                                    line.contains("\"pane.read\"") -> {
+                                        appendLine(
+                                            """{"id":"read_%1","result":{"type":"pane_read","read":{"pane_id":"%1","text":"$remotePaneBuffer"}}}"""
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+        val machine = HostMachine(
+            id = "lan-box",
+            name = "LAN Box",
+            hostname = "192.168.1.42",
+            username = "ian",
+        )
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+
+        // 1. Seed initial snapshot and surface via Poll lane
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+        val initialSurface = assertNotNull(surfaceBus.surfaceFor("lan-box"))
+        assertEquals("$", initialSurface.frame.cellAt(0, 0)?.symbol)
+
+        synchronized(recordedBatches) { recordedBatches.clear() }
+
+        // 2. Verify buildCoalescedInputCommands merges consecutive TextCommit + Key into single pane.send_input
+        val coalesced = client.buildCoalescedInputCommands(
+            listOf(
+                RealHerdrSshClient.PendingPaneInput(1L, "%1", ClientPaneInputEvent.TextCommit("l")),
+                RealHerdrSshClient.PendingPaneInput(2L, "%1", ClientPaneInputEvent.TextCommit("s")),
+                RealHerdrSshClient.PendingPaneInput(
+                    3L,
+                    "%1",
+                    ClientPaneInputEvent.Key(ClientKeyEvent(code = ClientKeyCode.Enter)),
+                ),
+            )
+        )
+        assertEquals(1, coalesced.size)
+        assertTrue(coalesced.single().ndjsonLine.contains("\"method\":\"pane.send_input\""))
+        assertTrue(coalesced.single().ndjsonLine.contains("\"text\":\"ls\""))
+        assertTrue(coalesced.single().ndjsonLine.contains("\"keys\":[\"Enter\"]"))
+
+        // 3. Send "l" and "s" and verify instant optimistic local echo on PaneSurfaceBus
+        assertTrue(client.sendPaneInput(machine, route, "%1", ClientPaneInputEvent.TextCommit("l")))
+        val optimisticAfterL = assertNotNull(surfaceBus.surfaceFor("lan-box"))
+        val predictedCell = assertNotNull(optimisticAfterL.frame.cellAt(1, 0))
+        assertEquals("l", predictedCell.symbol)
+        assertTrue(predictedCell.isPredictedEcho)
+
+        assertTrue(client.sendPaneInput(machine, route, "%1", ClientPaneInputEvent.TextCommit("s")))
+        client.awaitInputFlush("lan-box")
+
+        // 4. Verify input executed on WorkerLane.Input and did NOT invoke `herdr api snapshot`
+        val executedCopy = synchronized(recordedBatches) { recordedBatches.toList() }
+        assertTrue(executedCopy.isNotEmpty())
+        assertTrue(executedCopy.all { (lane, _) -> lane == RealHerdrSshClient.WorkerLane.Input })
+        val allInputCmds = executedCopy.flatMap { it.second }
+        assertTrue(
+            allInputCmds.none { cmd ->
+                cmd is RealHerdrSshClient.RemoteShellCommand.Exec && cmd.command.contains("herdr api snapshot")
+            },
+            "Typing characters must not trigger full herdr api snapshot processes",
+        )
+
+        // 5. Verify authoritative server read ("$ ls") replaced the optimistic prediction
+        val settledSurface = assertNotNull(surfaceBus.surfaceFor("lan-box"))
+        assertEquals("l", settledSurface.frame.cellAt(2, 0)?.symbol)
+        assertEquals("s", settledSurface.frame.cellAt(3, 0)?.symbol)
+        assertFalse(settledSurface.frame.cellAt(2, 0)?.isPredictedEcho == true)
+
+        client.disconnect("lan-box")
     }
 }

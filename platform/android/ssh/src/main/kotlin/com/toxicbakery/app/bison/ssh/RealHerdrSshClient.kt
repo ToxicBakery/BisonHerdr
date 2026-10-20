@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.ssh
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
+import com.jcraft.jsch.SocketFactory
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.AgentStatus
@@ -29,9 +30,18 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceScroll
 import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.ArrayDeque
 import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
@@ -39,6 +49,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -64,6 +75,10 @@ import kotlinx.serialization.json.put
  * streams visible ANSI pane buffers via `herdr remote-api-bridge` (`pane.read`), and dispatches
  * real interactive keystrokes (`pane.send_text`, `pane.send_keys`, `pane.send_input`), prompts,
  * and workspace/tab/pane focus mutations.
+ *
+ * Uses two dedicated persistent POSIX `sh` worker channels per machine ([WorkerLane.Input] and [WorkerLane.Poll])
+ * over `TCP_NODELAY` sockets with client-side optimistic local echo (`<1ms`), keystroke coalescing, and
+ * focused-pane-only reads so interactive typing never spawns per-key SSH channels or blocks behind background polls.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -71,7 +86,56 @@ internal class RealHerdrSshClient(
     private val paneSurfaceBus: PaneSurfaceBus,
     private val semanticNotificationBus: SemanticNotificationBus,
     private val keystoreKeyManagerProvider: () -> AndroidKeystoreKeyManager = { AndroidKeystoreKeyManager() },
+    private val remoteBatchExecutor: (
+        suspend (
+            machine: HostMachine,
+            route: ResolvedSshRoute,
+            lane: WorkerLane,
+            commands: List<RemoteShellCommand>,
+        ) -> String
+    )? = null,
 ) {
+    internal enum class WorkerLane {
+        Input,
+        Poll,
+    }
+
+    internal sealed interface RemoteShellCommand {
+        data class Exec(val command: String) : RemoteShellCommand
+        data class ApiBridgeLine(val ndjsonLine: String) : RemoteShellCommand
+    }
+
+    internal data class PendingPaneInput(
+        val seq: Long,
+        val paneId: String,
+        val event: ClientPaneInputEvent,
+    )
+
+    internal sealed interface OptimisticEdit {
+        val seq: Long
+        val paneId: String
+        val createdAtMs: Long
+
+        data class InsertText(
+            override val seq: Long,
+            override val paneId: String,
+            val text: String,
+            override val createdAtMs: Long = System.currentTimeMillis(),
+        ) : OptimisticEdit
+
+        data class Backspace(
+            override val seq: Long,
+            override val paneId: String,
+            override val createdAtMs: Long = System.currentTimeMillis(),
+        ) : OptimisticEdit
+
+        data class Newline(
+            override val seq: Long,
+            override val paneId: String,
+            override val createdAtMs: Long = System.currentTimeMillis(),
+        ) : OptimisticEdit
+    }
+
     private data class ClientSelectionState(
         @Volatile var focusedWorkspaceId: String? = null,
         @Volatile var focusedTabId: String? = null,
@@ -90,15 +154,55 @@ internal class RealHerdrSshClient(
         val ansiByPane: Map<String, String>,
     )
 
+    private class PersistentShellWorker(
+        val channel: ChannelExec,
+        val stdin: OutputStream,
+        val stdout: BufferedReader,
+    ) {
+        val isAlive: Boolean
+            get() = !channel.isClosed && channel.isConnected
+
+        fun close() {
+            runCatching { stdin.close() }
+            runCatching { stdout.close() }
+            runCatching { channel.disconnect() }
+        }
+    }
+
+    private object LowLatencySocketFactory : SocketFactory {
+        override fun createSocket(host: String, port: Int): Socket =
+            Socket().apply {
+                tcpNoDelay = true
+                keepAlive = true
+                runCatching { trafficClass = IPTOS_LOWDELAY }
+                connect(InetSocketAddress(host, port), SOCKET_CONNECT_TIMEOUT_MS)
+            }
+
+        override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
+
+        override fun getOutputStream(socket: Socket): OutputStream = socket.getOutputStream()
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = ConcurrentHashMap<String, Session>()
-    private val sessionLocks = ConcurrentHashMap<String, Mutex>()
+    private val sessionOpenLocks = ConcurrentHashMap<String, Mutex>()
+    private val inputLaneLocks = ConcurrentHashMap<String, Mutex>()
+    private val pollLaneLocks = ConcurrentHashMap<String, Mutex>()
+    private val inputWorkers = ConcurrentHashMap<String, PersistentShellWorker>()
+    private val pollWorkers = ConcurrentHashMap<String, PersistentShellWorker>()
     private val pollJobs = ConcurrentHashMap<String, Job>()
+    private val inputFlushJobs = ConcurrentHashMap<String, Job>()
+    private val inputFlushSignals = ConcurrentHashMap<String, Channel<Unit>>()
+    private val pendingInputQueues = ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingPaneInput>>()
+    private val optimisticEdits = ConcurrentHashMap<String, ArrayDeque<OptimisticEdit>>()
     private val selectionState = ConcurrentHashMap<String, ClientSelectionState>()
     private val cachedInputs = ConcurrentHashMap<String, CachedSurfaceInputs>()
     private val viewportSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val revisionCounter = AtomicLong(10L)
+    private val inputSequence = AtomicLong(0L)
+    private val lastInputConfirmedSeq = ConcurrentHashMap<String, Long>()
+    private val shellBatchCounter = AtomicLong(1L)
 
     fun isSimulatedHost(machine: HostMachine): Boolean {
         val host = machine.hostname.trim().lowercase()
@@ -110,35 +214,49 @@ internal class RealHerdrSshClient(
         return false
     }
 
-    private fun mutexFor(machineId: String): Mutex =
-        sessionLocks.computeIfAbsent(machineId) { Mutex() }
+    private fun sessionMutexFor(machineId: String): Mutex =
+        sessionOpenLocks.computeIfAbsent(machineId) { Mutex() }
+
+    private fun laneMutexFor(machineId: String, lane: WorkerLane): Mutex =
+        when (lane) {
+            WorkerLane.Input -> inputLaneLocks.computeIfAbsent(machineId) { Mutex() }
+            WorkerLane.Poll -> pollLaneLocks.computeIfAbsent(machineId) { Mutex() }
+        }
+
+    private fun inputQueueFor(machineId: String): ConcurrentLinkedQueue<PendingPaneInput> =
+        pendingInputQueues.computeIfAbsent(machineId) { ConcurrentLinkedQueue() }
+
+    private fun optimisticEditsFor(machineId: String): ArrayDeque<OptimisticEdit> =
+        optimisticEdits.computeIfAbsent(machineId) { ArrayDeque() }
 
     suspend fun connectAndVerify(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Boolean = withContext(Dispatchers.IO) {
-        mutexFor(machine.id).withLock {
-            runCatching {
-                val session = getOrOpenSessionLocked(machine, route)
-                val out = execCommandOnSession(session, "herdr --version || true")
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "RealSSH",
-                    message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
-                )
-                true
-            }.getOrElse { err ->
-                val errDetail = err.message?.takeIf { it.isNotBlank() }
-                    ?: err::class.simpleName
-                    ?: "Unknown SSH error"
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "RealSSH",
-                    message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
-                    isError = true,
-                )
-                false
-            }
+        runCatching {
+            val out = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Poll,
+                commands = listOf(RemoteShellCommand.Exec("herdr --version || true")),
+            )
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
+            )
+            true
+        }.getOrElse { err ->
+            val errDetail = err.message?.takeIf { it.isNotBlank() }
+                ?: err::class.simpleName
+                ?: "Unknown SSH error"
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
+                isError = true,
+            )
+            false
         }
     }
 
@@ -146,14 +264,16 @@ internal class RealHerdrSshClient(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Boolean = withContext(Dispatchers.IO) {
-        mutexFor(machine.id).withLock {
-            runCatching {
-                val session = getOrOpenSessionLocked(machine, route)
-                val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
-                val out = execCommandOnSession(session, "command -v $moshBin")
-                out.trim().isNotEmpty()
-            }.getOrDefault(false)
-        }
+        runCatching {
+            val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
+            val out = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Poll,
+                commands = listOf(RemoteShellCommand.Exec("command -v $moshBin")),
+            )
+            out.trim().isNotEmpty()
+        }.getOrDefault(false)
     }
 
     fun startLivePolling(
@@ -176,7 +296,7 @@ internal class RealHerdrSshClient(
                         )
                     }
                 }
-                delay(400L)
+                delay(LIVE_POLL_INTERVAL_MS)
             }
         }
         pollJobs[machine.id] = job
@@ -184,9 +304,16 @@ internal class RealHerdrSshClient(
 
     fun disconnect(machineId: String) {
         pollJobs.remove(machineId)?.cancel()
+        inputFlushJobs.remove(machineId)?.cancel()
+        inputFlushSignals.remove(machineId)?.close()
+        pendingInputQueues.remove(machineId)?.clear()
+        optimisticEdits.remove(machineId)?.let { synchronized(it) { it.clear() } }
+        lastInputConfirmedSeq.remove(machineId)
         selectionState.remove(machineId)
         cachedInputs.remove(machineId)
         viewportSizes.remove(machineId)
+        inputWorkers.remove(machineId)?.close()
+        pollWorkers.remove(machineId)?.close()
         sessions.remove(machineId)?.let { session ->
             runCatching { session.disconnect() }
         }
@@ -215,26 +342,62 @@ internal class RealHerdrSshClient(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Boolean = withContext(Dispatchers.IO) {
-        val rawSnapshotJson = mutexFor(machine.id).withLock {
-            val session = getOrOpenSessionLocked(machine, route)
-            execCommandOnSession(session, "herdr api snapshot")
-        }
-        val rootObj = runCatching {
-            val firstJsonLine = rawSnapshotJson.lineSequence()
-                .map { it.trim() }
-                .firstOrNull { it.startsWith("{") && it.endsWith("}") }
-                ?: rawSnapshotJson.trim()
-            json.parseToJsonElement(firstJsonLine).jsonObject
-        }.getOrNull() ?: return@withContext false
+        val pollStartInputSeq = inputSequence.get()
+        val pollStartConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
+        val predictedVisiblePanes = cachedInputs[machine.id]?.let { existing ->
+            val activeTabId = existing.snapshot.focusedTabId
+            existing.layout?.panes?.map { it.paneId }?.takeIf { it.isNotEmpty() }
+                ?: existing.snapshot.panes
+                    .filter { activeTabId == null || it.tabId == activeTabId }
+                    .map { it.paneId }
+                    .ifEmpty { listOfNotNull(existing.snapshot.focusedPaneId) }
+        }.orEmpty()
 
-        val snapshotObj = rootObj["result"]?.jsonObject?.get("snapshot")?.jsonObject
-            ?: return@withContext false
+        val initialCommands = buildList {
+            add(RemoteShellCommand.Exec("herdr api snapshot"))
+            predictedVisiblePanes.forEach { paneId ->
+                add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
+            }
+        }
+
+        val combinedRawOutput = executeBatchOnLane(
+            machine = machine,
+            route = route,
+            lane = WorkerLane.Poll,
+            commands = initialCommands,
+        )
+
+        var snapshotObj: JsonObject? = null
+        val ansiByPane = mutableMapOf<String, String>()
+
+        combinedRawOutput.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .forEach { line ->
+                runCatching {
+                    val obj = json.parseToJsonElement(line).jsonObject
+                    val resultObj = obj["result"]?.jsonObject ?: return@forEach
+                    val snapCandidate = resultObj["snapshot"]?.jsonObject
+                    if (snapCandidate != null && snapshotObj == null) {
+                        snapshotObj = snapCandidate
+                    }
+                    val readObj = resultObj["read"]?.jsonObject
+                    if (readObj != null) {
+                        val pId = readObj["pane_id"]?.jsonPrimitive?.content
+                        val text = readObj["text"]?.jsonPrimitive?.content
+                        if (!pId.isNullOrBlank() && text != null) {
+                            ansiByPane[pId] = text
+                        }
+                    }
+                }
+            }
+
+        val resolvedSnapshotObj = snapshotObj ?: return@withContext false
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
-        val parsed = parseSnapshotObject(machine.id, snapshotObj, sel)
+        val parsed = parseSnapshotObject(machine.id, resolvedSnapshotObj, sel)
         endpointSnapshotBus.publish(machine.id, parsed.snapshot)
 
-        // Read visible ANSI output for all panes in the focused tab
         val activeTabId = parsed.snapshot.focusedTabId
         val activeLayout = parsed.layoutsByTab[activeTabId]
             ?: parsed.layoutsByTab.values.firstOrNull()
@@ -247,41 +410,31 @@ internal class RealHerdrSshClient(
 
         if (visiblePaneIds.isEmpty()) return@withContext true
 
-        val ndjsonBatch = visiblePaneIds.joinToString("\n") { paneId ->
-            buildJsonObject {
-                put("id", "read_$paneId")
-                put("method", "pane.read")
-                put(
-                    "params",
-                    buildJsonObject {
-                        put("pane_id", paneId)
-                        put("source", "visible")
-                        put("format", "ansi")
-                    },
-                )
-            }.toString()
-        }
-
-        val batchResponse = mutexFor(machine.id).withLock {
-            val session = getOrOpenSessionLocked(machine, route)
-            execApiBridgeBatchLocked(session, ndjsonBatch)
-        }
-
-        val ansiByPane = mutableMapOf<String, String>()
-        batchResponse.lineSequence()
-            .map { it.trim() }
-            .filter { it.startsWith("{") && it.endsWith("}") }
-            .forEach { line ->
-                runCatching {
-                    val obj = json.parseToJsonElement(line).jsonObject
-                    val readObj = obj["result"]?.jsonObject?.get("read")?.jsonObject
-                    val pId = readObj?.get("pane_id")?.jsonPrimitive?.content
-                    val text = readObj?.get("text")?.jsonPrimitive?.content
-                    if (!pId.isNullOrBlank() && text != null) {
-                        ansiByPane[pId] = text
-                    }
-                }
+        val missingPaneIds = visiblePaneIds.filter { it !in ansiByPane }
+        if (missingPaneIds.isNotEmpty()) {
+            val missingCommands = missingPaneIds.map { paneId ->
+                RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId))
             }
+            val missingResponse = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Poll,
+                commands = missingCommands,
+            )
+            parsePaneReadLinesInto(missingResponse, ansiByPane)
+        }
+
+        // If the fast input lane updated the focused pane while this background poll was in flight,
+        // keep the newer focused-pane ANSI buffer so polling never clobbers recent keystrokes.
+        val currentConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
+        val currentInputSeq = inputSequence.get()
+        if (currentConfirmedSeq > pollStartConfirmedSeq || currentInputSeq > pollStartInputSeq) {
+            val focusedId = parsed.snapshot.focusedPaneId
+            val newerCachedAnsi = focusedId?.let { cachedInputs[machine.id]?.ansiByPane?.get(it) }
+            if (focusedId != null && newerCachedAnsi != null) {
+                ansiByPane[focusedId] = newerCachedAnsi
+            }
+        }
 
         // Update agent snippets from the read pane buffers
         parsed.snapshot.agents.forEach { agent ->
@@ -381,16 +534,62 @@ internal class RealHerdrSshClient(
                         sel.focusedWorkspaceId = pane.workspaceId
                         sel.focusedTabId = pane.tabId
                     }
+                    applyOptimisticPaneFocus(machine.id, paneId)
                 }
+            }
+        }
+
+        // Fast-path key/input RPCs (e.g., sendKeyChord -> pane.send_keys) onto the Input lane
+        // without running a full topology snapshot.
+        val isPaneInputRpc = request.method == "pane.send_keys" ||
+            request.method == "pane.send_text" ||
+            request.method == "pane.send_input"
+        if (isPaneInputRpc) {
+            val paramsObj = parseParamsObject(request.paramsJson)
+            val targetPaneId = paramsObj["pane_id"]?.jsonPrimitive?.content
+                ?.takeIf { it.isNotBlank() }
+                ?: sel.focusedPaneId
+                ?: endpointSnapshotBus.snapshotFor(machine.id)?.focusedPaneId
+            val ndjsonLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
+            return@withContext runCatching {
+                val cmds = buildList {
+                    add(RemoteShellCommand.ApiBridgeLine(ndjsonLine))
+                    if (!targetPaneId.isNullOrBlank()) {
+                        add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(targetPaneId)))
+                    }
+                }
+                val out = executeBatchOnLane(machine, route, WorkerLane.Input, cmds)
+                if (!targetPaneId.isNullOrBlank()) {
+                    val updatedAnsi = extractPaneAnsiFromResponse(out, targetPaneId)
+                    if (updatedAnsi != null) {
+                        updateFocusedPaneSurfaceFromInput(
+                            machineId = machine.id,
+                            paneId = targetPaneId,
+                            paneAnsi = updatedAnsi,
+                            confirmedSeq = inputSequence.get(),
+                        )
+                    }
+                }
+                out
+            }.getOrElse { err ->
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "RPC ${request.method} error: ${err.message}",
+                    isError = true,
+                )
+                null
             }
         }
 
         val ndjsonLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
         val response = runCatching {
-            mutexFor(machine.id).withLock {
-                val session = getOrOpenSessionLocked(machine, route)
-                execApiBridgeBatchLocked(session, ndjsonLine)
-            }
+            executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Poll,
+                commands = listOf(RemoteShellCommand.ApiBridgeLine(ndjsonLine)),
+            )
         }.getOrElse { err ->
             sshDebugLog.record(
                 machineId = machine.id,
@@ -401,89 +600,594 @@ internal class RealHerdrSshClient(
             null
         }
 
-        // Immediately refresh snapshot and visible pane ANSI buffer after any RPC
+        // Refresh snapshot and visible pane ANSI buffer after structural/focus RPCs
         runCatching { refreshSnapshotAndSurface(machine, route) }
         response
     }
 
+    /**
+     * Dispatches a pane input event with:
+     * 1. Immediate (`<1ms`) optimistic local echo published onto [paneSurfaceBus].
+     * 2. Non-blocking enqueue into the per-machine coalescing input queue so rapid typing never stalls
+     *    behind sequential round-trips.
+     * 3. Single-pass execution on the persistent [WorkerLane.Input] channel (`pane.send_text` / `pane.send_keys` /
+     *    `pane.send_input` + focused `pane.read`), completely decoupled from background polling.
+     */
     suspend fun sendPaneInput(
         machine: HostMachine,
         route: ResolvedSshRoute,
         paneId: String,
         event: ClientPaneInputEvent,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): Boolean {
         val targetPaneId = paneId.takeIf { it.isNotBlank() }
             ?: selectionState[machine.id]?.focusedPaneId
             ?: endpointSnapshotBus.snapshotFor(machine.id)?.focusedPaneId
-            ?: return@withContext false
+            ?: paneSurfaceBus.surfaceFor(machine.id)?.panes?.firstOrNull { it.focused }?.paneId
+            ?: return false
 
-        val rpcLine = when (event) {
-            is ClientPaneInputEvent.TextCommit -> {
-                buildJsonObject {
-                    put("id", "in_${revisionCounter.incrementAndGet()}")
-                    put("method", "pane.send_text")
-                    put(
-                        "params",
-                        buildJsonObject {
-                            put("pane_id", targetPaneId)
-                            put("text", event.text)
-                        },
-                    )
-                }.toString()
-            }
-
-            is ClientPaneInputEvent.Paste -> {
-                buildJsonObject {
-                    put("id", "paste_${revisionCounter.incrementAndGet()}")
-                    put("method", "pane.send_text")
-                    put(
-                        "params",
-                        buildJsonObject {
-                            put("pane_id", targetPaneId)
-                            put("text", event.text)
-                        },
-                    )
-                }.toString()
-            }
-
-            is ClientPaneInputEvent.Key -> {
-                val keySpec = mapKeyEventToHerdrKeySpec(event.event)
-                buildJsonObject {
-                    put("id", "key_${revisionCounter.incrementAndGet()}")
-                    put("method", "pane.send_keys")
-                    put(
-                        "params",
-                        buildJsonObject {
-                            put("pane_id", targetPaneId)
-                            put("keys", buildJsonArray { add(JsonPrimitive(keySpec)) })
-                        },
-                    )
-                }.toString()
-            }
-
-            is ClientPaneInputEvent.Mouse -> return@withContext true
+        if (event is ClientPaneInputEvent.Mouse) {
+            return true
         }
 
-        val ok = runCatching {
-            mutexFor(machine.id).withLock {
-                val session = getOrOpenSessionLocked(machine, route)
-                execApiBridgeBatchLocked(session, rpcLine)
+        val seq = inputSequence.incrementAndGet()
+
+        // 1. Apply immediate optimistic local echo (<1ms) so typed characters appear on screen before network I/O
+        val optimisticEdit = toOptimisticEdit(seq, targetPaneId, event)
+        if (optimisticEdit != null) {
+            val edits = optimisticEditsFor(machine.id)
+            synchronized(edits) {
+                while (edits.size >= MAX_OPTIMISTIC_EDITS) {
+                    edits.removeFirst()
+                }
+                edits.addLast(optimisticEdit)
             }
-            true
-        }.getOrElse { err ->
-            sshDebugLog.record(
-                machineId = machine.id,
-                tag = "RealSSH",
-                message = "Failed to send input to $targetPaneId: ${err.message}",
-                isError = true,
+            val currentFrame = paneSurfaceBus.surfaceFor(machine.id)
+            if (currentFrame != null) {
+                val updatedFrame = applyOptimisticEditToFrame(currentFrame, optimisticEdit)
+                paneSurfaceBus.publish(machine.id, updatedFrame)
+            }
+        } else if (isControlInterruptEvent(event)) {
+            val edits = optimisticEditsFor(machine.id)
+            synchronized(edits) {
+                edits.clear()
+            }
+        }
+
+        // 2. Enqueue for coalesced transmission on the dedicated persistent Input lane
+        inputQueueFor(machine.id).add(
+            PendingPaneInput(
+                seq = seq,
+                paneId = targetPaneId,
+                event = event,
             )
-            false
+        )
+        triggerInputFlushLoop(machine, route)
+        return true
+    }
+
+    /**
+     * Suspends until all currently queued input events for [machineId] have been flushed over [WorkerLane.Input].
+     */
+    internal suspend fun awaitInputFlush(machineId: String) = withContext(Dispatchers.IO) {
+        val targetSeq = inputSequence.get()
+        val deadline = System.currentTimeMillis() + 5_000L
+        while (System.currentTimeMillis() < deadline) {
+            val confirmed = lastInputConfirmedSeq[machineId] ?: 0L
+            val queueEmpty = inputQueueFor(machineId).isEmpty()
+            val mutexUnlocked = !laneMutexFor(machineId, WorkerLane.Input).isLocked
+            if (confirmed >= targetSeq && queueEmpty && mutexUnlocked) {
+                return@withContext
+            }
+            delay(5L)
+        }
+    }
+
+    private fun triggerInputFlushLoop(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ) {
+        val signal = inputFlushSignals.computeIfAbsent(machine.id) {
+            Channel(Channel.CONFLATED)
+        }
+        val existingJob = inputFlushJobs[machine.id]
+        if (existingJob == null || !existingJob.isActive) {
+            synchronized(inputFlushJobs) {
+                val current = inputFlushJobs[machine.id]
+                if (current == null || !current.isActive) {
+                    inputFlushJobs[machine.id] = scope.launch {
+                        for (trigger in signal) {
+                            drainAndFlushPendingInputs(machine, route)
+                        }
+                    }
+                }
+            }
+        }
+        signal.trySend(Unit)
+    }
+
+    private suspend fun drainAndFlushPendingInputs(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ) {
+        val queue = inputQueueFor(machine.id)
+        while (scope.isActive) {
+            val batch = ArrayList<PendingPaneInput>(16)
+            while (true) {
+                val next = queue.poll() ?: break
+                batch.add(next)
+            }
+            if (batch.isEmpty()) break
+
+            val maxSeqInBatch = batch.maxOf { it.seq }
+            val targetPaneId = batch.last().paneId
+            val coalescedRpcCommands = buildCoalescedInputCommands(batch)
+            if (coalescedRpcCommands.isEmpty()) continue
+
+            val prevAnsi = cachedInputs[machine.id]?.ansiByPane?.get(targetPaneId)
+            val readCommand = RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(targetPaneId))
+
+            runCatching {
+                val combinedCommands = coalescedRpcCommands + readCommand
+                val rawResponse = executeBatchOnLane(
+                    machine = machine,
+                    route = route,
+                    lane = WorkerLane.Input,
+                    commands = combinedCommands,
+                )
+
+                val immediateAnsi = extractPaneAnsiFromResponse(rawResponse, targetPaneId)
+
+                // If more keystrokes arrived while this batch was on the wire, immediately loop to send them
+                if (queue.isNotEmpty()) {
+                    if (immediateAnsi != null && immediateAnsi != prevAnsi) {
+                        updateFocusedPaneSurfaceFromInput(
+                            machineId = machine.id,
+                            paneId = targetPaneId,
+                            paneAnsi = immediateAnsi,
+                            confirmedSeq = maxSeqInBatch,
+                        )
+                    }
+                    return@runCatching
+                }
+
+                if (immediateAnsi != null && immediateAnsi != prevAnsi) {
+                    updateFocusedPaneSurfaceFromInput(
+                        machineId = machine.id,
+                        paneId = targetPaneId,
+                        paneAnsi = immediateAnsi,
+                        confirmedSeq = maxSeqInBatch,
+                    )
+                } else {
+                    // Remote PTY discipline or TUI may need a few milliseconds to echo back to the PTY master.
+                    // Keep the optimistic echo visible and perform one fast follow-up pane.read if still idle.
+                    delay(PTY_ECHO_SETTLE_DELAY_MS)
+                    if (queue.isEmpty()) {
+                        val followUpOut = executeBatchOnLane(
+                            machine = machine,
+                            route = route,
+                            lane = WorkerLane.Input,
+                            commands = listOf(readCommand),
+                        )
+                        val settledAnsi = extractPaneAnsiFromResponse(followUpOut, targetPaneId) ?: immediateAnsi
+                        if (settledAnsi != null) {
+                            updateFocusedPaneSurfaceFromInput(
+                                machineId = machine.id,
+                                paneId = targetPaneId,
+                                paneAnsi = settledAnsi,
+                                confirmedSeq = maxSeqInBatch,
+                            )
+                        } else {
+                            retireOptimisticEditsUpTo(machine.id, maxSeqInBatch)
+                        }
+                    }
+                }
+
+                // Trigger an asynchronous non-blocking snapshot refresh only on Enter or Ctrl chords
+                if (batch.any { shouldTriggerTopologyRefresh(it.event) }) {
+                    scope.launch {
+                        runCatching { refreshSnapshotAndSurface(machine, route) }
+                    }
+                }
+            }.onFailure { err ->
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "Failed to send input to $targetPaneId: ${err.message}",
+                    isError = true,
+                )
+            }
+        }
+    }
+
+    /**
+     * Coalesces consecutive [PendingPaneInput] events targeting the same pane into minimal JSON-RPC lines:
+     * - Consecutive `TextCommit` / `Paste` events merge into a single `pane.send_text`.
+     * - Consecutive `Key` events merge into a single `pane.send_keys` array.
+     * - Accumulated text immediately followed by `Key` events on the same pane merges into a single `pane.send_input`.
+     */
+    internal fun buildCoalescedInputCommands(batch: List<PendingPaneInput>): List<RemoteShellCommand.ApiBridgeLine> {
+        if (batch.isEmpty()) return emptyList()
+        val result = ArrayList<RemoteShellCommand.ApiBridgeLine>(batch.size)
+
+        var currentPaneId: String? = null
+        val textBuffer = StringBuilder()
+        val keyBuffer = ArrayList<String>(4)
+
+        fun flushCurrent() {
+            val paneId = currentPaneId ?: return
+            val hasText = textBuffer.isNotEmpty()
+            val hasKeys = keyBuffer.isNotEmpty()
+            if (!hasText && !hasKeys) return
+
+            val line = when {
+                hasText && hasKeys -> {
+                    val text = textBuffer.toString()
+                    val keys = keyBuffer.toList()
+                    buildJsonObject {
+                        put("id", "in_${revisionCounter.incrementAndGet()}")
+                        put("method", "pane.send_input")
+                        put(
+                            "params",
+                            buildJsonObject {
+                                put("pane_id", paneId)
+                                put("text", text)
+                                put(
+                                    "keys",
+                                    buildJsonArray {
+                                        keys.forEach { add(JsonPrimitive(it)) }
+                                    },
+                                )
+                            },
+                        )
+                    }.toString()
+                }
+
+                hasText -> {
+                    val text = textBuffer.toString()
+                    buildJsonObject {
+                        put("id", "in_${revisionCounter.incrementAndGet()}")
+                        put("method", "pane.send_text")
+                        put(
+                            "params",
+                            buildJsonObject {
+                                put("pane_id", paneId)
+                                put("text", text)
+                            },
+                        )
+                    }.toString()
+                }
+
+                else -> {
+                    val keys = keyBuffer.toList()
+                    buildJsonObject {
+                        put("id", "key_${revisionCounter.incrementAndGet()}")
+                        put("method", "pane.send_keys")
+                        put(
+                            "params",
+                            buildJsonObject {
+                                put("pane_id", paneId)
+                                put(
+                                    "keys",
+                                    buildJsonArray {
+                                        keys.forEach { add(JsonPrimitive(it)) }
+                                    },
+                                )
+                            },
+                        )
+                    }.toString()
+                }
+            }
+            result.add(RemoteShellCommand.ApiBridgeLine(line))
+            textBuffer.setLength(0)
+            keyBuffer.clear()
         }
 
-        if (ok) {
-            runCatching { refreshSnapshotAndSurface(machine, route) }
+        for (item in batch) {
+            if (currentPaneId != null && currentPaneId != item.paneId) {
+                flushCurrent()
+            }
+            currentPaneId = item.paneId
+
+            when (val ev = item.event) {
+                is ClientPaneInputEvent.TextCommit -> {
+                    if (keyBuffer.isNotEmpty()) {
+                        flushCurrent()
+                        currentPaneId = item.paneId
+                    }
+                    textBuffer.append(ev.text)
+                }
+
+                is ClientPaneInputEvent.Paste -> {
+                    if (keyBuffer.isNotEmpty()) {
+                        flushCurrent()
+                        currentPaneId = item.paneId
+                    }
+                    textBuffer.append(ev.text)
+                }
+
+                is ClientPaneInputEvent.Key -> {
+                    keyBuffer.add(mapKeyEventToHerdrKeySpec(ev.event))
+                }
+
+                is ClientPaneInputEvent.Mouse -> Unit
+            }
         }
-        ok
+        flushCurrent()
+        return result
+    }
+
+    private fun toOptimisticEdit(
+        seq: Long,
+        paneId: String,
+        event: ClientPaneInputEvent,
+    ): OptimisticEdit? = when (event) {
+        is ClientPaneInputEvent.TextCommit -> {
+            if (event.text.isEmpty()) null else OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = event.text)
+        }
+
+        is ClientPaneInputEvent.Paste -> {
+            if (event.text.isEmpty()) null else OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = event.text)
+        }
+
+        is ClientPaneInputEvent.Key -> {
+            val ev = event.event
+            if (ev.ctrl || ev.alt) {
+                null
+            } else {
+                when (ev.code) {
+                    ClientKeyCode.Backspace -> OptimisticEdit.Backspace(seq = seq, paneId = paneId)
+                    ClientKeyCode.Enter -> OptimisticEdit.Newline(seq = seq, paneId = paneId)
+                    ClientKeyCode.CharC -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "C" else "c")
+                    ClientKeyCode.CharB -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "B" else "b")
+                    ClientKeyCode.CharD -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "D" else "d")
+                    ClientKeyCode.CharZ -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "Z" else "z")
+                    ClientKeyCode.CharY -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "Y" else "y")
+                    ClientKeyCode.CharN -> OptimisticEdit.InsertText(seq = seq, paneId = paneId, text = if (ev.shift) "N" else "n")
+                    else -> null
+                }
+            }
+        }
+
+        is ClientPaneInputEvent.Mouse -> null
+    }
+
+    private fun isControlInterruptEvent(event: ClientPaneInputEvent): Boolean =
+        event is ClientPaneInputEvent.Key && (event.event.ctrl || event.event.code == ClientKeyCode.Escape)
+
+    private fun shouldTriggerTopologyRefresh(event: ClientPaneInputEvent): Boolean =
+        when (event) {
+            is ClientPaneInputEvent.Key -> event.event.code == ClientKeyCode.Enter || event.event.ctrl
+            is ClientPaneInputEvent.TextCommit -> event.text.contains('\n') || event.text.contains('\r')
+            is ClientPaneInputEvent.Paste -> event.text.contains('\n') || event.text.contains('\r')
+            is ClientPaneInputEvent.Mouse -> false
+        }
+
+    private fun retireOptimisticEditsUpTo(machineId: String, confirmedSeq: Long) {
+        if (confirmedSeq <= 0L) return
+        lastInputConfirmedSeq.compute(machineId) { _, prev ->
+            if (prev == null || confirmedSeq > prev) confirmedSeq else prev
+        }
+        val edits = optimisticEdits[machineId] ?: return
+        synchronized(edits) {
+            while (edits.isNotEmpty() && edits.peekFirst().seq <= confirmedSeq) {
+                edits.removeFirst()
+            }
+        }
+    }
+
+    private fun updateFocusedPaneSurfaceFromInput(
+        machineId: String,
+        paneId: String,
+        paneAnsi: String,
+        confirmedSeq: Long,
+    ) {
+        if (confirmedSeq > 0L) {
+            lastInputConfirmedSeq.compute(machineId) { _, prev ->
+                if (prev == null || confirmedSeq > prev) confirmedSeq else prev
+            }
+            retireOptimisticEditsUpTo(machineId, confirmedSeq)
+        }
+
+        val updatedCache = cachedInputs.compute(machineId) { _, existing ->
+            if (existing == null) {
+                null
+            } else {
+                existing.copy(ansiByPane = existing.ansiByPane + (paneId to paneAnsi))
+            }
+        } ?: return
+
+        val frame = buildCompositeSurfaceFrame(
+            machineId = machineId,
+            snapshot = updatedCache.snapshot,
+            layout = updatedCache.layout,
+            ansiByPane = updatedCache.ansiByPane,
+        )
+        paneSurfaceBus.publish(machineId, frame)
+    }
+
+    private fun applyOptimisticPaneFocus(machineId: String, paneId: String) {
+        val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId)
+        if (currentSnapshot != null && currentSnapshot.focusedPaneId != paneId) {
+            endpointSnapshotBus.publish(
+                machineId,
+                currentSnapshot.copy(
+                    revision = revisionCounter.incrementAndGet().toULong(),
+                    focusedPaneId = paneId,
+                    panes = currentSnapshot.panes.map { it.copy(focused = it.paneId == paneId) },
+                    agents = currentSnapshot.agents.map { it.copy(focused = it.paneId == paneId) },
+                ),
+            )
+        }
+        val currentSurface = paneSurfaceBus.surfaceFor(machineId)
+        if (currentSurface != null) {
+            paneSurfaceBus.publish(
+                machineId,
+                currentSurface.copy(
+                    revision = revisionCounter.incrementAndGet().toULong(),
+                    panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
+                ),
+            )
+        }
+    }
+
+    internal fun applyOptimisticEditToFrame(
+        frame: PaneSurfaceFrame,
+        edit: OptimisticEdit,
+    ): PaneSurfaceFrame {
+        val gridCols = frame.frame.width.toInt()
+        val gridRows = frame.frame.height.toInt()
+        if (gridCols <= 0 || gridRows <= 0 || frame.frame.cells.size < gridCols * gridRows) {
+            return frame
+        }
+
+        val targetPane = frame.panes.firstOrNull { it.paneId == edit.paneId }
+            ?: frame.panes.firstOrNull { it.focused }
+            ?: frame.panes.firstOrNull()
+        val minCol = (targetPane?.innerRect?.x?.toInt() ?: 0).coerceIn(0, gridCols - 1)
+        val minRow = (targetPane?.innerRect?.y?.toInt() ?: 0).coerceIn(0, gridRows - 1)
+        val maxCol = if (targetPane != null) {
+            (minCol + targetPane.innerRect.width.toInt() - 1).coerceIn(minCol, gridCols - 1)
+        } else {
+            gridCols - 1
+        }
+        val maxRow = if (targetPane != null) {
+            (minRow + targetPane.innerRect.height.toInt() - 1).coerceIn(minRow, gridRows - 1)
+        } else {
+            gridRows - 1
+        }
+
+        val cur = frame.frame.cursor
+        var cursorCol = (cur?.x?.toInt() ?: minCol).coerceIn(minCol, maxCol)
+        var cursorRow = (cur?.y?.toInt() ?: minRow).coerceIn(minRow, maxRow)
+        val cells = frame.frame.cells.toMutableList()
+
+        fun clearPredictedEchoOnRow(row: Int) {
+            for (c in minCol..maxCol) {
+                val idx = row * gridCols + c
+                val existing = cells[idx]
+                if (existing.isPredictedEcho) {
+                    val cleanMod = (existing.modifier.toInt() and CellData.MOD_PREDICTED_ECHO.toInt().inv()).toUShort()
+                    cells[idx] = existing.copy(modifier = cleanMod)
+                }
+            }
+        }
+
+        when (edit) {
+            is OptimisticEdit.InsertText -> {
+                for (ch in edit.text) {
+                    when {
+                        ch == '\n' || ch == '\r' -> {
+                            clearPredictedEchoOnRow(cursorRow)
+                            cursorCol = minCol
+                            cursorRow = (cursorRow + 1).coerceAtMost(maxRow)
+                        }
+
+                        ch == '\b' || ch == '\u007f' -> {
+                            if (cursorCol > minCol) {
+                                cursorCol--
+                                cells[cursorRow * gridCols + cursorCol] = BLANK_CELL
+                            }
+                        }
+
+                        !ch.isISOControl() -> {
+                            val idx = cursorRow * gridCols + cursorCol
+                            val existing = cells[idx]
+                            cells[idx] = CellData(
+                                symbol = codepointToSymbol(ch.code),
+                                fg = existing.fg,
+                                bg = existing.bg,
+                                modifier = CellData.MOD_PREDICTED_ECHO,
+                            )
+                            if (cursorCol < maxCol) {
+                                cursorCol++
+                            } else if (cursorRow < maxRow) {
+                                cursorCol = minCol
+                                cursorRow++
+                            }
+                        }
+                    }
+                }
+            }
+
+            is OptimisticEdit.Backspace -> {
+                if (cursorCol > minCol) {
+                    cursorCol--
+                    cells[cursorRow * gridCols + cursorCol] = BLANK_CELL
+                }
+            }
+
+            is OptimisticEdit.Newline -> {
+                clearPredictedEchoOnRow(cursorRow)
+                cursorCol = minCol
+                cursorRow = (cursorRow + 1).coerceAtMost(maxRow)
+            }
+        }
+
+        return frame.copy(
+            revision = revisionCounter.incrementAndGet().toULong(),
+            frame = frame.frame.copy(
+                cells = cells,
+                cursor = CursorState(
+                    x = cursorCol.toUShort(),
+                    y = cursorRow.toUShort(),
+                    shape = cur?.shape ?: CursorShape.Block,
+                    visible = true,
+                ),
+            ),
+        )
+    }
+
+    private fun buildPaneReadJsonLine(paneId: String): String =
+        buildJsonObject {
+            put("id", "read_$paneId")
+            put("method", "pane.read")
+            put(
+                "params",
+                buildJsonObject {
+                    put("pane_id", paneId)
+                    put("source", "visible")
+                    put("format", "ansi")
+                },
+            )
+        }.toString()
+
+    private fun extractPaneAnsiFromResponse(rawResponse: String, targetPaneId: String): String? {
+        var found: String? = null
+        rawResponse.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .forEach { line ->
+                runCatching {
+                    val obj = json.parseToJsonElement(line).jsonObject
+                    val readObj = obj["result"]?.jsonObject?.get("read")?.jsonObject ?: return@forEach
+                    val pId = readObj["pane_id"]?.jsonPrimitive?.content
+                    val text = readObj["text"]?.jsonPrimitive?.content
+                    if (pId == targetPaneId && text != null) {
+                        found = text
+                    }
+                }
+            }
+        return found
+    }
+
+    private fun parsePaneReadLinesInto(
+        rawResponse: String,
+        targetMap: MutableMap<String, String>,
+    ) {
+        rawResponse.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .forEach { line ->
+                runCatching {
+                    val obj = json.parseToJsonElement(line).jsonObject
+                    val readObj = obj["result"]?.jsonObject?.get("read")?.jsonObject
+                    val pId = readObj?.get("pane_id")?.jsonPrimitive?.content
+                    val text = readObj?.get("text")?.jsonPrimitive?.content
+                    if (!pId.isNullOrBlank() && text != null) {
+                        targetMap[pId] = text
+                    }
+                }
+            }
     }
 
     private fun mapKeyEventToHerdrKeySpec(ev: ClientKeyEvent): String {
@@ -516,92 +1220,225 @@ internal class RealHerdrSshClient(
         }
     }
 
-    private fun getOrOpenSessionLocked(
+    private suspend fun getOrOpenSession(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Session {
-        val existing = sessions[machine.id]
-        if (existing != null && existing.isConnected) {
+        val fastExisting = sessions[machine.id]
+        if (fastExisting != null && fastExisting.isConnected) {
+            return fastExisting
+        }
+        return sessionMutexFor(machine.id).withLock {
+            val existing = sessions[machine.id]
+            if (existing != null && existing.isConnected) {
+                return@withLock existing
+            }
+            inputWorkers.remove(machine.id)?.close()
+            pollWorkers.remove(machine.id)?.close()
+            JschAndroidCrypto.installGlobalDefaults()
+            val jsch = JSch()
+            val preferredAuths = when (val auth = machine.authMethod) {
+                is SshAuthMethod.Password -> "password,keyboard-interactive,publickey"
+                is SshAuthMethod.KeystoreKey -> {
+                    jsch.addIdentity(
+                        AndroidKeystoreJschIdentity(
+                            keystoreKeyManager = keystoreKeyManagerProvider(),
+                            keyAlias = auth.keyAlias,
+                            algorithm = auth.algorithm,
+                            requireBiometric = auth.requireBiometric,
+                        ),
+                        null,
+                    )
+                    "publickey,password,keyboard-interactive"
+                }
+                is SshAuthMethod.HardwareSecurityKey -> "publickey,keyboard-interactive,password"
+            }
+            val session = jsch.getSession(
+                route.entryUsername.ifBlank { machine.username },
+                route.entryHost,
+                route.entryPort,
+            )
+            if (machine.authMethod is SshAuthMethod.Password) {
+                val passwordAuth = machine.authMethod as SshAuthMethod.Password
+                session.setPassword(passwordAuth.encryptedPasswordRef.encodeToByteArray())
+            }
+            val props = Properties().apply {
+                put("StrictHostKeyChecking", "no")
+                put("PreferredAuthentications", preferredAuths)
+                put("Compression", "none")
+            }
+            session.setConfig(props)
+            session.setSocketFactory(LowLatencySocketFactory)
+            runCatching {
+                session.setServerAliveInterval(10_000)
+                session.setServerAliveCountMax(3)
+            }
+            JschAndroidCrypto.configureSession(session)
+            session.connect(SOCKET_CONNECT_TIMEOUT_MS)
+            sessions[machine.id] = session
+            session
+        }
+    }
+
+    private fun workerMapFor(lane: WorkerLane): ConcurrentHashMap<String, PersistentShellWorker> =
+        when (lane) {
+            WorkerLane.Input -> inputWorkers
+            WorkerLane.Poll -> pollWorkers
+        }
+
+    private fun getOrOpenWorkerLocked(
+        machineId: String,
+        lane: WorkerLane,
+        session: Session,
+    ): PersistentShellWorker {
+        val map = workerMapFor(lane)
+        val existing = map[machineId]
+        if (existing != null && existing.isAlive) {
             return existing
         }
-        JschAndroidCrypto.installGlobalDefaults()
-        val jsch = JSch()
-        val preferredAuths = when (val auth = machine.authMethod) {
-            is SshAuthMethod.Password -> "password,keyboard-interactive,publickey"
-            is SshAuthMethod.KeystoreKey -> {
-                jsch.addIdentity(
-                    AndroidKeystoreJschIdentity(
-                        keystoreKeyManager = keystoreKeyManagerProvider(),
-                        keyAlias = auth.keyAlias,
-                        algorithm = auth.algorithm,
-                        requireBiometric = auth.requireBiometric,
-                    ),
-                    null,
-                )
-                "publickey,password,keyboard-interactive"
-            }
-            is SshAuthMethod.HardwareSecurityKey -> "publickey,keyboard-interactive,password"
-        }
-        val session = jsch.getSession(
-            route.entryUsername.ifBlank { machine.username },
-            route.entryHost,
-            route.entryPort,
+        existing?.close()
+        val channel = session.openChannel("exec") as ChannelExec
+        val initCmd = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; exec sh"
+        channel.setCommand(initCmd)
+        val rawIn = channel.inputStream
+        val rawOut = channel.outputStream
+        channel.setErrStream(ByteArrayOutputStream())
+        channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
+        val worker = PersistentShellWorker(
+            channel = channel,
+            stdin = rawOut,
+            stdout = BufferedReader(InputStreamReader(rawIn, Charsets.UTF_8), 32 * 1024),
         )
-        if (machine.authMethod is SshAuthMethod.Password) {
-            val passwordAuth = machine.authMethod as SshAuthMethod.Password
-            session.setPassword(passwordAuth.encryptedPasswordRef.encodeToByteArray())
-        }
-        val props = Properties().apply {
-            put("StrictHostKeyChecking", "no")
-            put("PreferredAuthentications", preferredAuths)
-        }
-        session.setConfig(props)
-        JschAndroidCrypto.configureSession(session)
-        session.connect(6_000)
-        sessions[machine.id] = session
-        return session
+        map[machineId] = worker
+        return worker
     }
 
-    private fun execCommandOnSession(
-        session: Session,
-        command: String,
+    private suspend fun executeBatchOnLane(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        lane: WorkerLane,
+        commands: List<RemoteShellCommand>,
     ): String {
-        val channel = session.openChannel("exec") as ChannelExec
-        val fullCmd = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; $command"
-        channel.setCommand(fullCmd)
-        val out = ByteArrayOutputStream()
-        val err = ByteArrayOutputStream()
-        channel.outputStream = out
-        channel.setErrStream(err)
-        channel.connect(5_000)
-        val deadline = System.currentTimeMillis() + 6_000L
-        while (!channel.isClosed && System.currentTimeMillis() < deadline) {
-            Thread.sleep(12L)
+        if (commands.isEmpty()) return ""
+        val customExecutor = remoteBatchExecutor
+        if (customExecutor != null) {
+            return customExecutor(machine, route, lane, commands)
         }
-        channel.disconnect()
-        return out.toString(Charsets.UTF_8.name())
+        return laneMutexFor(machine.id, lane).withLock {
+            val session = getOrOpenSession(machine, route)
+            runCatching {
+                val worker = getOrOpenWorkerLocked(machine.id, lane, session)
+                runCommandsOnWorker(worker, commands)
+            }.recoverCatching {
+                // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
+                workerMapFor(lane).remove(machine.id)?.close()
+                val freshSession = getOrOpenSession(machine, route)
+                runCatching {
+                    val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
+                    runCommandsOnWorker(freshWorker, commands)
+                }.getOrElse {
+                    execBatchOneShot(freshSession, commands)
+                }
+            }.getOrThrow()
+        }
     }
 
-    private fun execApiBridgeBatchLocked(
-        session: Session,
-        ndjsonPayload: String,
+    private fun runCommandsOnWorker(
+        worker: PersistentShellWorker,
+        commands: List<RemoteShellCommand>,
     ): String {
-        val channel = session.openChannel("exec") as ChannelExec
-        val fullCmd = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; herdr remote-api-bridge"
-        channel.setCommand(fullCmd)
-        val out = ByteArrayOutputStream()
-        val err = ByteArrayOutputStream()
-        channel.outputStream = out
-        channel.setErrStream(err)
-        val stdinBytes = (ndjsonPayload.trimEnd() + "\n").toByteArray(Charsets.UTF_8)
-        channel.setInputStream(stdinBytes.inputStream())
-        channel.connect(5_000)
-        val deadline = System.currentTimeMillis() + 6_000L
-        while (!channel.isClosed && System.currentTimeMillis() < deadline) {
-            Thread.sleep(12L)
+        val batchId = shellBatchCounter.incrementAndGet()
+        val (script, sentinel) = buildShellBatchScript(batchId, commands)
+        worker.stdin.write(script.toByteArray(Charsets.UTF_8))
+        worker.stdin.flush()
+
+        val out = StringBuilder(256)
+        while (true) {
+            val line = worker.stdout.readLine()
+                ?: throw IOException("Persistent SSH shell stream closed before sentinel")
+            val trimmed = line.trim()
+            if (trimmed == sentinel) {
+                break
+            }
+            if (trimmed.endsWith(sentinel)) {
+                val prefix = line.substringBeforeLast(sentinel)
+                if (prefix.isNotEmpty()) {
+                    out.append(prefix).append('\n')
+                }
+                break
+            }
+            out.append(line).append('\n')
         }
-        channel.disconnect()
-        return out.toString(Charsets.UTF_8.name())
+        return out.toString()
+    }
+
+    private fun execBatchOneShot(
+        session: Session,
+        commands: List<RemoteShellCommand>,
+    ): String {
+        val batchId = shellBatchCounter.incrementAndGet()
+        val body = buildString(commands.size * 160 + 96) {
+            append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
+            commands.forEachIndexed { index, cmd ->
+                when (cmd) {
+                    is RemoteShellCommand.Exec -> {
+                        append(cmd.command.trim()).append('\n')
+                    }
+                    is RemoteShellCommand.ApiBridgeLine -> {
+                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
+                        append("herdr remote-api-bridge <<'")
+                            .append(eofMarker)
+                            .append("'\n")
+                            .append(cmd.ndjsonLine.trim())
+                            .append('\n')
+                            .append(eofMarker)
+                            .append('\n')
+                    }
+                }
+            }
+        }
+        val channel = session.openChannel("exec") as ChannelExec
+        channel.setCommand(body)
+        val stdout = channel.inputStream
+        channel.setErrStream(ByteArrayOutputStream())
+        channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
+        return try {
+            stdout.readBytes().toString(Charsets.UTF_8)
+        } finally {
+            runCatching { channel.disconnect() }
+        }
+    }
+
+    internal fun buildShellBatchScript(
+        batchId: Long,
+        commands: List<RemoteShellCommand>,
+    ): Pair<String, String> {
+        val sentinel = "__BISON_DONE_${batchId}__"
+        val script = buildString(commands.size * 160 + 64) {
+            commands.forEachIndexed { index, cmd ->
+                when (cmd) {
+                    is RemoteShellCommand.Exec -> {
+                        append(cmd.command.trim())
+                        append('\n')
+                    }
+
+                    is RemoteShellCommand.ApiBridgeLine -> {
+                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
+                        append("herdr remote-api-bridge <<'")
+                        append(eofMarker)
+                        append("'\n")
+                        append(cmd.ndjsonLine.trim())
+                        append('\n')
+                        append(eofMarker)
+                        append('\n')
+                    }
+                }
+            }
+            append("printf '\\n")
+            append(sentinel)
+            append("\\n'\n")
+        }
+        return script to sentinel
     }
 
     private data class ParsedSnapshotBundle(
@@ -892,7 +1729,7 @@ internal class RealHerdrSshClient(
 
         val splits = if (scaledLayout != null) deriveSplitsFromLayout(scaledLayout) else emptyList()
 
-        return PaneSurfaceFrame(
+        val baseFrame = PaneSurfaceFrame(
             bootId = snapshot.bootId,
             revision = revisionCounter.incrementAndGet().toULong(),
             frame = FrameData(
@@ -904,6 +1741,19 @@ internal class RealHerdrSshClient(
             panes = surfacePanes,
             splits = splits,
         )
+
+        // Overlay any unconfirmed optimistic local echo edits (<1.5s TTL) so polls/resizes never drop in-flight keys
+        val editsDeque = optimisticEdits[machineId] ?: return baseFrame
+        val activeEdits = synchronized(editsDeque) {
+            val now = System.currentTimeMillis()
+            while (editsDeque.isNotEmpty() && now - editsDeque.peekFirst().createdAtMs > OPTIMISTIC_ECHO_TTL_MS) {
+                editsDeque.removeFirst()
+            }
+            if (editsDeque.isEmpty()) emptyList() else editsDeque.toList()
+        }
+        return activeEdits.fold(baseFrame) { acc, edit ->
+            applyOptimisticEditToFrame(acc, edit)
+        }
     }
 
     /**
@@ -1256,6 +2106,14 @@ internal class RealHerdrSshClient(
         }
 
     companion object {
+        private const val SOCKET_CONNECT_TIMEOUT_MS = 6_000
+        private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
+        private const val IPTOS_LOWDELAY = 0x10
+        private const val LIVE_POLL_INTERVAL_MS = 400L
+        private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
+        private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
+        private const val MAX_OPTIMISTIC_EDITS = 128
+
         private val BLANK_CELL = CellData()
         private val RESET_SGR_STATE = SgrState(0u, 0u, 0u)
         private val ASCII_SYMBOLS = Array(128) { it.toChar().toString() }
