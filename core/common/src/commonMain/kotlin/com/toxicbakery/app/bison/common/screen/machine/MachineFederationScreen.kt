@@ -25,7 +25,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -37,7 +36,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -65,7 +63,6 @@ import com.toxicbakery.app.bison.common.navigation.ScreenKeyWorkspaceTerminal
 import com.toxicbakery.app.bison.common.theme.BisonThemePalette
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
-import com.toxicbakery.app.bison.debug.DebugServer
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.AppSettings
 import com.toxicbakery.app.bison.model.HostMachine
@@ -108,7 +105,6 @@ fun MachineFederationScreen(
     val sshStateManager: SshStateManager by di.instance()
     val endpointSnapshotBus: EndpointSnapshotBus by di.instance()
     val appSettingsStore: AppSettingsStore by di.instance()
-    val debugServer: DebugServer by di.instance()
 
     val machines by machineStore.knownMachines.collectAsState()
     val connectedMachines by sshStateManager.connectedMachines.collectAsState()
@@ -152,33 +148,6 @@ fun MachineFederationScreen(
                     }
                 },
                 actions = {
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                debugServer.enable()
-                                val firstId = machineStore.knownMachines.value.firstOrNull()?.id
-                                    ?: "demo-workstation"
-                                debugServer.handleConnect(firstId)
-                                onOpenWorkspaceTerminal(firstId)
-                            }
-                        },
-                        border = BorderStroke(1.dp, palette.accentSecondary),
-                        modifier = Modifier.padding(end = 8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Build,
-                            contentDescription = null,
-                            tint = palette.accentSecondary,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Text(
-                            text = " Demo Fleet",
-                            color = palette.accentSecondary,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-
                     IconButton(onClick = { showSettingsSheet = true }) {
                         Icon(
                             imageVector = Icons.Default.Settings,
@@ -209,15 +178,6 @@ fun MachineFederationScreen(
         if (machines.isEmpty()) {
             EmptyFleetBanner(
                 onAddMachine = { onConfigureMachine("") },
-                onLaunchDemoMode = {
-                    scope.launch {
-                        debugServer.enable()
-                        val firstId = machineStore.knownMachines.value.firstOrNull()?.id
-                            ?: "demo-workstation"
-                        debugServer.handleConnect(firstId)
-                        onOpenWorkspaceTerminal(firstId)
-                    }
-                },
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
@@ -426,7 +386,6 @@ private fun TelemetryBadge(
 @Composable
 private fun EmptyFleetBanner(
     onAddMachine: () -> Unit,
-    onLaunchDemoMode: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalBisonPalette.current
@@ -452,39 +411,20 @@ private fun EmptyFleetBanner(
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = "Connect to any unmodified upstream Herdr server over Mosh UDP SSP + SSH Endpoint Generation 1, or explore the 3-machine federated demo fleet.",
+                    text = "Connect to any unmodified upstream Herdr server over Mosh UDP SSP + SSH Endpoint Generation 1.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.fgMuted,
                 )
                 Spacer(modifier = Modifier.height(4.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                Button(
+                    onClick = onAddMachine,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = palette.accentPrimary,
+                        contentColor = palette.bgDeep,
+                    ),
                 ) {
-                    Button(
-                        onClick = onAddMachine,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = palette.accentPrimary,
-                            contentColor = palette.bgDeep,
-                        ),
-                    ) {
-                        Icon(imageVector = Icons.Default.Add, contentDescription = null)
-                        Text(" Add Herdr Host", fontWeight = FontWeight.SemiBold)
-                    }
-                    OutlinedButton(
-                        onClick = onLaunchDemoMode,
-                        border = BorderStroke(1.dp, palette.accentSecondary),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Build,
-                            contentDescription = null,
-                            tint = palette.accentSecondary,
-                        )
-                        Text(
-                            text = " Launch 3-Machine Demo Fleet",
-                            color = palette.accentSecondary,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
+                    Icon(imageVector = Icons.Default.Add, contentDescription = null)
+                    Text(" Add Herdr Host", fontWeight = FontWeight.SemiBold)
                 }
             }
         }
