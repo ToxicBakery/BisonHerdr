@@ -82,6 +82,9 @@ kotlin {
 
 baselineProfile {
     mergeIntoMain = true
+    saveInSrc = true
+    automaticGenerationDuringBuild = false
+    dexLayoutOptimization = true
 }
 
 dependencies {
@@ -109,6 +112,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtimeCompose)
     implementation(libs.androidx.lifecycle.viewmodelCompose)
     implementation(libs.androidx.material)
+    implementation(libs.androidx.profileinstaller)
     implementation(libs.arbor)
     implementation(libs.arbor.android)
     implementation(libs.compose.components.resources)
