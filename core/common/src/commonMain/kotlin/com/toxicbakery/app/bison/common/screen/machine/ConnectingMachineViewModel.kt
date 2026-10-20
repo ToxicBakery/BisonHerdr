@@ -55,6 +55,10 @@ class ConnectingMachineViewModel(
     sealed interface Action {
         data class Connected(val machineId: String) : Action
         data object Cancelled : Action
+
+        companion object {
+            fun NavigateToWorkspace(machineId: String): Connected = Connected(machineId)
+        }
     }
 
     val machine: StateFlow<HostMachine?> = machineStore.knownMachines
@@ -90,6 +94,16 @@ class ConnectingMachineViewModel(
     val logs: StateFlow<List<SshLogEntry>> = sshDebugLog.entries
         .map { list -> list.filter { it.machineId == machineId || it.machineId == "*" } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    init {
+        viewModelScope.launch {
+            progress.collect { currentProgress ->
+                if (currentProgress == ConnectionProgress.Connected) {
+                    sendAction(Action.Connected(machineId))
+                }
+            }
+        }
+    }
 
     override fun onEvent(event: Event) {
         when (event) {

@@ -33,7 +33,9 @@ kotlin {
         }
         val commonTest by getting {
             dependencies {
+                implementation(projects.core.fakeServer)
                 implementation(libs.kotlin.test)
+                implementation(libs.kotlinx.coroutines.test)
             }
         }
     }

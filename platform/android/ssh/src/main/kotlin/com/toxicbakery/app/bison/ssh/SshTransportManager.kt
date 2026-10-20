@@ -24,16 +24,23 @@ import com.toxicbakery.app.bison.protocol.EndpointClientHello
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
+import com.toxicbakery.app.bison.protocol.MoshConnectInfo
 import com.toxicbakery.app.bison.protocol.PaneLayoutPane
 import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
+import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
+import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Android SSH2 + Mosh UDP SSP + Herdr Endpoint Generation 1 transport coordinator.
@@ -68,7 +75,11 @@ class SshTransportManager(
     )
     internal var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog)
     internal var moshBootstrapBannerProvider: ((HostMachine) -> String?)? = null
+    internal var moshUdpReachabilityProbe: (suspend (HostMachine, MoshConnectInfo) -> Boolean)? = null
+    internal var sshRouteProbe: (suspend (HostMachine, ResolvedSshRoute) -> Boolean)? = null
+    internal var passwordAuthenticator: (suspend (HostMachine, SshAuthMethod.Password) -> Boolean)? = null
 
+    private val json = Json { ignoreUnknownKeys = true }
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
     private val surfaceLeaseActive = ConcurrentHashMap<String, Boolean>()
@@ -140,7 +151,31 @@ class SshTransportManager(
 
         // Phase 1: AuthenticatingSsh (optionally via ProxyJump / Tailscale)
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.AuthenticatingSsh)
+        val proxy = machine.proxyJump
+        if (machine.hostname.isBlank() || !machine.isValidPort ||
+            (proxy != null && (proxy.bastionHost.isBlank() || proxy.bastionPort !in 1..65535 || proxy.bastionHost.endsWith(".invalid")))
+        ) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "ProxyJump",
+                message = "Invalid or unreachable SSH/Bastion endpoint for ${machine.displayAddress}",
+                isError = true,
+            )
+            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            return false
+        }
         val route = proxyJumpTunnel.resolveRoute(machine)
+        val routeReachable = sshRouteProbe?.invoke(machine, route) ?: true
+        if (!routeReachable) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "ProxyJump",
+                message = "SSH route unreachable for ${route.entryHost}:${route.entryPort}",
+                isError = true,
+            )
+            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            return false
+        }
         val authSucceeded = authenticateSshSession(machine, route)
         if (!authSucceeded) {
             sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
@@ -255,6 +290,7 @@ class SshTransportManager(
             tag = "RPC",
             message = "[$transportLane] $wireLine",
         )
+        applyFocusRpcMutation(machineId, request, isMoshActive)
         return """{"id":"${request.id}","result":{"type":"ok","lane":"$transportLane"}}"""
     }
 
@@ -454,6 +490,17 @@ class SshTransportManager(
             }
 
             is SshAuthMethod.Password -> {
+                val isValid = auth.encryptedPasswordRef.isNotBlank() &&
+                    (passwordAuthenticator?.invoke(machine, auth) ?: !auth.encryptedPasswordRef.startsWith("invalid:"))
+                if (!isValid) {
+                    sshDebugLog.record(
+                        machineId = machine.id,
+                        tag = "SSHAuth",
+                        message = "Password authentication failed for ${machine.displayAddress}: invalid or blank credential",
+                        isError = true,
+                    )
+                    return false
+                }
                 sshDebugLog.record(
                     machineId = machine.id,
                     tag = "SSHAuth",
@@ -463,6 +510,11 @@ class SshTransportManager(
             }
 
             is SshAuthMethod.HardwareSecurityKey -> {
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "SSHAuth",
+                    message = "Requesting hardware security key assertion (${auth.keyType.opensshKeyType}, transport=${auth.transport})",
+                )
                 val result = yubiKeyFido2Manager.signChallenge(
                     machineId = machine.id,
                     keyType = auth.keyType.opensshKeyType,
@@ -479,6 +531,7 @@ class SshTransportManager(
         route: ResolvedSshRoute,
     ): ActiveBackbone? {
         val machineId = machine.id
+        var moshFallbackReason: String? = null
         if (machine.transportMode != TransportMode.SshEndpointOnly) {
             val bootstrapCmd = buildMoshServerBootstrapCommand(machine)
             val configToml = MoshBootstrapConfig.buildTabletHerdrConfigToml()
@@ -496,15 +549,20 @@ class SshTransportManager(
             if (connectInfo != null) {
                 sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
                 val udpVerified = withTimeoutOrNull(MOSH_UDP_HANDSHAKE_TIMEOUT_MS) {
-                    moshUdpEngine.startSession(
-                        machineId = machineId,
-                        host = route.targetHost,
-                        udpPort = connectInfo.udpPort,
-                        sessionKey = connectInfo.sessionKey,
-                        cols = DEFAULT_COLS,
-                        rows = DEFAULT_ROWS,
-                        localEcho = true,
-                    )
+                    val probeAllowed = moshUdpReachabilityProbe?.invoke(machine, connectInfo) ?: true
+                    if (!probeAllowed) {
+                        false
+                    } else {
+                        moshUdpEngine.startSession(
+                            machineId = machineId,
+                            host = route.targetHost,
+                            udpPort = connectInfo.udpPort,
+                            sessionKey = connectInfo.sessionKey,
+                            cols = DEFAULT_COLS,
+                            rows = DEFAULT_ROWS,
+                            localEcho = true,
+                        )
+                    }
                 } == true
 
                 if (udpVerified) {
@@ -515,13 +573,17 @@ class SshTransportManager(
                         roamedCount = 0,
                     )
                 }
+                moshUdpEngine.stopSession(machineId)
+                moshFallbackReason = "Mosh UDP unreachable or blocked by firewall (${MOSH_UDP_HANDSHAKE_TIMEOUT_MS}ms timeout)"
+            } else {
+                moshFallbackReason = "mosh-server unavailable on remote host"
             }
 
             if (machine.transportMode == TransportMode.MoshOnly) {
                 sshDebugLog.record(
                     machineId = machineId,
                     tag = "MoshBootstrap",
-                    message = "MoshOnly mode requested, but mosh-server or UDP handshake failed",
+                    message = "MoshOnly mode requested, but mosh-server or UDP handshake failed ($moshFallbackReason)",
                     isError = true,
                 )
                 return null
@@ -530,7 +592,7 @@ class SshTransportManager(
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "Fallback",
-                message = "Mosh UDP unavailable; falling back to ${buildSshEndpointBridgeCommand()}",
+                message = "$moshFallbackReason; falling back to ${buildSshEndpointBridgeCommand()}",
             )
         }
 
@@ -548,7 +610,7 @@ class SshTransportManager(
         return ActiveBackbone.SshEndpoint(
             rttMs = 24,
             fallbackReason = if (machine.transportMode == TransportMode.AutoPreferMosh) {
-                "Mosh UDP unavailable"
+                moshFallbackReason ?: "Mosh UDP unavailable"
             } else {
                 null
             },
@@ -599,6 +661,14 @@ class SshTransportManager(
                         focused = true,
                         agentStatus = AgentStatus.Working,
                     ),
+                    ClientShellWorkspace(
+                        workspaceId = "w2",
+                        activeTabId = "w2:t1",
+                        label = "wt/roaming",
+                        branch = "feat/roaming",
+                        focused = false,
+                        agentStatus = AgentStatus.Idle,
+                    ),
                 ),
                 tabs = listOf(
                     ClientShellTab(
@@ -609,15 +679,31 @@ class SshTransportManager(
                         focused = true,
                         agentStatus = AgentStatus.Working,
                     ),
+                    ClientShellTab(
+                        tabId = "w1:t2",
+                        workspaceId = "w1",
+                        number = 2,
+                        label = "tests",
+                        focused = false,
+                        agentStatus = AgentStatus.Idle,
+                    ),
                 ),
                 panes = listOf(
                     ClientShellPane(
                         paneId = "w1:p1",
                         workspaceId = "w1",
                         tabId = "w1:t1",
-                        label = "${machine.name} · shell",
+                        label = "${machine.name} · shell #1",
                         cwd = "~/workspace",
                         focused = true,
+                    ),
+                    ClientShellPane(
+                        paneId = "w1:p2",
+                        workspaceId = "w1",
+                        tabId = "w1:t1",
+                        label = "${machine.name} · shell #2",
+                        cwd = "~/workspace",
+                        focused = false,
                     ),
                 ),
                 agents = listOf(
@@ -632,6 +718,17 @@ class SshTransportManager(
                         agentStatus = AgentStatus.Working,
                         focused = true,
                     ),
+                    ClientShellAgent(
+                        paneId = "w1:p2",
+                        workspaceId = "w1",
+                        tabId = "w1:t1",
+                        name = "codex",
+                        displayAgent = "Codex CLI",
+                        agent = "codex",
+                        title = "Monitoring ${machine.displayAddress}",
+                        agentStatus = AgentStatus.Idle,
+                        focused = false,
+                    ),
                 ),
             )
             endpointSnapshotBus.publish(machineId, snapshot)
@@ -640,21 +737,11 @@ class SshTransportManager(
         if (isMosh) {
             moshUdpEngine.updateLayoutSnapshot(
                 machineId = machineId,
-                layout = PaneLayoutSnapshot(
-                    workspaceId = "w1",
-                    tabId = "w1:t1",
-                    zoomed = false,
-                    panes = listOf(
-                        PaneLayoutPane(
-                            paneId = "w1:p1",
-                            rect = SurfaceRect(0u, 0u, DEFAULT_COLS, DEFAULT_ROWS),
-                            focused = true,
-                        ),
-                    ),
-                ),
+                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = "w1:p1"),
                 tabCount = 1,
             )
         } else if (paneSurfaceBus.surfaceFor(machineId) == null) {
+            val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
             val initialFrame = PaneSurfaceFrame(
                 bootId = "boot-$machineId",
                 revision = 1u,
@@ -667,10 +754,17 @@ class SshTransportManager(
                 panes = listOf(
                     PaneSurfacePane(
                         paneId = "w1:p1",
-                        rect = SurfaceRect(0u, 0u, DEFAULT_COLS, DEFAULT_ROWS),
+                        rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
                         focused = true,
                         title = "${machine.name} · SSH Endpoint Gen 1",
                         agentStatus = AgentStatus.Working,
+                    ),
+                    PaneSurfacePane(
+                        paneId = "w1:p2",
+                        rect = SurfaceRect(halfCols, 0u, (DEFAULT_COLS - halfCols).toUShort(), DEFAULT_ROWS),
+                        focused = false,
+                        title = "${machine.name} · Pane #2",
+                        agentStatus = AgentStatus.Idle,
                     ),
                 ),
             )
@@ -695,6 +789,116 @@ class SshTransportManager(
                 agentStatus = AgentStatus.Working,
             ),
         )
+    }
+
+    private fun buildTwoPaneLayoutSnapshot(focusedPaneId: String): PaneLayoutSnapshot {
+        val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
+        val rightCols = (DEFAULT_COLS - halfCols).toUShort()
+        return PaneLayoutSnapshot(
+            workspaceId = "w1",
+            tabId = "w1:t1",
+            zoomed = false,
+            panes = listOf(
+                PaneLayoutPane(
+                    paneId = "w1:p1",
+                    rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
+                    focused = focusedPaneId == "w1:p1",
+                ),
+                PaneLayoutPane(
+                    paneId = "w1:p2",
+                    rect = SurfaceRect(halfCols, 0u, rightCols, DEFAULT_ROWS),
+                    focused = focusedPaneId == "w1:p2",
+                ),
+            ),
+            splits = listOf(
+                PaneLayoutSplit(
+                    id = "s0:root",
+                    direction = PaneSurfaceSplitDirection.Vertical,
+                    ratio = 0.5f,
+                    rect = SurfaceRect(0u, 0u, DEFAULT_COLS, DEFAULT_ROWS),
+                ),
+            ),
+        )
+    }
+
+    private fun applyFocusRpcMutation(
+        machineId: String,
+        request: ClientShellEndpointRequest,
+        isMoshActive: Boolean,
+    ) {
+        val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId) ?: return
+        val params = runCatching { json.parseToJsonElement(request.paramsJson).jsonObject }
+            .getOrElse { JsonObject(emptyMap()) }
+
+        when (request.method) {
+            "workspace.focus" -> {
+                val wsId = params["workspace_id"]?.jsonPrimitive?.content ?: return
+                val updated = currentSnapshot.copy(
+                    revision = currentSnapshot.revision + 1u,
+                    focusedWorkspaceId = wsId,
+                    workspaces = currentSnapshot.workspaces.map { it.copy(focused = it.workspaceId == wsId) },
+                )
+                endpointSnapshotBus.publish(machineId, updated)
+            }
+
+            "tab.focus" -> {
+                val tabId = params["tab_id"]?.jsonPrimitive?.content ?: return
+                val updated = currentSnapshot.copy(
+                    revision = currentSnapshot.revision + 1u,
+                    focusedTabId = tabId,
+                    tabs = currentSnapshot.tabs.map { it.copy(focused = it.tabId == tabId) },
+                )
+                endpointSnapshotBus.publish(machineId, updated)
+            }
+
+            "pane.focus" -> {
+                val paneId = params["pane_id"]?.jsonPrimitive?.content ?: return
+                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, paneId, isMoshActive)
+            }
+
+            "agent.focus" -> {
+                val requestedPaneId = params["pane_id"]?.jsonPrimitive?.content
+                val requestedName = params["name"]?.jsonPrimitive?.content
+                val resolvedPaneId = requestedPaneId
+                    ?: currentSnapshot.agents.firstOrNull { it.name == requestedName }?.paneId
+                    ?: return
+                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, resolvedPaneId, isMoshActive)
+            }
+        }
+    }
+
+    private fun focusPaneInSnapshotAndSurface(
+        machineId: String,
+        currentSnapshot: ClientShellSnapshot,
+        paneId: String,
+        isMoshActive: Boolean,
+    ) {
+        val updatedSnapshot = currentSnapshot.copy(
+            revision = currentSnapshot.revision + 1u,
+            focusedPaneId = paneId,
+            panes = currentSnapshot.panes.map { it.copy(focused = it.paneId == paneId) },
+            agents = currentSnapshot.agents.map { it.copy(focused = it.paneId == paneId) },
+        )
+        endpointSnapshotBus.publish(machineId, updatedSnapshot)
+
+        if (isMoshActive) {
+            moshUdpEngine.updateLayoutSnapshot(
+                machineId = machineId,
+                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = paneId),
+                tabCount = updatedSnapshot.tabs.size.coerceAtLeast(1),
+            )
+        } else {
+            val currentSurface = paneSurfaceBus.surfaceFor(machineId)
+            if (currentSurface != null) {
+                paneSurfaceBus.publish(
+                    machineId = machineId,
+                    frame = currentSurface.copy(
+                        revision = currentSurface.revision + 1u,
+                        panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
+                    ),
+                )
+            }
+        }
     }
 
     private suspend fun flushOfflinePrompts(machineId: String) {

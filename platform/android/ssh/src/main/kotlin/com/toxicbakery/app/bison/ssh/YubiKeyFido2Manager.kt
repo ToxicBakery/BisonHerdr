@@ -23,6 +23,7 @@ class YubiKeyFido2Manager(
 ) : HardwareKeySigner {
 
     private val signatureCounter = AtomicInteger(1)
+    internal var onTouchPromptActive: (suspend (SshRequest.PromptHardwareKeyTouch) -> Unit)? = null
     private val ephemeralEd25519 by lazy {
         KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
     }
@@ -54,6 +55,7 @@ class YubiKeyFido2Manager(
         )
 
         try {
+            onTouchPromptActive?.invoke(prompt)
             val counter = signatureCounter.getAndIncrement()
             val flags: Byte = SSH_SK_USER_PRESENCE_REQD
             val signedBlob = buildOpenSshSkSignatureBlob(

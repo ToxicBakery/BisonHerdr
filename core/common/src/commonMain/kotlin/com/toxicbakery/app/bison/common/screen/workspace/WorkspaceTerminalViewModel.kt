@@ -64,6 +64,8 @@ class WorkspaceTerminalViewModel(
         data class TapModifierWithTimestamp(val key: TerminalModifierKey, val timestampMs: Long) : Event
         data class PressQuickKey(val keyLabel: String) : Event
         data class PressArrowKey(val keyCode: ClientKeyCode) : Event
+        data class PressSpecialKey(val keyCode: ClientKeyCode) : Event
+        data class TypeText(val text: String) : Event
         data object PressEnterKey : Event
         data class SubmitPrompt(val prompt: String, val target: PromptTarget = PromptTarget.FocusedPane) : Event
         data object ApproveFocusedAgent : Event
@@ -93,6 +95,13 @@ class WorkspaceTerminalViewModel(
         ) : Event
         data class SelectionChanged(val selection: TerminalSelectionRange?) : Event
         data class CopySelection(val selection: TerminalSelectionRange) : Event
+
+        companion object {
+            fun SubmitComposerPrompt(
+                prompt: String,
+                target: PromptTarget = PromptTarget.FocusedPane,
+            ): SubmitPrompt = SubmitPrompt(prompt = prompt, target = target)
+        }
     }
 
     sealed interface Action {
@@ -226,6 +235,14 @@ class WorkspaceTerminalViewModel(
 
             is Event.PressArrowKey -> {
                 handleArrowKeyPress(event.keyCode)
+            }
+
+            is Event.PressSpecialKey -> {
+                handleArrowKeyPress(event.keyCode)
+            }
+
+            is Event.TypeText -> {
+                handleTypeText(event.text)
             }
 
             Event.PressEnterKey -> {
@@ -545,6 +562,39 @@ class WorkspaceTerminalViewModel(
                     shift = mods.shift.isActive,
                 ),
             )
+        }
+    }
+
+    private fun handleTypeText(text: String) {
+        if (text.isEmpty()) return
+        val currentState = state.value
+        val targetMachineId = currentState.activeMachineId
+        val paneId = focusedPaneId()
+        val mods = currentState.modifierKeyState
+        updateState {
+            it.copy(
+                modifierKeyState = mods.consumeOneShot(),
+                isTypingHudFaded = appSettings.value.autoFadeHudWhileTyping,
+            )
+        }
+        viewModelScope.launch {
+            if (text == "\n" || text == "\r") {
+                sendKeyEvent(
+                    targetMachineId,
+                    paneId,
+                    ClientKeyEvent(
+                        code = ClientKeyCode.Enter,
+                        ctrl = mods.ctrl.isActive,
+                        alt = mods.alt.isActive,
+                        shift = mods.shift.isActive,
+                    ),
+                )
+            } else if (mods.hasActiveModifiers && text.length == 1) {
+                val chord = mods.formatKeyChord(text)
+                sendKeyChord(targetMachineId, paneId, chord)
+            } else {
+                sendLiteralText(targetMachineId, paneId, text)
+            }
         }
     }
 
