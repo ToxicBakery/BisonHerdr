@@ -283,7 +283,10 @@ fun ConnectingMachineScreen(
                                         .padding(12.dp),
                                     verticalArrangement = Arrangement.spacedBy(4.dp),
                                 ) {
-                                    items(logs) { entry ->
+                                    items(
+                                        items = logs,
+                                        key = { "${it.timestampEpochMs}-${it.tag}-${it.message.hashCode()}" },
+                                    ) { entry ->
                                         Text(
                                             text = "[${entry.tag}] ${entry.message}",
                                             style = MaterialTheme.typography.labelSmall,

@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.common.screen.delegate
 
+import androidx.compose.runtime.Immutable
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientKeyEvent
@@ -18,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
  * Federated coding agent entry aggregated across all connected machines and sorted by priority
  * (`Blocked` -> `Done` -> `Working` -> `Idle` -> `Unknown`).
  */
+@Immutable
 data class FederatedAgentItem(
     val machineId: String,
     val machineName: String,

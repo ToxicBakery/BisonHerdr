@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.common.screen.workspace
 
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.viewModelScope
 import com.toxicbakery.app.bison.common.screen.delegate.AgentActionDelegate
 import com.toxicbakery.app.bison.common.screen.delegate.FederatedAgentItem
@@ -31,6 +32,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -47,6 +49,7 @@ class WorkspaceTerminalViewModel(
     initialState = State(activeMachineId = machineId),
 ), MachineViewModelDelegate by machineViewModelDelegate, AgentActionDelegate by agentActionDelegate {
 
+    @Immutable
     data class State(
         val activeMachineId: String,
         val modifierKeyState: ModifierKeyState = ModifierKeyState(),
@@ -111,37 +114,39 @@ class WorkspaceTerminalViewModel(
     private val defaultSettingsFlow = MutableStateFlow(AppSettings())
     val appSettings: StateFlow<AppSettings> = appSettingsStore?.settings ?: defaultSettingsFlow
 
+    private val activeMachineIdFlow = state.map { it.activeMachineId }.distinctUntilChanged()
+
     val activeMachine: StateFlow<HostMachine?> = combine(
         machineStore.knownMachines,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { machines, activeId ->
         machines.firstOrNull { it.id == activeId } ?: machines.firstOrNull()
     }.stateIn(viewModelScope, SharingStarted.Eagerly, machineStore.getMachine(machineId))
 
     val activeBackbone: StateFlow<ActiveBackbone?> = combine(
         sshStateManager.activeTransportBackbone,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { backbones, activeId ->
         backbones[activeId]
     }.stateIn(viewModelScope, SharingStarted.Eagerly, sshStateManager.activeTransportBackbone.value[machineId])
 
     val roamingStatus: StateFlow<RoamingStatus> = combine(
         sshStateManager.roamingState,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { states, activeId ->
         states[activeId] ?: RoamingStatus.Healthy
     }.stateIn(viewModelScope, SharingStarted.Eagerly, RoamingStatus.Healthy)
 
     val activeSnapshot: StateFlow<ClientShellSnapshot?> = combine(
         snapshots,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { snapshotMap, activeId ->
         snapshotMap[activeId]
     }.stateIn(viewModelScope, SharingStarted.Eagerly, snapshots.value[machineId])
 
     val activeSurfaceFrame: StateFlow<PaneSurfaceFrame?> = combine(
         paneSurfaceBus.surfaces,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { surfaceMap, activeId ->
         surfaceMap[activeId]
     }.stateIn(viewModelScope, SharingStarted.Eagerly, paneSurfaceBus.surfaces.value[machineId])
@@ -157,7 +162,7 @@ class WorkspaceTerminalViewModel(
 
     val queuedPromptsForActiveMachine: StateFlow<List<QueuedPrompt>> = combine(
         sshStateManager.queuedPrompts,
-        state.map { it.activeMachineId },
+        activeMachineIdFlow,
     ) { _, activeId ->
         sshStateManager.queuedPromptsForMachine(activeId)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())

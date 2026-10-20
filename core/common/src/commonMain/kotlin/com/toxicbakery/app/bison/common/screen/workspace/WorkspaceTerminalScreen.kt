@@ -86,9 +86,12 @@ fun WorkspaceTerminalScreen(
         val fontSizeSp = activeMachine?.fontSizeSp ?: appSettings.defaultFontSizeSp
         val hudOpacity = if (state.isTypingHudFaded && appSettings.autoFadeHudWhileTyping) 0.85f else 1f
         var keyboardTriggerCount by remember { mutableIntStateOf(0) }
-        val focusedAgent = activeSnapshot?.let { snap ->
-            val fPaneId = snap.focusedPaneId ?: activeSurfaceFrame?.panes?.firstOrNull { it.focused }?.paneId
-            snap.agents.firstOrNull { it.paneId == fPaneId } ?: snap.agents.firstOrNull { it.focused }
+        val surfaceFocusedPaneId = activeSurfaceFrame?.panes?.firstOrNull { it.focused }?.paneId
+        val focusedAgent = remember(activeSnapshot, surfaceFocusedPaneId) {
+            activeSnapshot?.let { snap ->
+                val fPaneId = snap.focusedPaneId ?: surfaceFocusedPaneId
+                snap.agents.firstOrNull { it.paneId == fPaneId } ?: snap.agents.firstOrNull { it.focused }
+            }
         }
 
         Column(

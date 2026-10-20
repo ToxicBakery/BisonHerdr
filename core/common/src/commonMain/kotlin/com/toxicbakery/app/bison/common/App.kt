@@ -29,6 +29,8 @@ import com.toxicbakery.app.bison.common.theme.resolveTheme
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.logging.Arbor
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import org.kodein.di.compose.rememberInstance
 
 private val log = Arbor.tag("App")
@@ -44,15 +46,17 @@ fun App(
     val navigationController = remember(backStack) { NavigationController(backStack) }
     val machineStore: MachineStore by rememberInstance()
     val appSettingsStore: AppSettingsStore by rememberInstance()
-    val knownMachines by machineStore.knownMachines.collectAsState()
+    val knownMachinesCount by remember(machineStore) {
+        machineStore.knownMachines.map { it.size }.distinctUntilChanged()
+    }.collectAsState(initial = 0)
     val appSettings by appSettingsStore.settings.collectAsState()
 
     val globalPalette = remember(appSettings.themeId) {
         resolveTheme(globalThemeId = appSettings.themeId, hostOverrideThemeId = null)
     }
 
-    LaunchedEffect(knownMachines.size) {
-        log.d { "BisonHerdr fleet has ${knownMachines.size} configured hosts" }
+    LaunchedEffect(knownMachinesCount) {
+        log.d { "BisonHerdr fleet has $knownMachinesCount configured hosts" }
     }
 
     BisonTheme(palette = globalPalette) {
