@@ -12,7 +12,7 @@ import org.kodein.di.instance
  * release builds bind `NoDebugServer` so zero simulated server code ships in production.
  */
 val fakeServerModule = DI.Module("fakeServerModule") {
-    bindSingleton<DebugServer>(overrides = true) {
+    bindSingleton<DebugServer> {
         FakeHerdrServer(
             machineStore = instance(),
             sshStateManager = instance(),
