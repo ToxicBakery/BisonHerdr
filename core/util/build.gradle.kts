@@ -14,13 +14,13 @@ kotlin {
     }
     jvm()
     sourceSets {
-        val commonMain by getting {
+        commonMain {
             dependencies {
                 api(libs.androidx.lifecycle.viewmodelCompose)
                 api(libs.kotlinx.coroutines.core)
             }
         }
-        val commonTest by getting {
+        commonTest {
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)

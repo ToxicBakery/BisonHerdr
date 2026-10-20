@@ -15,7 +15,7 @@ kotlin {
     }
     jvm()
     sourceSets {
-        val commonMain by getting {
+        commonMain {
             dependencies {
                 implementation(projects.core.model)
 
@@ -28,7 +28,7 @@ kotlin {
                 implementation(libs.kotlinx.serialization.json.io)
             }
         }
-        val commonTest by getting {
+        commonTest {
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)
