@@ -969,7 +969,7 @@ internal class RealHerdrSshClient(
         }
         val edits = optimisticEdits[machineId] ?: return
         synchronized(edits) {
-            while (edits.isNotEmpty() && edits.peekFirst().seq <= confirmedSeq) {
+            while (edits.isNotEmpty() && edits.first().seq <= confirmedSeq) {
                 edits.removeFirst()
             }
         }
@@ -1746,7 +1746,7 @@ internal class RealHerdrSshClient(
         val editsDeque = optimisticEdits[machineId] ?: return baseFrame
         val activeEdits = synchronized(editsDeque) {
             val now = System.currentTimeMillis()
-            while (editsDeque.isNotEmpty() && now - editsDeque.peekFirst().createdAtMs > OPTIMISTIC_ECHO_TTL_MS) {
+            while (editsDeque.isNotEmpty() && now - editsDeque.first().createdAtMs > OPTIMISTIC_ECHO_TTL_MS) {
                 editsDeque.removeFirst()
             }
             if (editsDeque.isEmpty()) emptyList() else editsDeque.toList()
