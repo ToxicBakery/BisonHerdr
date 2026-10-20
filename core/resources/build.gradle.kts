@@ -11,7 +11,7 @@ kotlin {
     configureOptIns()
     jvm()
     sourceSets {
-        val commonMain by getting {
+        commonMain {
             dependencies {
                 implementation(libs.androidx.lifecycle.runtimeCompose)
                 api(libs.compose.components.resources)

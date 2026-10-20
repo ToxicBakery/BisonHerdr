@@ -9,12 +9,16 @@ kotlin {
     configureOptIns()
     android {
         namespace = "com.toxicbakery.app.bison.di"
-        compileSdk = libs.versions.android.compileSdk.get().toInt()
+        compileSdk {
+            version = release(libs.versions.android.compileSdk.get().toInt()) {
+                minorApiLevel = 1
+            }
+        }
         minSdk = libs.versions.android.minSdk.get().toInt()
     }
     jvm()
     sourceSets {
-        val commonMain by getting {
+        commonMain {
             dependencies {
                 implementation(projects.core.common)
                 implementation(projects.core.debugServer)
@@ -31,7 +35,7 @@ kotlin {
                 implementation(libs.kotlinx.serialization.json)
             }
         }
-        val commonTest by getting {
+        commonTest {
             dependencies {
                 implementation(projects.core.fakeServer)
                 implementation(libs.kotlin.test)

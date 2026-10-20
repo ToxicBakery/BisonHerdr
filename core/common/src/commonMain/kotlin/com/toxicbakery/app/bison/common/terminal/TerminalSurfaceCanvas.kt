@@ -22,8 +22,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -68,7 +68,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.IntOffset
@@ -138,7 +137,7 @@ fun TerminalSurfaceCanvas(
     val textMeasurer = rememberTextMeasurer(cacheSize = 2048)
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
-    var imeBuffer by remember { mutableStateOf(TextFieldValue(text = " ", selection = TextRange(1))) }
+    val imeState = rememberTextFieldState(initialText = " ", initialSelection = TextRange(1))
 
     var liveFontSizeSp by remember { mutableFloatStateOf(fontSizeSp.coerceIn(7f, 28f)) }
     var lastDispatchedFontSizeSp by remember { mutableFloatStateOf(fontSizeSp.coerceIn(7f, 28f)) }
@@ -276,33 +275,36 @@ fun TerminalSurfaceCanvas(
         val currentOnFontSizeChange by rememberUpdatedState(onFontSizeChange)
         val currentOnPaneScroll by rememberUpdatedState(onPaneScroll)
         val currentOnSelectionChanged by rememberUpdatedState(onSelectionChanged)
+        val currentOnTextInput by rememberUpdatedState(onTextInput)
+        val currentOnSpecialKey by rememberUpdatedState(onSpecialKey)
 
         // Hidden IME receiver so tapping the terminal or pressing keys types directly into the focused pane
         BasicTextField(
-            value = imeBuffer,
-            onValueChange = { updated ->
-                val raw = updated.text
+            state = imeState,
+            inputTransformation = {
+                val raw = asCharSequence().toString()
                 when {
                     raw.isEmpty() -> {
-                        onSpecialKey(ClientKeyCode.Backspace)
+                        currentOnSpecialKey(ClientKeyCode.Backspace)
                     }
                     raw.startsWith(" ") && raw.length > 1 -> {
                         val delta = raw.substring(1)
                         if (delta == "\n" || delta == "\r") {
-                            onSpecialKey(ClientKeyCode.Enter)
+                            currentOnSpecialKey(ClientKeyCode.Enter)
                         } else {
-                            onTextInput(delta)
+                            currentOnTextInput(delta)
                         }
                     }
                     raw != " " -> {
                         if (raw == "\n" || raw == "\r") {
-                            onSpecialKey(ClientKeyCode.Enter)
+                            currentOnSpecialKey(ClientKeyCode.Enter)
                         } else {
-                            onTextInput(raw)
+                            currentOnTextInput(raw)
                         }
                     }
                 }
-                imeBuffer = TextFieldValue(text = " ", selection = TextRange(1))
+                replace(0, length, " ")
+                placeCursorAfterCharAt(0)
             },
             keyboardOptions = KeyboardOptions(
                 capitalization = KeyboardCapitalization.None,
@@ -310,11 +312,9 @@ fun TerminalSurfaceCanvas(
                 keyboardType = KeyboardType.Ascii,
                 imeAction = ImeAction.Send,
             ),
-            keyboardActions = KeyboardActions(
-                onSend = { onSpecialKey(ClientKeyCode.Enter) },
-                onDone = { onSpecialKey(ClientKeyCode.Enter) },
-                onGo = { onSpecialKey(ClientKeyCode.Enter) },
-            ),
+            onKeyboardAction = {
+                currentOnSpecialKey(ClientKeyCode.Enter)
+            },
             modifier = Modifier
                 .size(1.dp)
                 .alpha(0.01f)

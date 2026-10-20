@@ -528,7 +528,7 @@ internal class RealHerdrSshClient(
         )
         when (val auth = machine.authMethod) {
             is SshAuthMethod.Password -> {
-                session.setPassword(auth.encryptedPasswordRef)
+                session.setPassword(auth.encryptedPasswordRef.encodeToByteArray())
             }
             else -> {
                 // Publickey or keyboard-interactive fallback

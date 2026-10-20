@@ -11,7 +11,11 @@ plugins {
 
 android {
     namespace = "com.toxicbakery.app.bison"
-    compileSdk = libs.versions.android.compileSdk.get().toInt()
+    compileSdk {
+        version = release(libs.versions.android.compileSdk.get().toInt()) {
+            minorApiLevel = 1
+        }
+    }
 
     defaultConfig {
         applicationId = "com.toxicbakery.app.bison"
@@ -64,7 +68,6 @@ android {
     }
 
     lint {
-        htmlReport = true
         checkReleaseBuilds = false
     }
 
