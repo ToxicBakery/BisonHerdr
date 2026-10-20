@@ -1,4 +1,4 @@
-# BisonHerdr (Herdr Tablet)
+# BisonHerdr
 
 **BisonHerdr** (`com.toxicbakery.app.bison`) is a high-performance, native Android tablet and foldable terminal workspace and multi-machine coding-agent control center powered by [Herdr](https://github.com/herdrdev/herdr).
 
