@@ -36,6 +36,7 @@ import com.toxicbakery.app.bison.common.screen.workspace.composable.ZenCanvasTop
 import com.toxicbakery.app.bison.common.terminal.TerminalSurfaceCanvas
 import com.toxicbakery.app.bison.common.theme.BisonTheme
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
+import com.toxicbakery.app.bison.common.version.VersionCheck
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.common_cancel
@@ -44,6 +45,7 @@ import com.toxicbakery.app.bison.resources.hardware_key_sheet_tap_nfc
 import com.toxicbakery.app.bison.resources.hardware_key_sheet_title
 import com.toxicbakery.app.bison.resources.hardware_key_sheet_touch_usb
 import com.toxicbakery.app.bison.ssh.SshRequest
+import com.toxicbakery.app.bison.version.AppVersion
 import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.viewmodel.rememberViewModel
 
@@ -163,6 +165,11 @@ fun WorkspaceTerminalScreen(
                 },
                 onRequestKeyboard = {
                     keyboardTriggerCount++
+                },
+                availableUpdateVersion = VersionCheck.unseenReleaseVersion(appSettings, AppVersion.CODE),
+                onAcknowledgeUpdate = {
+                    viewModel.onEvent(WorkspaceTerminalViewModel.Event.AcknowledgeReleaseUpdate)
+                    navigationController.goTo(ScreenKeyMachineFederation)
                 },
             )
 

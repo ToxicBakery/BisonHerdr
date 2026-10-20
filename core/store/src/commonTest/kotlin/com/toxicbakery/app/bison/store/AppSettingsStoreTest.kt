@@ -52,6 +52,21 @@ class AppSettingsStoreTest {
         val decoded = appJson.decodeFromString<AppSettings>(rawJson)
         assertEquals("oled-black", decoded.themeId)
         assertEquals(16f, decoded.defaultFontSizeSp)
+
+        store.updateSettings {
+            it.copy(
+                availableReleaseVersion = "26.42.2",
+                availableReleaseUrl = "https://github.com/ToxicBakery/BisonHerdr/releases/tag/v26.42.2",
+            )
+        }
+        store.acknowledgeReleaseUpdate()
+        store.setCheckForUpdates(false)
+
+        val updatedDecoded = appJson.decodeFromString<AppSettings>(
+            assertNotNull(io.readText(AppSettingsStore.SETTINGS_FILE_NAME)),
+        )
+        assertEquals("26.42.2", updatedDecoded.notifiedReleaseVersion)
+        assertEquals(false, updatedDecoded.checkForUpdates)
     }
 
     @Test

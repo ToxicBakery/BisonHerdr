@@ -88,6 +88,25 @@ class AppSettingsStore(
         }
     }
 
+    /**
+     * Enables or disables automatic daily GitHub release checks.
+     */
+    suspend fun setCheckForUpdates(enabled: Boolean) {
+        updateSettings { current ->
+            current.copy(checkForUpdates = enabled)
+        }
+    }
+
+    /**
+     * Marks [AppSettings.availableReleaseVersion] as seen in [AppSettings.notifiedReleaseVersion].
+     */
+    suspend fun acknowledgeReleaseUpdate() {
+        updateSettings { current ->
+            val available = current.availableReleaseVersion ?: return@updateSettings current
+            current.copy(notifiedReleaseVersion = available)
+        }
+    }
+
     private suspend fun loadSettingsFromDisk() {
         try {
             mutex.withLock {

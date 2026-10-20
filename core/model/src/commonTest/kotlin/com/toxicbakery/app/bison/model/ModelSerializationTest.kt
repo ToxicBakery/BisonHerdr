@@ -28,10 +28,27 @@ class ModelSerializationTest {
             listOf("Esc", "Tab", "Ctrl", "Alt", "^C", "^B", "/", "|"),
             settings.leftThumbKeys,
         )
+        assertTrue(settings.checkForUpdates)
+        assertEquals(0L, settings.lastReleaseCheckEpochMs)
+        assertEquals(null, settings.availableReleaseVersion)
+        assertEquals(null, settings.availableReleaseUrl)
+        assertEquals(null, settings.notifiedReleaseVersion)
 
         val encoded = json.encodeToString(settings)
         val decoded = json.decodeFromString<AppSettings>(encoded)
         assertEquals(settings, decoded)
+
+        val defaultsFromEmpty = json.decodeFromString<AppSettings>("{}")
+        assertEquals(AppSettings(), defaultsFromEmpty)
+
+        val withReleaseFields = settings.copy(
+            checkForUpdates = false,
+            lastReleaseCheckEpochMs = 1_760_000_000_000L,
+            availableReleaseVersion = "26.42.2",
+            availableReleaseUrl = "https://github.com/ToxicBakery/BisonHerdr/releases/tag/v26.42.2",
+            notifiedReleaseVersion = "26.42.1",
+        )
+        assertEquals(withReleaseFields, json.decodeFromString<AppSettings>(json.encodeToString(withReleaseFields)))
     }
 
     @Test

@@ -26,11 +26,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -53,6 +55,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -63,6 +68,8 @@ import com.toxicbakery.app.bison.common.navigation.ScreenKeyWorkspaceTerminal
 import com.toxicbakery.app.bison.common.theme.BisonThemePalette
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
+import com.toxicbakery.app.bison.common.version.RemoteRelease
+import com.toxicbakery.app.bison.common.version.VersionCheck
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.AppSettings
 import com.toxicbakery.app.bison.model.HostMachine
@@ -70,6 +77,12 @@ import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.app_version_label
+import com.toxicbakery.app.bison.resources.frame_update_available
+import com.toxicbakery.app.bison.resources.settings_about_new
+import com.toxicbakery.app.bison.resources.settings_about_open_release
+import com.toxicbakery.app.bison.resources.settings_about_update_available
+import com.toxicbakery.app.bison.resources.settings_app_check_updates
+import com.toxicbakery.app.bison.resources.settings_app_check_updates_summary
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
@@ -79,6 +92,18 @@ import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.localDI
 import org.kodein.di.instance
+
+/** Test tag of the top-bar chip indicating that a new release version is available. */
+const val UPDATE_AVAILABLE_TAG: String = "updateAvailable"
+
+/** Test tag of the "Update available" card in the Settings/About sheet. */
+const val ABOUT_UPDATE_AVAILABLE_TAG: String = "about-update-available"
+
+/** Test tag of the button that opens the GitHub Release page. */
+const val ABOUT_OPEN_RELEASE_TAG: String = "about-open-release"
+
+/** Test tag of the switch that toggles automatic daily update checks. */
+const val CHECK_FOR_UPDATES_TAG: String = "app-check-updates"
 
 @Composable
 fun MachineFederationScreen(
@@ -166,6 +191,18 @@ fun MachineFederationScreen(
                     }
                 },
                 actions = {
+                    val unseenUpdateVersion = VersionCheck.unseenReleaseVersion(appSettings, AppVersion.CODE)
+                    if (unseenUpdateVersion != null && VersionCheck.shouldShowTopBarNotification(appSettings, AppVersion.CODE)) {
+                        UpdateAvailableIndicator(
+                            version = unseenUpdateVersion,
+                            onClick = {
+                                scope.launch {
+                                    appSettingsStore.updateSettings(VersionCheck::acknowledgeRelease)
+                                }
+                                showSettingsSheet = true
+                            },
+                        )
+                    }
                     IconButton(onClick = { showSettingsSheet = true }) {
                         Icon(
                             imageVector = Icons.Default.Settings,
@@ -451,7 +488,7 @@ private fun EmptyFleetBanner(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun ThemeAndSettingsBottomSheet(
+internal fun ThemeAndSettingsBottomSheet(
     settings: AppSettings,
     onSelectTheme: (String) -> Unit,
     onUpdateSettings: ((AppSettings) -> AppSettings) -> Unit,
@@ -459,6 +496,7 @@ private fun ThemeAndSettingsBottomSheet(
 ) {
     val palette = LocalBisonPalette.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val effectiveRelease = VersionCheck.effectiveAvailableRelease(settings, AppVersion.CODE)
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -473,6 +511,15 @@ private fun ThemeAndSettingsBottomSheet(
                 .padding(horizontal = 24.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            if (effectiveRelease != null) {
+                UpdateAvailableSection(
+                    release = effectiveRelease,
+                    onOpenRelease = {
+                        onUpdateSettings(VersionCheck::acknowledgeRelease)
+                    },
+                )
+            }
+
             Text(
                 text = "Color Themes (19 Curated Palettes)",
                 style = MaterialTheme.typography.titleMedium,
@@ -521,6 +568,15 @@ private fun ThemeAndSettingsBottomSheet(
                     onUpdateSettings { it.copy(splitThumbLayoutEnabled = enabled) }
                 },
             )
+            SettingToggleRow(
+                label = stringResource(Res.string.settings_app_check_updates),
+                summary = stringResource(Res.string.settings_app_check_updates_summary),
+                checked = settings.checkForUpdates,
+                onCheckedChange = { enabled ->
+                    onUpdateSettings { it.copy(checkForUpdates = enabled) }
+                },
+                tag = CHECK_FOR_UPDATES_TAG,
+            )
             Text(
                 text = stringResource(Res.string.app_version_label, AppVersion.NAME),
                 style = MaterialTheme.typography.labelSmall,
@@ -528,6 +584,127 @@ private fun ThemeAndSettingsBottomSheet(
                 fontFamily = FontFamily.Monospace,
             )
             Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+/**
+ * Compact chip in the top bar when an unseen release is available. One tap marks the version as
+ * seen and opens the Settings/About sheet.
+ */
+@Composable
+internal fun UpdateAvailableIndicator(
+    version: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalBisonPalette.current
+    Box(
+        modifier = modifier
+            .padding(horizontal = 4.dp)
+            .testTag(UPDATE_AVAILABLE_TAG)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            color = palette.accentPrimary.copy(alpha = 0.18f),
+            contentColor = palette.accentPrimary,
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, palette.accentPrimary.copy(alpha = 0.55f)),
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+                Text(
+                    text = stringResource(Res.string.frame_update_available, version),
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Non-intrusive "Update available" card in the Settings/About sheet with a button to open the
+ * GitHub Release page in the system browser.
+ */
+@Composable
+internal fun UpdateAvailableSection(
+    release: RemoteRelease,
+    onOpenRelease: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalBisonPalette.current
+    val uriHandler = LocalUriHandler.current
+
+    Surface(
+        color = palette.bgDeep,
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, palette.accentPrimary.copy(alpha = 0.5f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag(ABOUT_UPDATE_AVAILABLE_TAG),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Surface(
+                    color = palette.accentPrimary.copy(alpha = 0.2f),
+                    contentColor = palette.accentPrimary,
+                    shape = RoundedCornerShape(6.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Text(
+                            text = stringResource(Res.string.settings_about_new),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+                Text(
+                    text = stringResource(Res.string.settings_about_update_available, release.version),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = palette.fgPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                FilledTonalButton(
+                    onClick = {
+                        onOpenRelease()
+                        runCatching { uriHandler.openUri(release.htmlUrl) }
+                    },
+                    modifier = Modifier.testTag(ABOUT_OPEN_RELEASE_TAG),
+                ) {
+                    Text(stringResource(Res.string.settings_about_open_release))
+                }
+            }
         }
     }
 }
@@ -581,19 +758,31 @@ private fun SettingToggleRow(
     label: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    summary: String? = null,
+    tag: String? = null,
 ) {
     val palette = LocalBisonPalette.current
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (tag != null) Modifier.testTag(tag) else Modifier),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.fgPrimary,
-            modifier = Modifier.weight(1f),
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.fgPrimary,
+            )
+            if (!summary.isNullOrBlank()) {
+                Text(
+                    text = summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.fgMuted,
+                )
+            }
+        }
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
