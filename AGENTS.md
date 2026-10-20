@@ -2,11 +2,12 @@
 
 This file defines workspace-wide instructions and workflow rules for AI coding agents working in `herdr-tablet`.
 
-## 1. Git Workflow & Commit Policy (REQUIRED)
+## 1. Definition of Done & Git Workflow (REQUIRED)
 
+- **Zero-Warning Builds (Definition of Done):** Work is **not** complete until all relevant Gradle/Kotlin and Cargo/Rust builds and tests pass **with zero compiler, linker, or build warnings**. Fix all deprecation, unused-symbol, unchecked-cast, clippy, and build configuration warnings before considering any task done.
 - **Commit to `main` as work completes:** Agents **must** commit changes directly to the `main` branch as each task, phase, or logical unit of work is completed. Do not leave completed work uncommitted in the working tree.
 - **Atomic, verified commits:**
-  1. Verify that any relevant builds, unit tests, or checks pass before committing.
+  1. Verify that all relevant builds and unit tests complete **without warnings** or errors before committing.
   2. Check `git status` and `git diff` to ensure only intended files are staged and no temporary files or secrets are included.
   3. Commit to `main` with a clear, descriptive commit message (e.g., `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`, `refactor: ...`).
   4. If a task modifies the `herdr/` submodule (e.g., extracting `herdr-protocol` or updating `client_shell` API schema entries), commit those changes inside `herdr/` first, then stage and commit the updated `herdr` submodule pointer on `main` in the root repository.

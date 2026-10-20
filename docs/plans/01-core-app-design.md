@@ -982,3 +982,7 @@ data class ScreenKeyMachineConfigure(
 ### Phase 4: Split-Thumb Floating Controls, Prompt Composer & Notifications
 - Build the ergonomic **Left & Right Split-Thumb Floating Key Clusters** (sticky/chorded `Ctrl`/`Alt`/`Shift`/`Esc`/`Tab` + swipe arrow trackpad).
 - Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste, and offline Mosh roaming queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
+
+### Definition of Done (All Phases)
+- **Zero-Warning Builds:** Every Gradle/Kotlin and Cargo/Rust build (`./gradlew build`, `cargo build`, `cargo test`, `cargo clippy`) must complete **with zero warnings** and zero errors.
+- **Verified Commits on `main`:** Each completed phase or logical unit of work is verified and committed directly to `main` with a clean working tree.
