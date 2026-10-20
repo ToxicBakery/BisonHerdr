@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App Identity & General Navigation -->
+    <string name="app_name">BisonHerdr</string>
+    <string name="app_demo_name">BisonHerdr Demo</string>
+    <string name="app_tagline">Touch-First Herdr Terminal &amp; Multi-Machine Agent Control Center</string>
+    <string name="app_version_label">Version %1$s</string>
+    <string name="navigation_back">Back</string>
+    <string name="common_save">Save</string>
+    <string name="common_cancel">Cancel</string>
+    <string name="common_delete">Delete</string>
+    <string name="common_edit">Edit</string>
+    <string name="common_close">Close</string>
+    <string name="common_connect">Connect</string>
+    <string name="common_disconnect">Disconnect</string>
+    <string name="common_retry">Retry</string>
+    <string name="common_confirm">Confirm</string>
+    <string name="common_enabled">Enabled</string>
+    <string name="common_disabled">Disabled</string>
+
+    <!-- Zen Canvas Floating Top HUD Islands -->
+    <string name="hud_host_switcher_description">Switch Host, Workspace, or Tab</string>
+    <string name="hud_host_workspace_summary">%1$s &#8226; %2$s (%3$d/%4$d)</string>
+    <string name="hud_rtt_ms">%1$d ms</string>
+    <string name="hud_local_echo_on">Local Echo: ON</string>
+    <string name="hud_local_echo_off">Local Echo: OFF</string>
+    <string name="hud_agents_pill_label">Agents</string>
+    <string name="hud_agents_blocked_count">%1$d Blocked</string>
+    <string name="hud_agents_working_count">%1$d Working</string>
+    <string name="hud_agents_done_count">%1$d Done</string>
+    <string name="hud_splits_pill_label">Splits</string>
+    <string name="hud_split_right">Split Right</string>
+    <string name="hud_split_down">Split Down</string>
+    <string name="hud_pane_zoom_toggle">Zoom Pane</string>
+    <string name="hud_pane_close">Close Pane</string>
+    <string name="hud_workspace_create">New Workspace</string>
+    <string name="hud_worktree_create">New Git Worktree</string>
+    <string name="hud_tab_create">New Tab</string>
+
+    <!-- Transport & Roaming Badges -->
+    <string name="transport_badge_mosh_udp">MOSH &#8226; UDP</string>
+    <string name="transport_badge_mosh_udp_port">MOSH UDP :%1$d</string>
+    <string name="transport_badge_mosh_roamed">MOSH ROAMED</string>
+    <string name="transport_badge_ssh_tcp">SSH &#8226; TCP</string>
+    <string name="transport_badge_ssh_fallback">SSH &#8226; TCP (Mosh UDP unavailable)</string>
+    <string name="roaming_status_healthy">Connected</string>
+    <string name="roaming_status_parked">Background Parked (0 B/s)</string>
+    <string name="roaming_status_reconnecting">Reconnecting&#8230;</string>
+    <string name="roaming_zero_drop_armed">Zero-drop UDP roaming armed</string>
+
+    <!-- Slide-Over Federated Agent Command Center -->
+    <string name="agent_drawer_title">Federated Agent Command Center</string>
+    <string name="agent_drawer_empty">No active coding agents detected across connected machines.</string>
+    <string name="agent_status_blocked">Blocked</string>
+    <string name="agent_status_done">Done</string>
+    <string name="agent_status_working">Working</string>
+    <string name="agent_status_idle">Idle</string>
+    <string name="agent_status_unknown">Unknown</string>
+    <string name="agent_action_approve">Approve</string>
+    <string name="agent_action_approve_enter">Approve (Enter)</string>
+    <string name="agent_action_always_allow">Always Allow</string>
+    <string name="agent_action_reject">Reject</string>
+    <string name="agent_action_cancel_esc">Cancel (Esc)</string>
+    <string name="agent_action_jump_to_pane">Jump to Pane</string>
+    <string name="agent_permission_prompt_header">Permission Prompt &#8212; %1$s</string>
+
+    <!-- Split-Thumb Clusters & Native Prompt Composer -->
+    <string name="composer_placeholder">Prompt focused pane or coding agent&#8230;</string>
+    <string name="composer_expanded_title">Compose Prompt</string>
+    <string name="composer_send_button">Send</string>
+    <string name="composer_paste_image">Paste Image</string>
+    <string name="composer_voice_dictation">Voice Dictation</string>
+    <string name="composer_queued_offline">Queued for Mosh / SSH delivery (%1$d pending)</string>
+    <string name="thumb_key_esc">Esc</string>
+    <string name="thumb_key_tab">Tab</string>
+    <string name="thumb_key_ctrl">Ctrl</string>
+    <string name="thumb_key_alt">Alt</string>
+    <string name="thumb_key_ctrl_c">^C</string>
+    <string name="thumb_key_enter">Enter</string>
+
+    <!-- Machine Federation & Connection Screens -->
+    <string name="machine_federation_title">Machine Federation</string>
+    <string name="machine_federation_subtitle">Manage SSH &amp; Mosh hosts running Herdr</string>
+    <string name="machine_federation_add_host">Add Host Machine</string>
+    <string name="machine_federation_demo_mode">Launch Demo Server</string>
+    <string name="machine_federation_empty">No machines configured yet. Add an SSH host or launch the demo server.</string>
+    <string name="machine_configure_add_title">Add Host Machine</string>
+    <string name="machine_configure_edit_title">Configure Machine</string>
+    <string name="machine_field_name_label">Display Name</string>
+    <string name="machine_field_hostname_label">Hostname or Tailscale IP</string>
+    <string name="machine_field_port_label">SSH Port</string>
+    <string name="machine_field_username_label">SSH Username</string>
+    <string name="machine_field_transport_mode_label">Transport Backbone</string>
+    <string name="machine_transport_auto_prefer_mosh">Auto (Prefer Mosh UDP + Herdr Sideband)</string>
+    <string name="machine_transport_mosh_only">Mosh UDP Only</string>
+    <string name="machine_transport_ssh_only">SSH Endpoint Bridge Only</string>
+    <string name="machine_field_mosh_path_label">Custom mosh-server Path (Optional)</string>
+    <string name="machine_field_mosh_ports_label">Mosh UDP Port Range</string>
+    <string name="machine_field_auth_method_label">Authentication Method</string>
+    <string name="machine_auth_keystore">Android Keystore Private Key (Ed25519 / RSA / ECDSA)</string>
+    <string name="machine_auth_password">Password / Keyboard-Interactive</string>
+    <string name="machine_auth_hardware_key">Hardware Security Key (YubiKey / FIDO2 NFC &amp; USB-C)</string>
+    <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
+    <string name="machine_connecting_title">Connecting to %1$s</string>
+    <string name="machine_connecting_step_ssh">1. Authenticating SSH &amp; verifying host key&#8230;</string>
+    <string name="machine_connecting_step_mosh">2. Probing mosh-server &amp; bootstrapping Herdr session&#8230;</string>
+    <string name="machine_connecting_step_handshake">3. Verifying Mosh UDP SSP / Endpoint Gen 1 handshake&#8230;</string>
+    <string name="machine_connecting_step_snapshot">4. Synchronizing Herdr workspace &amp; agent snapshot&#8230;</string>
+
+    <!-- YubiKey / FIDO2 Hardware Security Key Prompt -->
+    <string name="hardware_key_sheet_title">Security Key Verification Required</string>
+    <string name="hardware_key_sheet_touch_usb">Touch the flashing contact on your USB-C YubiKey to sign the SSH challenge.</string>
+    <string name="hardware_key_sheet_tap_nfc">Hold your NFC YubiKey against the back of the tablet to sign the SSH challenge.</string>
+    <string name="hardware_key_key_type_label">Key Type: %1$s</string>
+
+    <!-- Settings & Color Themes (Gruvbox Dark Default + 18 Palettes) -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_section_appearance">Appearance &amp; Color Palette</string>
+    <string name="settings_theme_label">Global Color Theme</string>
+    <string name="settings_host_theme_override_label">Per-Host Theme Override</string>
+    <string name="settings_theme_default_badge">Default</string>
+    <string name="settings_font_size_label">Terminal Font Size (pt)</string>
+    <string name="settings_section_mosh_roaming">Mosh UDP &amp; Background Parking</string>
+    <string name="settings_predictive_echo_label">Mosh Local Predictive Echo</string>
+    <string name="settings_surface_lease_label">Zero-Bandwidth Background Parking (surface_interest)</string>
+
+    <!-- Foreground Service & Actionable System Notifications -->
+    <string name="service_notification_channel_name">BisonHerdr Active Sessions</string>
+    <string name="service_notification_title">BisonHerdr: %1$d machines (%2$s) &#8226; %3$d agents active</string>
+    <string name="agent_alert_channel_name">Coding Agent Alerts</string>
+    <string name="agent_alert_blocked_title">Agent Blocked on %1$s (%2$s)</string>
+    <string name="agent_alert_done_title">Agent Finished on %1$s (%2$s)</string>
+    <string name="agent_alert_inline_reply_label">Reply with Prompt</string>
+</resources>

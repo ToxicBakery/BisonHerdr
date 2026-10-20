@@ -1,7 +1,10 @@
 # Gradle & Kotlin Multiplatform
 .gradle/
+.kotlin/
+build/
 **/build/
 !src/**/build/
+!rust/**/build.rs
 kotlin-js-store/
 
 # Android Studio / IntelliJ IDEA
@@ -14,9 +17,12 @@ captures/
 .externalNativeBuild/
 .cxx/
 
-# Rust / Cargo
+# Rust / Cargo / Zig
+rust/target/
 **/target/
 **/*.rs.bk
+.zig-cache/
+zig-out/
 
 # OS / Editor files
 .DS_Store
