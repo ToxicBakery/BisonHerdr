@@ -61,10 +61,11 @@ class KodeinConnectionFlowE2ETest {
             val di = DI {
                 import(coreDiModule)
                 bindSingleton<DebugServer> { NoDebugServer }
-                bindProvider<StoreIOProvider>(overrides = true) { InMemoryStoreIOProvider() }
+                bindSingleton<StoreIOProvider>(overrides = true) { InMemoryStoreIOProvider() }
             }
 
             val direct = di.direct
+            assertEquals(direct.instance<StoreIOProvider>(), direct.instance<StoreIOProvider>())
             assertNotNull(direct.instance<Json>())
             assertNotNull(direct.instance<SshStateManager>())
             assertNotNull(direct.instance<SshRequestManager>())

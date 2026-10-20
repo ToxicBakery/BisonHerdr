@@ -52,7 +52,7 @@ interface StoreIOProvider {
         override fun flush() = Unit
 
         override fun close() {
-            writeAtomic(storeName, buffer.copy().readString())
+            writeAtomic(storeName, buffer.readString())
         }
     }
 

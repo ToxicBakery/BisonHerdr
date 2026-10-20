@@ -54,6 +54,7 @@ data class ExportedSshPublicKey(
 class AndroidKeystoreKeyManager {
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
+    private val exportedPublicKeys = ConcurrentHashMap<String, ExportedSshPublicKey>()
 
     /**
      * Generates or loads an existing key pair for [keyAlias] using [algorithm] and returns its
@@ -65,14 +66,17 @@ class AndroidKeystoreKeyManager {
         requireBiometric: Boolean = false,
         comment: String = "bison-tablet",
     ): ExportedSshPublicKey {
-        val publicKey = loadExistingPublicKey(keyAlias)
-            ?: generateKeyPair(keyAlias, algorithm, requireBiometric).public
-        return exportPublicKey(
-            keyAlias = keyAlias,
-            algorithm = algorithm,
-            publicKey = publicKey,
-            comment = comment,
-        )
+        val cacheKey = "$keyAlias:${algorithm.name}:$comment"
+        return exportedPublicKeys.computeIfAbsent(cacheKey) {
+            val publicKey = loadExistingPublicKey(keyAlias)
+                ?: generateKeyPair(keyAlias, algorithm, requireBiometric).public
+            exportPublicKey(
+                keyAlias = keyAlias,
+                algorithm = algorithm,
+                publicKey = publicKey,
+                comment = comment,
+            )
+        }
     }
 
     /**
@@ -116,6 +120,8 @@ class AndroidKeystoreKeyManager {
      */
     fun deleteKey(keyAlias: String) {
         fallbackKeyPairs.remove(keyAlias)
+        val prefix = "$keyAlias:"
+        exportedPublicKeys.keys.removeIf { it.startsWith(prefix) }
         runCatching {
             val ks = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
             ks.load(null)

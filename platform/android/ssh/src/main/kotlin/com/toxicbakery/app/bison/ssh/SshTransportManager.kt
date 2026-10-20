@@ -66,13 +66,13 @@ class SshTransportManager(
     private val endpointSnapshotBus: EndpointSnapshotBus,
     private val paneSurfaceBus: PaneSurfaceBus,
     private val semanticNotificationBus: SemanticNotificationBus,
-) {
-    internal var keystoreKeyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager()
-    internal var yubiKeyFido2Manager: YubiKeyFido2Manager = YubiKeyFido2Manager(
+    var keystoreKeyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(),
+    var yubiKeyFido2Manager: YubiKeyFido2Manager = YubiKeyFido2Manager(
         sshStateManager = sshStateManager,
         sshDebugLog = sshDebugLog,
-    )
-    internal var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog)
+    ),
+    var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
+) {
     internal var moshBootstrapBannerProvider: ((HostMachine) -> String?)? = null
     internal var moshUdpReachabilityProbe: (suspend (HostMachine, MoshConnectInfo) -> Boolean)? = null
     internal var sshRouteProbe: (suspend (HostMachine, ResolvedSshRoute) -> Boolean)? = null
@@ -823,7 +823,7 @@ class SshTransportManager(
                 frame = FrameData(
                     width = DEFAULT_COLS,
                     height = DEFAULT_ROWS,
-                    cells = List(DEFAULT_COLS.toInt() * DEFAULT_ROWS.toInt()) { CellData() },
+                    cells = List(DEFAULT_COLS.toInt() * DEFAULT_ROWS.toInt()) { BLANK_CELL },
                     cursor = CursorState(x = 0u, y = 0u, shape = CursorShape.Block, visible = true),
                 ),
                 panes = listOf(
@@ -896,17 +896,20 @@ class SshTransportManager(
         )
     }
 
+    private fun parseParamsObject(paramsJson: String): JsonObject =
+        runCatching { json.parseToJsonElement(paramsJson).jsonObject }
+            .getOrElse { JsonObject(emptyMap()) }
+
     private fun applyFocusRpcMutation(
         machineId: String,
         request: ClientShellEndpointRequest,
         isMoshActive: Boolean,
     ) {
         val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId) ?: return
-        val params = runCatching { json.parseToJsonElement(request.paramsJson).jsonObject }
-            .getOrElse { JsonObject(emptyMap()) }
 
         when (request.method) {
             "workspace.focus" -> {
+                val params = parseParamsObject(request.paramsJson)
                 val wsId = params["workspace_id"]?.jsonPrimitive?.content ?: return
                 val updated = currentSnapshot.copy(
                     revision = currentSnapshot.revision + 1u,
@@ -917,6 +920,7 @@ class SshTransportManager(
             }
 
             "tab.focus" -> {
+                val params = parseParamsObject(request.paramsJson)
                 val tabId = params["tab_id"]?.jsonPrimitive?.content ?: return
                 val updated = currentSnapshot.copy(
                     revision = currentSnapshot.revision + 1u,
@@ -927,11 +931,13 @@ class SshTransportManager(
             }
 
             "pane.focus" -> {
+                val params = parseParamsObject(request.paramsJson)
                 val paneId = params["pane_id"]?.jsonPrimitive?.content ?: return
                 focusPaneInSnapshotAndSurface(machineId, currentSnapshot, paneId, isMoshActive)
             }
 
             "agent.focus" -> {
+                val params = parseParamsObject(request.paramsJson)
                 val requestedPaneId = params["pane_id"]?.jsonPrimitive?.content
                 val requestedName = params["name"]?.jsonPrimitive?.content
                 val resolvedPaneId = requestedPaneId
@@ -993,31 +999,31 @@ class SshTransportManager(
             is ClientPaneInputEvent.TextCommit -> event.text.encodeToByteArray()
             is ClientPaneInputEvent.Paste -> event.text.encodeToByteArray()
             is ClientPaneInputEvent.Key -> encodeKeyEventToBytes(event)
-            is ClientPaneInputEvent.Mouse -> ByteArray(0)
+            is ClientPaneInputEvent.Mouse -> EMPTY_BYTES
         }
 
     private fun encodeKeyEventToBytes(keyEvent: ClientPaneInputEvent.Key): ByteArray {
         val ev = keyEvent.event
         return when (ev.code) {
-            ClientKeyCode.Enter -> "\r".encodeToByteArray()
-            ClientKeyCode.Escape -> "\u001b".encodeToByteArray()
-            ClientKeyCode.Tab -> "\t".encodeToByteArray()
-            ClientKeyCode.Backspace -> "\u007f".encodeToByteArray()
-            ClientKeyCode.Up -> "\u001b[A".encodeToByteArray()
-            ClientKeyCode.Down -> "\u001b[B".encodeToByteArray()
-            ClientKeyCode.Right -> "\u001b[C".encodeToByteArray()
-            ClientKeyCode.Left -> "\u001b[D".encodeToByteArray()
-            ClientKeyCode.Home -> "\u001b[H".encodeToByteArray()
-            ClientKeyCode.End -> "\u001b[F".encodeToByteArray()
-            ClientKeyCode.PageUp -> "\u001b[5~".encodeToByteArray()
-            ClientKeyCode.PageDown -> "\u001b[6~".encodeToByteArray()
-            ClientKeyCode.Delete -> "\u001b[3~".encodeToByteArray()
-            ClientKeyCode.CharC -> if (ev.ctrl) byteArrayOf(0x03) else "c".encodeToByteArray()
-            ClientKeyCode.CharB -> if (ev.ctrl) byteArrayOf(0x02) else "b".encodeToByteArray()
-            ClientKeyCode.CharD -> if (ev.ctrl) byteArrayOf(0x04) else "d".encodeToByteArray()
-            ClientKeyCode.CharZ -> if (ev.ctrl) byteArrayOf(0x1a) else "z".encodeToByteArray()
-            ClientKeyCode.CharY -> "y".encodeToByteArray()
-            ClientKeyCode.CharN -> "n".encodeToByteArray()
+            ClientKeyCode.Enter -> ENTER_BYTES
+            ClientKeyCode.Escape -> ESCAPE_BYTES
+            ClientKeyCode.Tab -> TAB_BYTES
+            ClientKeyCode.Backspace -> BACKSPACE_BYTES
+            ClientKeyCode.Up -> UP_BYTES
+            ClientKeyCode.Down -> DOWN_BYTES
+            ClientKeyCode.Right -> RIGHT_BYTES
+            ClientKeyCode.Left -> LEFT_BYTES
+            ClientKeyCode.Home -> HOME_BYTES
+            ClientKeyCode.End -> END_BYTES
+            ClientKeyCode.PageUp -> PAGE_UP_BYTES
+            ClientKeyCode.PageDown -> PAGE_DOWN_BYTES
+            ClientKeyCode.Delete -> DELETE_BYTES
+            ClientKeyCode.CharC -> if (ev.ctrl) CTRL_C_BYTES else CHAR_C_BYTES
+            ClientKeyCode.CharB -> if (ev.ctrl) CTRL_B_BYTES else CHAR_B_BYTES
+            ClientKeyCode.CharD -> if (ev.ctrl) CTRL_D_BYTES else CHAR_D_BYTES
+            ClientKeyCode.CharZ -> if (ev.ctrl) CTRL_Z_BYTES else CHAR_Z_BYTES
+            ClientKeyCode.CharY -> CHAR_Y_BYTES
+            ClientKeyCode.CharN -> CHAR_N_BYTES
         }
     }
 
@@ -1026,5 +1032,31 @@ class SshTransportManager(
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
         private val DEFAULT_COLS: UShort = 120u
         private val DEFAULT_ROWS: UShort = 36u
+        private val BLANK_CELL = CellData()
+
+        private val EMPTY_BYTES = ByteArray(0)
+        private val ENTER_BYTES = "\r".encodeToByteArray()
+        private val ESCAPE_BYTES = "\u001b".encodeToByteArray()
+        private val TAB_BYTES = "\t".encodeToByteArray()
+        private val BACKSPACE_BYTES = "\u007f".encodeToByteArray()
+        private val UP_BYTES = "\u001b[A".encodeToByteArray()
+        private val DOWN_BYTES = "\u001b[B".encodeToByteArray()
+        private val RIGHT_BYTES = "\u001b[C".encodeToByteArray()
+        private val LEFT_BYTES = "\u001b[D".encodeToByteArray()
+        private val HOME_BYTES = "\u001b[H".encodeToByteArray()
+        private val END_BYTES = "\u001b[F".encodeToByteArray()
+        private val PAGE_UP_BYTES = "\u001b[5~".encodeToByteArray()
+        private val PAGE_DOWN_BYTES = "\u001b[6~".encodeToByteArray()
+        private val DELETE_BYTES = "\u001b[3~".encodeToByteArray()
+        private val CTRL_C_BYTES = byteArrayOf(0x03)
+        private val CTRL_B_BYTES = byteArrayOf(0x02)
+        private val CTRL_D_BYTES = byteArrayOf(0x04)
+        private val CTRL_Z_BYTES = byteArrayOf(0x1a)
+        private val CHAR_C_BYTES = "c".encodeToByteArray()
+        private val CHAR_B_BYTES = "b".encodeToByteArray()
+        private val CHAR_D_BYTES = "d".encodeToByteArray()
+        private val CHAR_Z_BYTES = "z".encodeToByteArray()
+        private val CHAR_Y_BYTES = "y".encodeToByteArray()
+        private val CHAR_N_BYTES = "n".encodeToByteArray()
     }
 }

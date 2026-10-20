@@ -37,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import org.kodein.di.DI
@@ -62,7 +63,7 @@ class BisonSessionService : Service(), DIAware {
     private val semanticNotificationBus: SemanticNotificationBus by instance()
     private val json: Json by instance()
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var networkCallbackRegistered = false
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -210,7 +211,7 @@ class BisonSessionService : Service(), DIAware {
                     }
                 }
                 Triple(connected.size, resolveTransportSummary(backbones), activeAgents)
-            }.collect { (connectedCount, transportSummary, activeAgents) ->
+            }.distinctUntilChanged().collect { (connectedCount, transportSummary, activeAgents) ->
                 updateForegroundNotification(connectedCount, transportSummary, activeAgents)
             }
         }

@@ -72,9 +72,15 @@ internal class RealHerdrSshClient(
     private val semanticNotificationBus: SemanticNotificationBus,
 ) {
     private data class ClientSelectionState(
-        var focusedWorkspaceId: String? = null,
-        var focusedTabId: String? = null,
-        var focusedPaneId: String? = null,
+        @Volatile var focusedWorkspaceId: String? = null,
+        @Volatile var focusedTabId: String? = null,
+        @Volatile var focusedPaneId: String? = null,
+    )
+
+    private class SgrState(
+        val fg: UInt,
+        val bg: UInt,
+        val mod: UShort,
     )
 
     private data class CachedSurfaceInputs(
@@ -310,18 +316,21 @@ internal class RealHerdrSshClient(
         true
     }
 
+    private fun parseParamsObject(paramsJson: String): JsonObject =
+        runCatching { json.parseToJsonElement(paramsJson).jsonObject }
+            .getOrElse { JsonObject(emptyMap()) }
+
     suspend fun executeEndpointRpc(
         machine: HostMachine,
         route: ResolvedSshRoute,
         request: ClientShellEndpointRequest,
     ): String? = withContext(Dispatchers.IO) {
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
-        val paramsObj = runCatching { json.parseToJsonElement(request.paramsJson).jsonObject }
-            .getOrElse { JsonObject(emptyMap()) }
 
         // Track client selection overrides immediately so switching workspaces/tabs/panes is instant
         when (request.method) {
             "workspace.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
                 val wsId = paramsObj["workspace_id"]?.jsonPrimitive?.content
                 if (!wsId.isNullOrBlank()) {
                     sel.focusedWorkspaceId = wsId
@@ -341,6 +350,7 @@ internal class RealHerdrSshClient(
             }
 
             "tab.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
                 val tabId = paramsObj["tab_id"]?.jsonPrimitive?.content
                 if (!tabId.isNullOrBlank()) {
                     sel.focusedTabId = tabId
@@ -356,20 +366,8 @@ internal class RealHerdrSshClient(
                 }
             }
 
-            "pane.focus" -> {
-                val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
-                if (!paneId.isNullOrBlank()) {
-                    sel.focusedPaneId = paneId
-                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
-                    val pane = currentSnap?.panes?.firstOrNull { it.paneId == paneId }
-                    if (pane != null) {
-                        sel.focusedWorkspaceId = pane.workspaceId
-                        sel.focusedTabId = pane.tabId
-                    }
-                }
-            }
-
-            "agent.focus" -> {
+            "pane.focus", "agent.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
                 val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
                 if (!paneId.isNullOrBlank()) {
                     sel.focusedPaneId = paneId
@@ -833,7 +831,7 @@ internal class RealHerdrSshClient(
             splits = layout.splits.map { sp -> sp.copy(rect = scaleRect(sp.rect)) },
         )
 
-        val grid = Array(totalCols * totalRows) { CellData() }
+        val grid = Array(totalCols * totalRows) { BLANK_CELL }
 
         var focusedCursor: CursorState? = null
         val surfacePanes = layoutPanes.map { lp ->
@@ -927,7 +925,7 @@ internal class RealHerdrSshClient(
 
             fun ensureCol(targetCol: Int) {
                 while (lineCells.size < targetCol && lineCells.size < maxLineCols) {
-                    lineCells.add(CellData())
+                    lineCells.add(BLANK_CELL)
                 }
             }
 
@@ -945,9 +943,9 @@ internal class RealHerdrSshClient(
                             when (finalChar) {
                                 'm' -> {
                                     val sgrState = applySgrCodes(paramsStr, fg, bg, mod)
-                                    fg = sgrState.first
-                                    bg = sgrState.second
-                                    mod = sgrState.third
+                                    fg = sgrState.fg
+                                    bg = sgrState.bg
+                                    mod = sgrState.mod
                                 }
                                 'C' -> {
                                     val n = paramsStr.toIntOrNull()?.coerceAtLeast(1) ?: 1
@@ -1034,7 +1032,7 @@ internal class RealHerdrSshClient(
                 if (col < maxLineCols) {
                     ensureCol(col)
                     val cell = CellData(
-                        symbol = String(Character.toChars(cp)),
+                        symbol = codepointToSymbol(cp),
                         fg = fg,
                         bg = bg,
                         modifier = mod,
@@ -1120,14 +1118,17 @@ internal class RealHerdrSshClient(
         return min(endX - 1, lastCol + 1) to lastRow
     }
 
+    private fun codepointToSymbol(cp: Int): String =
+        if (cp in 0..<128) ASCII_SYMBOLS[cp] else String(Character.toChars(cp))
+
     private fun applySgrCodes(
         paramsStr: String,
         currentFg: UInt,
         currentBg: UInt,
         currentMod: UShort,
-    ): Triple<UInt, UInt, UShort> {
+    ): SgrState {
         if (paramsStr.isEmpty()) {
-            return Triple(0u, 0u, 0u)
+            return RESET_SGR_STATE
         }
         val rawTokens = paramsStr.split(';')
         var fg = currentFg
@@ -1212,12 +1213,12 @@ internal class RealHerdrSshClient(
             }
             idx++
         }
-        return Triple(fg, bg, mod.toUShort())
+        return SgrState(fg, bg, mod.toUShort())
     }
 
     private fun stripAnsiCodes(text: String): String =
-        text.replace(Regex("\u001b\\[[0-9;?]*[ -/]*[@-~]"), "")
-            .replace(Regex("\u001b\\][^\u0007]*\u0007"), "")
+        text.replace(CSI_REGEX, "")
+            .replace(OSC_REGEX, "")
 
     private fun parseSurfaceRect(rectObj: JsonObject): SurfaceRect =
         SurfaceRect(
@@ -1235,4 +1236,12 @@ internal class RealHerdrSshClient(
             "idle" -> AgentStatus.Idle
             else -> AgentStatus.Unknown
         }
+
+    companion object {
+        private val BLANK_CELL = CellData()
+        private val RESET_SGR_STATE = SgrState(0u, 0u, 0u)
+        private val ASCII_SYMBOLS = Array(128) { it.toChar().toString() }
+        private val CSI_REGEX = Regex("\u001b\\[[0-9;?]*[ -/]*[@-~]")
+        private val OSC_REGEX = Regex("\u001b\\][^\u0007]*\u0007")
+    }
 }

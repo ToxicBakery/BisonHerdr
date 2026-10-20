@@ -16,8 +16,12 @@ class StoreIOProviderAndroid(
     private val context: Context,
 ) : StoreIOProvider {
 
+    private val storageDir: File by lazy {
+        context.filesDir.apply { mkdirs() }
+    }
+
     private fun resolveFile(fileName: String): File =
-        File(context.filesDir, fileName)
+        File(storageDir, fileName)
 
     override fun exists(fileName: String): Boolean =
         resolveFile(fileName).isFile
@@ -31,7 +35,6 @@ class StoreIOProviderAndroid(
     override fun writeAtomic(fileName: String, content: String) {
         val tempFile = resolveFile("$fileName.tmp")
         val targetFile = resolveFile(fileName)
-        tempFile.parentFile?.mkdirs()
         FileOutputStream(tempFile).use { stream ->
             stream.write(content.toByteArray(Charsets.UTF_8))
             stream.flush()

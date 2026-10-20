@@ -48,6 +48,9 @@ internal val sshModule = DI.Module("sshModule") {
             endpointSnapshotBus = instance(),
             paneSurfaceBus = instance(),
             semanticNotificationBus = instance(),
+            keystoreKeyManager = instance(),
+            yubiKeyFido2Manager = instance(),
+            proxyJumpTunnel = instance(),
         )
     }
 }

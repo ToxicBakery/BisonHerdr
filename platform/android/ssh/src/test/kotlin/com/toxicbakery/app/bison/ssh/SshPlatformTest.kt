@@ -20,7 +20,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotSame
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
@@ -36,6 +38,21 @@ class SshPlatformTest {
         )
         assertTrue(edKey.openSshAuthorizedKeyLine.startsWith("ssh-ed25519 "))
         assertTrue(edKey.openSshAuthorizedKeyLine.endsWith(" tablet@workbox"))
+
+        val edKeyCached = manager.getOrCreatePublicKey(
+            keyAlias = "test_ed25519",
+            algorithm = KeyAlgorithm.Ed25519,
+            comment = "tablet@workbox",
+        )
+        assertSame(edKey, edKeyCached)
+
+        manager.deleteKey("test_ed25519")
+        val edKeyAfterDelete = manager.getOrCreatePublicKey(
+            keyAlias = "test_ed25519",
+            algorithm = KeyAlgorithm.Ed25519,
+            comment = "tablet@workbox",
+        )
+        assertNotSame(edKey, edKeyAfterDelete)
 
         val edSig = manager.signSshChallenge(
             keyAlias = "test_ed25519",
