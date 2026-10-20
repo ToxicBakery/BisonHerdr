@@ -9,3 +9,6 @@
 /composite/gradle.properties text eol=lf
 /composite/settings.gradle.kts text eol=lf
 /composite/src/main/** text eol=lf
+
+# The encrypted upload keystore is binary data. Do not let Git change its bytes.
+/signing/upload.keystore.gpg binary
