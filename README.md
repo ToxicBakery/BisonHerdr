@@ -1,6 +1,6 @@
-# Herdr Tablet
+# Bison (Herdr Tablet)
 
-**Herdr Tablet** is a high-performance, native Android tablet and foldable terminal workspace and multi-machine coding-agent control center powered by [Herdr](https://github.com/herdrdev/herdr).
+**Bison** (`com.toxicbakery.app.bison`) is a high-performance, native Android tablet and foldable terminal workspace and multi-machine coding-agent control center powered by [Herdr](https://github.com/herdrdev/herdr).
 
 It is designed around two core principles:
 
@@ -12,15 +12,15 @@ It is designed around two core principles:
 ## Core Goals
 
 ### 1. Resilience: Survive Backgrounding & Roaming
-Traditional SSH clients on Android drop connections when you switch apps to inspect a browser preview, lock the tablet, or walk from Wi-Fi to 5G. Herdr Tablet eliminates connection fragility through a layered lifecycle and transport architecture:
+Traditional SSH clients on Android drop connections when you switch apps to inspect a browser preview, lock the tablet, or walk from Wi-Fi to 5G. Bison eliminates connection fragility through a layered lifecycle and transport architecture:
 
-- **Android Foreground Service (`connectedDevice` / `specialUse`)**: Holds active transport sockets open inside a persistent `HerdrSessionService` with live notification actions (*Approve Pending Agent*, *Disconnect All*) while you switch to browsers, docs, or other apps.
+- **Android Foreground Service (`connectedDevice` / `specialUse`)**: Holds active transport sockets open inside a persistent `BisonSessionService` with live notification actions (*Approve Pending Agent*, *Disconnect All*) while you switch to browsers, docs, or other apps.
 - **Mosh UDP SSP Backbone + Zero-Traffic Background Suspend**: Uses Mosh's State Synchronization Protocol (`AES-128-OCB` over UDP) so packets stop flowing automatically when backgrounded, resuming and synchronizing to the latest terminal frame in a single UDP round-trip on wake.
 - **Zero-Bandwidth Daemon Surface Lease**: When `ON_STOP` fires on the Herdr control channel, the client sends `client_shell.surface.set({ active: false })` to pause high-frequency terminal surface deltas while retaining the logical session lease, then restores the viewport and requests a fresh keyframe via `client_shell.surface.set({ active: true })` on `ON_START`.
 - **Sub-100ms Network Roaming (`ConnectivityManager.NetworkCallback`)**: Detects Wi-Fi ↔ cellular handoffs immediately, rebinds UDP sockets and triggers an SSP heartbeat to roam IP addresses seamlessly while re-establishing the Herdr control sideband in the background.
 
 ### 2. Primary Input: Touch-First Terminal Experience
-On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. Herdr Tablet replaces tiny text-mode chrome with native, ergonomic touch controls:
+On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. Bison replaces tiny text-mode chrome with native, ergonomic touch controls:
 
 - **Zen Canvas (96%+ Terminal Viewport)**: Suppresses Herdr's inner ASCII sidebar and top tab bar so your panes occupy the entire screen. A single compact 36dp top bar shows workspace tabs, agent attention badges, and your live connection/RTT pill.
 - **Split-Thumb Ergonomic Floating Clusters**: Docked at the bottom-left (`Esc`, `Ctrl`, `Alt`, `Tab`, `/`, `-`, `|`, `~`) and bottom-right (`↑`, `↓`, `←`, `→`, `Enter`, `PgUp`/`PgDn`, `Prompt`) corners—right under your thumbs when holding a tablet in landscape, leaving the center viewport unobstructed.
