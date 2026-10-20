@@ -1,0 +1,57 @@
+package com.toxicbakery.app.bison.di
+
+import com.toxicbakery.app.bison.common.screen.delegate.AgentActionDelegate
+import com.toxicbakery.app.bison.common.screen.delegate.AgentActionDelegateImpl
+import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
+import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegateImpl
+import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
+import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewModel
+import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
+import org.kodein.di.DI
+import org.kodein.di.bindFactory
+import org.kodein.di.bindSingleton
+import org.kodein.di.instance
+
+val viewModelModule = DI.Module("viewModelModule") {
+    bindFactory<String, WorkspaceTerminalViewModel> { machineId: String ->
+        WorkspaceTerminalViewModel(
+            machineId = machineId,
+            machineStore = instance(),
+            sshStateManager = instance(),
+            paneSurfaceBus = instance(),
+            machineViewModelDelegate = instance(),
+            agentActionDelegate = instance(),
+            appSettingsStore = instance(),
+        )
+    }
+    bindFactory<String, ConfigureMachineViewModel> { machineId: String ->
+        ConfigureMachineViewModel(
+            machineId = machineId,
+            machineStore = instance(),
+            machineViewModelDelegate = instance(),
+        )
+    }
+    bindFactory<String, ConnectingMachineViewModel> { machineId: String ->
+        ConnectingMachineViewModel(
+            machineId = machineId,
+            sshStateManager = instance(),
+            machineStore = instance(),
+            machineViewModelDelegate = instance(),
+            sshDebugLog = instance(),
+        )
+    }
+    bindSingleton<MachineViewModelDelegate> {
+        MachineViewModelDelegateImpl(
+            machineStore = instance(),
+            sshRequestManager = instance(),
+            endpointSnapshotBus = instance(),
+        )
+    }
+    bindSingleton<AgentActionDelegate> {
+        AgentActionDelegateImpl(
+            sshRequestManager = instance(),
+            semanticNotificationBus = instance(),
+            endpointSnapshotBus = instance(),
+        )
+    }
+}

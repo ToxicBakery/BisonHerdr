@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Fallback for API 24 and 25, which do not read mipmap-anydpi-v26. The foreground mipmap already
+  carries the padding an adaptive icon needs, so it sits on the field as it does above.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+  <item android:drawable="@color/demo_launcher_background"/>
+  <item android:drawable="@mipmap/ic_launcher_foreground"/>
+</layer-list>
