@@ -1,0 +1,31 @@
+[package]
+name = "herdr-mobile-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Hybrid Rust JNI Core for BisonHerdr (Mosh UDP SSP + russh + herdr-protocol + ghostty-vt)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aes.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bincode.workspace = true
+flate2.workspace = true
+ghostty-vt.workspace = true
+herdr-protocol.workspace = true
+jni.workspace = true
+prost.workspace = true
+russh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
