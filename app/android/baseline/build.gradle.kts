@@ -1,4 +1,5 @@
 import com.toxicbakery.app.bison.composite.util.configureOptIns
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.androidBaseline)
@@ -10,8 +11,8 @@ android {
     compileSdk = libs.versions.android.compileSdk.get().toInt()
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
     defaultConfig {
@@ -19,11 +20,14 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunnerArguments["androidx.benchmark.suppressErrors"] = "EMULATOR,LOW-BATTERY"
     }
 
-    buildTypes {
-        create("benchmark") {
-            matchingFallbacks += listOf("release")
+    testOptions.managedDevices.localDevices {
+        create("pixelTabletApi35") {
+            device = "Pixel Tablet"
+            sdkVersion = 35
+            systemImageSource = "aosp-atd"
         }
     }
 
@@ -32,10 +36,14 @@ android {
 
 kotlin {
     configureOptIns(serialization = false)
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_11
+    }
 }
 
 baselineProfile {
     useConnectedDevices = true
+    enableEmulatorDisplay = false
 }
 
 dependencies {
