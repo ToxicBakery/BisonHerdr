@@ -27,8 +27,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -91,6 +93,7 @@ import kotlin.math.roundToInt
 /**
  * Coordinates of a long-press text selection inside a terminal pane.
  */
+@Immutable
 data class TerminalSelectionRange(
     val paneId: String,
     val startCol: Int,
@@ -216,7 +219,6 @@ fun TerminalSurfaceCanvas(
             effectiveCellHeight,
             cellWidthPx,
             cellHeightPx,
-            palette.text,
         ) {
             val widthScale = (effectiveCellWidth * 0.98f) / cellWidthPx.toFloat()
             val heightScale = (effectiveCellHeight * 1.18f) / cellHeightPx.toFloat()
@@ -225,10 +227,44 @@ fun TerminalSurfaceCanvas(
             TextStyle(
                 fontFamily = FontFamily.Monospace,
                 fontSize = scaledSp.sp,
-                color = palette.text,
+                color = Color.Unspecified,
                 lineHeight = scaledSp.sp,
+                textDecoration = TextDecoration.None,
             )
         }
+        val normalStyle = remember(renderTextStyle) {
+            renderTextStyle.copy(
+                color = Color.Unspecified,
+                fontWeight = FontWeight.Normal,
+                fontStyle = FontStyle.Normal,
+                textDecoration = TextDecoration.None,
+            )
+        }
+        val boldStyle = remember(renderTextStyle) {
+            renderTextStyle.copy(
+                color = Color.Unspecified,
+                fontWeight = FontWeight.Bold,
+                fontStyle = FontStyle.Normal,
+                textDecoration = TextDecoration.None,
+            )
+        }
+        val italicStyle = remember(renderTextStyle) {
+            renderTextStyle.copy(
+                color = Color.Unspecified,
+                fontWeight = FontWeight.Normal,
+                fontStyle = FontStyle.Italic,
+                textDecoration = TextDecoration.None,
+            )
+        }
+        val boldItalicStyle = remember(renderTextStyle) {
+            renderTextStyle.copy(
+                color = Color.Unspecified,
+                fontWeight = FontWeight.Bold,
+                fontStyle = FontStyle.Italic,
+                textDecoration = TextDecoration.None,
+            )
+        }
+        val scratchPath = remember { Path() }
 
         val currentSurfaceFrame by rememberUpdatedState(surfaceFrame)
         val currentEffectiveCellWidth by rememberUpdatedState(effectiveCellWidth)
@@ -409,15 +445,10 @@ fun TerminalSurfaceCanvas(
                             val pressedCount = event.changes.count { it.pressed }
                             if (pressedCount >= 2) {
                                 isPinching = true
+                                showZoomIndicator = true
                                 val zoomChange = event.calculateZoom()
                                 if (abs(zoomChange - 1f) > 0.002f) {
-                                    val updated = (liveFontSizeSp * zoomChange).coerceIn(7f, 28f)
-                                    liveFontSizeSp = updated
-                                    zoomIndicatorPulse++
-                                    if (abs(updated - lastDispatchedFontSizeSp) >= 0.15f) {
-                                        lastDispatchedFontSizeSp = updated
-                                        currentOnFontSizeChange(updated)
-                                    }
+                                    liveFontSizeSp = (liveFontSizeSp * zoomChange).coerceIn(7f, 28f)
                                 }
                                 event.changes.forEach { it.consume() }
                             } else if (!isPinching && pressedCount == 1) {
@@ -444,9 +475,12 @@ fun TerminalSurfaceCanvas(
                             }
                         } while (event.changes.any { it.pressed })
 
-                        if (isPinching && abs(liveFontSizeSp - lastDispatchedFontSizeSp) > 0.01f) {
-                            lastDispatchedFontSizeSp = liveFontSizeSp
-                            currentOnFontSizeChange(liveFontSizeSp)
+                        if (isPinching) {
+                            zoomIndicatorPulse++
+                            if (abs(liveFontSizeSp - lastDispatchedFontSizeSp) > 0.01f) {
+                                lastDispatchedFontSizeSp = liveFontSizeSp
+                                currentOnFontSizeChange(liveFontSizeSp)
+                            }
                         }
                     }
                 }
@@ -458,7 +492,11 @@ fun TerminalSurfaceCanvas(
                     frame = surfaceFrame.frame,
                     cellWidth = effectiveCellWidth,
                     cellHeight = effectiveCellHeight,
-                    baseTextStyle = renderTextStyle,
+                    normalStyle = normalStyle,
+                    boldStyle = boldStyle,
+                    italicStyle = italicStyle,
+                    boldItalicStyle = boldItalicStyle,
+                    scratchPath = scratchPath,
                     textMeasurer = textMeasurer,
                     palette = palette,
                     predictiveEchoUnderlines = predictiveEchoUnderlines,
@@ -522,88 +560,90 @@ fun TerminalSurfaceCanvas(
 
         // Interactive 24.dp BSP Split Handles
         surfaceFrame?.splits?.forEach { split ->
-            val touchTargetPx = with(density) { 24.dp.toPx() }
-            val hitX = split.hitRect.x.toInt() * effectiveCellWidth
-            val hitY = split.hitRect.y.toInt() * effectiveCellHeight
-            val hitW = max(split.hitRect.width.toInt() * effectiveCellWidth, effectiveCellWidth)
-            val hitH = max(split.hitRect.height.toInt() * effectiveCellHeight, effectiveCellHeight)
+            key(split.id) {
+                val touchTargetPx = with(density) { 24.dp.toPx() }
+                val hitX = split.hitRect.x.toInt() * effectiveCellWidth
+                val hitY = split.hitRect.y.toInt() * effectiveCellHeight
+                val hitW = max(split.hitRect.width.toInt() * effectiveCellWidth, effectiveCellWidth)
+                val hitH = max(split.hitRect.height.toInt() * effectiveCellHeight, effectiveCellHeight)
 
-            val boxLeftPx = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
-                hitX + (hitW / 2f) - (touchTargetPx / 2f)
-            } else {
-                hitX
-            }
-            val boxTopPx = if (split.direction == PaneSurfaceSplitDirection.Horizontal) {
-                hitY + (hitH / 2f) - (touchTargetPx / 2f)
-            } else {
-                hitY
-            }
-            val boxWidthDp = with(density) {
-                if (split.direction == PaneSurfaceSplitDirection.Vertical) 24.dp else hitW.toDp()
-            }
-            val boxHeightDp = with(density) {
-                if (split.direction == PaneSurfaceSplitDirection.Horizontal) 24.dp else hitH.toDp()
-            }
+                val boxLeftPx = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
+                    hitX + (hitW / 2f) - (touchTargetPx / 2f)
+                } else {
+                    hitX
+                }
+                val boxTopPx = if (split.direction == PaneSurfaceSplitDirection.Horizontal) {
+                    hitY + (hitH / 2f) - (touchTargetPx / 2f)
+                } else {
+                    hitY
+                }
+                val boxWidthDp = with(density) {
+                    if (split.direction == PaneSurfaceSplitDirection.Vertical) 24.dp else hitW.toDp()
+                }
+                val boxHeightDp = with(density) {
+                    if (split.direction == PaneSurfaceSplitDirection.Horizontal) 24.dp else hitH.toDp()
+                }
 
-            Box(
-                modifier = Modifier
-                    .offset { IntOffset(boxLeftPx.roundToInt(), boxTopPx.roundToInt()) }
-                    .size(width = boxWidthDp, height = boxHeightDp)
-                    .testTag("splitHandle_${split.id}")
-                    .pointerInput(split, effectiveCellWidth, effectiveCellHeight) {
-                        detectTapGestures(
-                            onDoubleTap = {
-                                onSplitRatioChanged(split.path, 0.5f)
-                            }
-                        )
-                    }
-                    .pointerInput(split, effectiveCellWidth, effectiveCellHeight) {
-                        var currentRatio = split.ratio
-                        detectDragGestures(
-                            onDragStart = {
-                                currentRatio = split.ratio
-                                activeDragSplit = split
-                                activeDragRatio = currentRatio
-                            },
-                            onDrag = { change, dragAmount ->
-                                change.consume()
-                                val workspaceSpanPx = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
-                                    max(1f, split.workspaceRect.width.toInt() * effectiveCellWidth)
-                                } else {
-                                    max(1f, split.workspaceRect.height.toInt() * effectiveCellHeight)
-                                }
-                                val deltaRatio = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
-                                    dragAmount.x / workspaceSpanPx
-                                } else {
-                                    dragAmount.y / workspaceSpanPx
-                                }
-                                currentRatio = (currentRatio + deltaRatio).coerceIn(0.10f, 0.90f)
-                                activeDragRatio = snapSplitRatio(currentRatio)
-                            },
-                            onDragEnd = {
-                                val finalRatio = snapSplitRatio(currentRatio)
-                                activeDragSplit = null
-                                onSplitRatioChanged(split.path, finalRatio)
-                            },
-                            onDragCancel = {
-                                activeDragSplit = null
-                            },
-                        )
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                // Pill grabber visual cue on the divider
                 Box(
                     modifier = Modifier
-                        .size(
-                            width = if (split.direction == PaneSurfaceSplitDirection.Vertical) 4.dp else 32.dp,
-                            height = if (split.direction == PaneSurfaceSplitDirection.Vertical) 32.dp else 4.dp,
-                        )
-                        .background(
-                            color = palette.accent.copy(alpha = 0.55f),
-                            shape = RoundedCornerShape(2.dp),
-                        )
-                )
+                        .offset { IntOffset(boxLeftPx.roundToInt(), boxTopPx.roundToInt()) }
+                        .size(width = boxWidthDp, height = boxHeightDp)
+                        .testTag("splitHandle_${split.id}")
+                        .pointerInput(split, effectiveCellWidth, effectiveCellHeight) {
+                            detectTapGestures(
+                                onDoubleTap = {
+                                    onSplitRatioChanged(split.path, 0.5f)
+                                }
+                            )
+                        }
+                        .pointerInput(split, effectiveCellWidth, effectiveCellHeight) {
+                            var currentRatio = split.ratio
+                            detectDragGestures(
+                                onDragStart = {
+                                    currentRatio = split.ratio
+                                    activeDragSplit = split
+                                    activeDragRatio = currentRatio
+                                },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    val workspaceSpanPx = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
+                                        max(1f, split.workspaceRect.width.toInt() * effectiveCellWidth)
+                                    } else {
+                                        max(1f, split.workspaceRect.height.toInt() * effectiveCellHeight)
+                                    }
+                                    val deltaRatio = if (split.direction == PaneSurfaceSplitDirection.Vertical) {
+                                        dragAmount.x / workspaceSpanPx
+                                    } else {
+                                        dragAmount.y / workspaceSpanPx
+                                    }
+                                    currentRatio = (currentRatio + deltaRatio).coerceIn(0.10f, 0.90f)
+                                    activeDragRatio = snapSplitRatio(currentRatio)
+                                },
+                                onDragEnd = {
+                                    val finalRatio = snapSplitRatio(currentRatio)
+                                    activeDragSplit = null
+                                    onSplitRatioChanged(split.path, finalRatio)
+                                },
+                                onDragCancel = {
+                                    activeDragSplit = null
+                                },
+                            )
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // Pill grabber visual cue on the divider
+                    Box(
+                        modifier = Modifier
+                            .size(
+                                width = if (split.direction == PaneSurfaceSplitDirection.Vertical) 4.dp else 32.dp,
+                                height = if (split.direction == PaneSurfaceSplitDirection.Vertical) 32.dp else 4.dp,
+                            )
+                            .background(
+                                color = palette.accent.copy(alpha = 0.55f),
+                                shape = RoundedCornerShape(2.dp),
+                            )
+                    )
+                }
             }
         }
 
@@ -747,7 +787,11 @@ private fun DrawScope.drawFrameCells(
     frame: FrameData,
     cellWidth: Float,
     cellHeight: Float,
-    baseTextStyle: TextStyle,
+    normalStyle: TextStyle,
+    boldStyle: TextStyle,
+    italicStyle: TextStyle,
+    boldItalicStyle: TextStyle,
+    scratchPath: Path,
     textMeasurer: TextMeasurer,
     palette: BisonThemePalette,
     predictiveEchoUnderlines: Boolean,
@@ -821,6 +865,7 @@ private fun DrawScope.drawFrameCells(
                     endX = xPx + runWidthPx,
                     baselineY = yPx + cellHeight - 2.dp.toPx(),
                     color = palette.red,
+                    scratchPath = scratchPath,
                 )
             }
 
@@ -860,18 +905,15 @@ private fun DrawScope.drawFrameCells(
                 }
             }
 
-            val decorations = buildList {
-                if (cell.isUnderline) add(TextDecoration.None)
+            val glyphStyle = when {
+                cell.isBold && cell.isItalic -> boldItalicStyle
+                cell.isBold -> boldStyle
+                cell.isItalic -> italicStyle
+                else -> normalStyle
             }
-            val style = baseTextStyle.copy(
-                color = fgColor,
-                fontWeight = if (cell.isBold) FontWeight.Bold else FontWeight.Normal,
-                fontStyle = if (cell.isItalic) FontStyle.Italic else FontStyle.Normal,
-                textDecoration = if (decorations.isEmpty()) TextDecoration.None else TextDecoration.combine(decorations),
-            )
             val layoutResult = textMeasurer.measure(
                 text = symbol,
-                style = style,
+                style = glyphStyle,
                 softWrap = false,
                 maxLines = 1,
             )
@@ -879,10 +921,16 @@ private fun DrawScope.drawFrameCells(
             val offsetY = yPx + (cellHeight - layoutResult.size.height) * 0.5f
             drawText(
                 textLayoutResult = layoutResult,
+                color = fgColor,
                 topLeft = Offset(offsetX, offsetY),
             )
         }
     }
+}
+
+private fun isHeavyBoxChar(code: Int): Boolean = when (code) {
+    0x2501, 0x2503, 0x250F, 0x2513, 0x2517, 0x251B, 0x2523, 0x252B, 0x2533, 0x253B, 0x254B -> true
+    else -> false
 }
 
 private fun DrawScope.drawBoxOrBlockElement(
@@ -898,7 +946,7 @@ private fun DrawScope.drawBoxOrBlockElement(
     val midY = cellY + cellHeight * 0.5f
     val rightX = cellX + cellWidth + 0.5f
     val bottomY = cellY + cellHeight + 0.5f
-    val stroke = if (isBold || code in listOf(0x2501, 0x2503, 0x250F, 0x2513, 0x2517, 0x251B, 0x2523, 0x252B, 0x2533, 0x253B, 0x254B)) {
+    val stroke = if (isBold || isHeavyBoxChar(code)) {
         max(1.8f, cellHeight * 0.12f)
     } else {
         max(1.1f, cellHeight * 0.07f)
@@ -1017,23 +1065,23 @@ private fun DrawScope.drawCurlyUnderline(
     endX: Float,
     baselineY: Float,
     color: Color,
+    scratchPath: Path,
 ) {
     val waveLength = 6.dp.toPx().coerceAtLeast(4f)
     val amplitude = 1.5.dp.toPx()
-    val path = Path().apply {
-        moveTo(startX, baselineY)
-        var x = startX
-        var up = true
-        while (x < endX) {
-            val nextX = min(x + waveLength / 2f, endX)
-            val midX = (x + nextX) / 2f
-            val controlY = if (up) baselineY - amplitude else baselineY + amplitude
-            quadraticTo(midX, controlY, nextX, baselineY)
-            x = nextX
-            up = !up
-        }
+    scratchPath.rewind()
+    scratchPath.moveTo(startX, baselineY)
+    var x = startX
+    var up = true
+    while (x < endX) {
+        val nextX = min(x + waveLength / 2f, endX)
+        val midX = (x + nextX) / 2f
+        val controlY = if (up) baselineY - amplitude else baselineY + amplitude
+        scratchPath.quadraticTo(midX, controlY, nextX, baselineY)
+        x = nextX
+        up = !up
     }
-    drawPath(path = path, color = color, style = Stroke(width = 1.2.dp.toPx()))
+    drawPath(path = scratchPath, color = color, style = Stroke(width = 1.2.dp.toPx()))
 }
 
 private fun DrawScope.drawPaneChrome(

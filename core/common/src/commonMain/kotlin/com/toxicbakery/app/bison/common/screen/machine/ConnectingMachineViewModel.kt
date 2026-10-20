@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.common.screen.machine
 
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.viewModelScope
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.model.ActiveBackbone
@@ -34,6 +35,7 @@ class ConnectingMachineViewModel(
         Failed,
     }
 
+    @Immutable
     data class BootstrapStep(
         val stage: ConnectionProgress,
         val title: String,
@@ -41,6 +43,7 @@ class ConnectingMachineViewModel(
         val status: StepStatus,
     )
 
+    @Immutable
     data class State(
         val machineId: String,
         val hasDispatchedConnect: Boolean = false,

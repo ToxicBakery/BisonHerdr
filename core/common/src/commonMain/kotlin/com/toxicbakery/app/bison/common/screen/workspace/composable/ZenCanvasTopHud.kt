@@ -32,6 +32,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -108,19 +109,33 @@ fun ZenCanvasTopHud(
     var showHostWorkspaceSheet by remember { mutableStateOf(false) }
     var showSplitMenu by remember { mutableStateOf(false) }
 
-    val activeWorkspace = workspaces.firstOrNull { it.workspaceId == focusedWorkspaceId }
-        ?: workspaces.firstOrNull { it.focused }
-        ?: workspaces.firstOrNull()
-    val workspaceTabs = tabs.filter { activeWorkspace == null || it.workspaceId == activeWorkspace.workspaceId }
-        .ifEmpty { tabs }
-    val activeTab = workspaceTabs.firstOrNull { it.tabId == focusedTabId }
-        ?: workspaceTabs.firstOrNull { it.focused }
-        ?: workspaceTabs.firstOrNull()
-    val activeTabPanes = panes.filter { activeTab == null || it.tabId == activeTab.tabId }
+    val activeWorkspace = remember(workspaces, focusedWorkspaceId) {
+        workspaces.firstOrNull { it.workspaceId == focusedWorkspaceId }
+            ?: workspaces.firstOrNull { it.focused }
+            ?: workspaces.firstOrNull()
+    }
+    val workspaceTabs = remember(tabs, activeWorkspace) {
+        tabs.filter { activeWorkspace == null || it.workspaceId == activeWorkspace.workspaceId }
+            .ifEmpty { tabs }
+    }
+    val activeTab = remember(workspaceTabs, focusedTabId) {
+        workspaceTabs.firstOrNull { it.tabId == focusedTabId }
+            ?: workspaceTabs.firstOrNull { it.focused }
+            ?: workspaceTabs.firstOrNull()
+    }
+    val activeTabPanes = remember(panes, activeTab) {
+        panes.filter { activeTab == null || it.tabId == activeTab.tabId }
+    }
 
-    val blockedCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Blocked }
-    val workingCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Working }
-    val doneCount = federatedAgents.count { it.agent.agentStatus == AgentStatus.Done }
+    val blockedCount = remember(federatedAgents) {
+        federatedAgents.count { it.agent.agentStatus == AgentStatus.Blocked }
+    }
+    val workingCount = remember(federatedAgents) {
+        federatedAgents.count { it.agent.agentStatus == AgentStatus.Working }
+    }
+    val doneCount = remember(federatedAgents) {
+        federatedAgents.count { it.agent.agentStatus == AgentStatus.Done }
+    }
 
     Column(
         modifier = modifier
@@ -212,50 +227,52 @@ fun ZenCanvasTopHud(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 workspaces.forEachIndexed { idx, ws ->
-                    val isFocused = ws.workspaceId == (activeWorkspace?.workspaceId ?: focusedWorkspaceId)
-                    val wsStatusColor = when (ws.agentStatus) {
-                        AgentStatus.Blocked -> palette.red
-                        AgentStatus.Working -> palette.accent
-                        AgentStatus.Done -> palette.green
-                        else -> null
-                    }
-                    Surface(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable { onFocusWorkspace(ws.workspaceId) }
-                            .testTag("hudWorkspacePill_${ws.workspaceId}"),
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (isFocused) palette.accent else palette.terminalBg,
-                    ) {
-                        Row(
+                    key(ws.workspaceId) {
+                        val isFocused = ws.workspaceId == (activeWorkspace?.workspaceId ?: focusedWorkspaceId)
+                        val wsStatusColor = when (ws.agentStatus) {
+                            AgentStatus.Blocked -> palette.red
+                            AgentStatus.Working -> palette.accent
+                            AgentStatus.Done -> palette.green
+                            else -> null
+                        }
+                        Surface(
                             modifier = Modifier
-                                .border(
-                                    width = 1.dp,
-                                    color = if (isFocused) palette.accent else (wsStatusColor ?: palette.text.copy(alpha = 0.16f)),
-                                    shape = RoundedCornerShape(10.dp),
-                                )
-                                .padding(horizontal = 9.dp, vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onFocusWorkspace(ws.workspaceId) }
+                                .testTag("hudWorkspacePill_${ws.workspaceId}"),
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isFocused) palette.accent else palette.terminalBg,
                         ) {
-                            if (wsStatusColor != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .background(
-                                            if (isFocused) palette.terminalBg else wsStatusColor,
-                                            CircleShape,
-                                        )
+                            Row(
+                                modifier = Modifier
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (isFocused) palette.accent else (wsStatusColor ?: palette.text.copy(alpha = 0.16f)),
+                                        shape = RoundedCornerShape(10.dp),
+                                    )
+                                    .padding(horizontal = 9.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                if (wsStatusColor != null) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .background(
+                                                if (isFocused) palette.terminalBg else wsStatusColor,
+                                                CircleShape,
+                                            )
+                                    )
+                                }
+                                Text(
+                                    text = "${idx + 1}: ${ws.label}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (isFocused) palette.terminalBg else palette.text,
+                                    fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                            Text(
-                                text = "${idx + 1}: ${ws.label}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = if (isFocused) palette.terminalBg else palette.text,
-                                fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
                         }
                     }
                 }
@@ -436,40 +453,42 @@ fun ZenCanvasTopHud(
                     color = palette.text.copy(alpha = 0.55f),
                 )
                 workspaceTabs.forEach { tab ->
-                    val isTabFocused = tab.tabId == (activeTab?.tabId ?: focusedTabId)
-                    Surface(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { onFocusTab(tab.tabId) }
-                            .testTag("hudTabPill_${tab.tabId}"),
-                        shape = RoundedCornerShape(8.dp),
-                        color = if (isTabFocused) palette.accent.copy(alpha = 0.22f) else palette.panelBg,
-                    ) {
-                        Row(
+                    key(tab.tabId) {
+                        val isTabFocused = tab.tabId == (activeTab?.tabId ?: focusedTabId)
+                        Surface(
                             modifier = Modifier
-                                .border(
-                                    width = 1.dp,
-                                    color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.14f),
-                                    shape = RoundedCornerShape(8.dp),
-                                )
-                                .padding(horizontal = 8.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onFocusTab(tab.tabId) }
+                                .testTag("hudTabPill_${tab.tabId}"),
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (isTabFocused) palette.accent.copy(alpha = 0.22f) else palette.panelBg,
                         ) {
-                            Text(
-                                text = "${tab.number}: ${tab.label}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.85f),
-                                fontWeight = if (isTabFocused) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1,
-                            )
-                            if (workspaceTabs.size > 1 && isTabFocused) {
+                            Row(
+                                modifier = Modifier
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.14f),
+                                        shape = RoundedCornerShape(8.dp),
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
                                 Text(
-                                    text = "✕",
+                                    text = "${tab.number}: ${tab.label}",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = palette.red,
-                                    modifier = Modifier.clickable { onCloseTab(tab.tabId) },
+                                    color = if (isTabFocused) palette.accent else palette.text.copy(alpha = 0.85f),
+                                    fontWeight = if (isTabFocused) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
                                 )
+                                if (workspaceTabs.size > 1 && isTabFocused) {
+                                    Text(
+                                        text = "✕",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = palette.red,
+                                        modifier = Modifier.clickable { onCloseTab(tab.tabId) },
+                                    )
+                                }
                             }
                         }
                     }
@@ -508,23 +527,25 @@ fun ZenCanvasTopHud(
                         color = palette.text.copy(alpha = 0.55f),
                     )
                     activeTabPanes.forEachIndexed { idx, pane ->
-                        val isPaneFocused = pane.paneId == focusedPaneId || pane.focused
-                        Surface(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { onFocusPane(pane.paneId) }
-                                .testTag("hudPanePill_${pane.paneId}"),
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (isPaneFocused) palette.accent else palette.panelBg,
-                        ) {
-                            Text(
-                                text = "#${idx + 1} ${pane.label.ifBlank { pane.paneId }}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isPaneFocused) palette.terminalBg else palette.text,
-                                fontWeight = if (isPaneFocused) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
-                            )
+                        key(pane.paneId) {
+                            val isPaneFocused = pane.paneId == focusedPaneId || pane.focused
+                            Surface(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onFocusPane(pane.paneId) }
+                                    .testTag("hudPanePill_${pane.paneId}"),
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isPaneFocused) palette.accent else palette.panelBg,
+                            ) {
+                                Text(
+                                    text = "#${idx + 1} ${pane.label.ifBlank { pane.paneId }}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isPaneFocused) palette.terminalBg else palette.text,
+                                    fontWeight = if (isPaneFocused) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                )
+                            }
                         }
                     }
                 }
