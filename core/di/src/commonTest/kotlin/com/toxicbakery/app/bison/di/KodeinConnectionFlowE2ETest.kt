@@ -189,6 +189,21 @@ class KodeinConnectionFlowE2ETest {
 
             // 2. Instantiate ConnectingMachineViewModel and observe the 4-stage progression -> Connected
             val connectingVm = connectingFactory(machineId)
+            val duplicateConnectRequests = mutableListOf<SshRequest.Connect>()
+            val duplicateCheckJob = launch(dispatcher) {
+                sshRequestManager.bus.collect { req ->
+                    if (req is SshRequest.Connect) {
+                        duplicateConnectRequests.add(req)
+                    }
+                }
+            }
+            // StartConnectIfNeeded immediately after SaveAndConnect should consume the pending connect
+            // without dispatching a duplicate SshRequest.Connect.
+            connectingVm.onEvent(ConnectingMachineViewModel.Event.StartConnectIfNeeded)
+            duplicateCheckJob.cancel()
+            assertTrue(duplicateConnectRequests.isEmpty())
+            assertTrue(connectingVm.state.value.hasDispatchedConnect)
+
             val observedProgress = mutableListOf<ConnectionProgress>()
             val observedActions = mutableListOf<ConnectingMachineViewModel.Action>()
 

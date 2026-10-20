@@ -73,6 +73,43 @@ class SshPlatformTest {
             challenge = "challenge-payload".toByteArray(),
         )
         assertTrue(ecdsaSig.isNotEmpty())
+
+        // Verify JSch Android crypto providers (Ed25519 signature, X25519 key agreement, and Keystore Identity)
+        val xdhClient = AndroidJschXdh().apply { init("X25519", 32) }
+        val xdhServer = AndroidJschXdh().apply { init("X25519", 32) }
+        assertTrue(xdhClient.validate(xdhServer.q))
+        assertTrue(xdhServer.validate(xdhClient.q))
+        val clientSecret = xdhClient.getSecret(xdhServer.q)
+        val serverSecret = xdhServer.getSecret(xdhClient.q)
+        assertTrue(clientSecret.contentEquals(serverSecret))
+
+        val rawSeed = ByteArray(32) { (it + 1).toByte() }
+        val jschEdSigner = AndroidJschSignatureEd25519().apply {
+            init()
+            setPrvKey(rawSeed)
+            update("ssh-kex-exchange-hash".toByteArray())
+        }
+        val rawEdSig = jschEdSigner.sign()
+        assertEquals(64, rawEdSig.size)
+
+        val edIdentity = AndroidKeystoreJschIdentity(
+            keystoreKeyManager = manager,
+            keyAlias = "test_ed25519",
+            algorithm = KeyAlgorithm.Ed25519,
+        )
+        assertEquals("ssh-ed25519", edIdentity.algName)
+        assertFalse(edIdentity.isEncrypted)
+        val edChallenge = "ssh-userauth-session-challenge".toByteArray()
+        val wrappedEdSig = assertNotNull(edIdentity.getSignature(edChallenge, "ssh-ed25519"))
+        // Extract the 32-byte raw Ed25519 public key at the end of the SSH public key wire blob
+        val pubBlob = edIdentity.publicKeyBlob
+        val rawPub32 = pubBlob.copyOfRange(pubBlob.size - 32, pubBlob.size)
+        val jschEdVerifier = AndroidJschSignatureEd25519().apply {
+            init()
+            setPubKey(rawPub32)
+            update(edChallenge)
+        }
+        assertTrue(jschEdVerifier.verify(wrappedEdSig))
     }
 
     @Test

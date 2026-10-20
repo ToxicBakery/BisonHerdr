@@ -8,7 +8,9 @@ import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.store.MachineStore
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -16,6 +18,8 @@ interface MachineViewModelDelegate {
     val knownMachines: StateFlow<List<HostMachine>>
     val snapshots: StateFlow<Map<String, ClientShellSnapshot>>
 
+    fun markPendingConnect(machineId: String) {}
+    fun consumePendingConnect(machineId: String): Boolean = false
     suspend fun connect(machineId: String)
     suspend fun disconnect(machineId: String)
     suspend fun setSurfaceLease(machineId: String, active: Boolean)
@@ -74,12 +78,27 @@ class MachineViewModelDelegateImpl(
 
     override val knownMachines: StateFlow<List<HostMachine>> = machineStore.knownMachines
     override val snapshots: StateFlow<Map<String, ClientShellSnapshot>> = endpointSnapshotBus.snapshots
+    private val pendingConnectIds = MutableStateFlow<Set<String>>(emptySet())
+
+    override fun markPendingConnect(machineId: String) {
+        pendingConnectIds.update { it + machineId }
+    }
+
+    override fun consumePendingConnect(machineId: String): Boolean {
+        var wasPresent = false
+        pendingConnectIds.update { current ->
+            wasPresent = machineId in current
+            if (wasPresent) current - machineId else current
+        }
+        return wasPresent
+    }
 
     override suspend fun connect(machineId: String) {
         sshRequestManager.emit(SshRequest.Connect(machineId))
     }
 
     override suspend fun disconnect(machineId: String) {
+        pendingConnectIds.update { it - machineId }
         sshRequestManager.emit(SshRequest.Disconnect(machineId))
     }
 

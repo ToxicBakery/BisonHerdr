@@ -87,9 +87,11 @@ class AndroidKeystoreKeyManager {
         keyAlias: String,
         algorithm: KeyAlgorithm,
         challenge: ByteArray,
+        sshAlgorithmOverride: String? = null,
     ): ByteArray {
         val privateKey = loadPrivateKey(keyAlias)
             ?: generateKeyPair(keyAlias, algorithm, requireBiometric = false).private
+        val resolvedSshAlg = sshAlgorithmOverride?.takeIf { it.isNotBlank() } ?: algorithm.sshKeyType
         val rawSignature = when (algorithm) {
             KeyAlgorithm.Ed25519 -> {
                 val sig = Signature.getInstance("Ed25519")
@@ -99,7 +101,12 @@ class AndroidKeystoreKeyManager {
             }
 
             KeyAlgorithm.Rsa4096 -> {
-                val sig = Signature.getInstance("SHA512withRSA")
+                val jcaDigestAlg = when (resolvedSshAlg) {
+                    "rsa-sha2-256", "ssh-rsa-sha256@ssh.com" -> "SHA256withRSA"
+                    "ssh-rsa" -> "SHA1withRSA"
+                    else -> "SHA512withRSA"
+                }
+                val sig = Signature.getInstance(jcaDigestAlg)
                 sig.initSign(privateKey)
                 sig.update(challenge)
                 sig.sign()
@@ -112,7 +119,7 @@ class AndroidKeystoreKeyManager {
                 derEcdsaToSshMpintPair(sig.sign())
             }
         }
-        return encodeSshSignatureBlob(algorithm.sshKeyType, rawSignature)
+        return encodeSshSignatureBlob(resolvedSshAlg, rawSignature)
     }
 
     /**

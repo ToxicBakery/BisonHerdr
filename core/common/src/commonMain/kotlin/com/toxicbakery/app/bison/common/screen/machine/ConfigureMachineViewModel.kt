@@ -189,6 +189,7 @@ class ConfigureMachineViewModel(
         viewModelScope.launch {
             upsertMachine(machine)
             if (connectImmediately) {
+                markPendingConnect(machine.id)
                 connect(machine.id)
             }
             sendAction(Action.Saved(machineId = machine.id, connectImmediately = connectImmediately))

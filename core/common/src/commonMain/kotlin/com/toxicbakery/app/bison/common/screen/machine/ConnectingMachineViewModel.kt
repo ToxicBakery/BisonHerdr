@@ -115,6 +115,19 @@ class ConnectingMachineViewModel(
                     emitAction(Action.Connected(machineId))
                     return
                 }
+                if (consumePendingConnect(machineId)) {
+                    updateState { it.copy(hasDispatchedConnect = true) }
+                    return
+                }
+                val currentProgress = sshStateManager.connectionProgress.value[machineId]
+                val isAlreadyConnecting = currentProgress == ConnectionProgress.AuthenticatingSsh ||
+                    currentProgress == ConnectionProgress.BootstrappingMoshOrBridge ||
+                    currentProgress == ConnectionProgress.VerifyingUdpOrHello ||
+                    currentProgress == ConnectionProgress.SyncingHerdrSnapshot
+                if (isAlreadyConnecting) {
+                    updateState { it.copy(hasDispatchedConnect = true) }
+                    return
+                }
                 if (!state.value.hasDispatchedConnect) {
                     updateState { it.copy(hasDispatchedConnect = true) }
                     viewModelScope.launch {

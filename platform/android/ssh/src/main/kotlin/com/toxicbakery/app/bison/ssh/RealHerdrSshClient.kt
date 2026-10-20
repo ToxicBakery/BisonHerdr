@@ -70,6 +70,7 @@ internal class RealHerdrSshClient(
     private val endpointSnapshotBus: EndpointSnapshotBus,
     private val paneSurfaceBus: PaneSurfaceBus,
     private val semanticNotificationBus: SemanticNotificationBus,
+    private val keystoreKeyManagerProvider: () -> AndroidKeystoreKeyManager = { AndroidKeystoreKeyManager() },
 ) {
     private data class ClientSelectionState(
         @Volatile var focusedWorkspaceId: String? = null,
@@ -127,10 +128,13 @@ internal class RealHerdrSshClient(
                 )
                 true
             }.getOrElse { err ->
+                val errDetail = err.message?.takeIf { it.isNotBlank() }
+                    ?: err::class.simpleName
+                    ?: "Unknown SSH error"
                 sshDebugLog.record(
                     machineId = machine.id,
                     tag = "RealSSH",
-                    message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: ${err.message}",
+                    message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
                     isError = true,
                 )
                 false
@@ -520,25 +524,39 @@ internal class RealHerdrSshClient(
         if (existing != null && existing.isConnected) {
             return existing
         }
+        JschAndroidCrypto.installGlobalDefaults()
         val jsch = JSch()
+        val preferredAuths = when (val auth = machine.authMethod) {
+            is SshAuthMethod.Password -> "password,keyboard-interactive,publickey"
+            is SshAuthMethod.KeystoreKey -> {
+                jsch.addIdentity(
+                    AndroidKeystoreJschIdentity(
+                        keystoreKeyManager = keystoreKeyManagerProvider(),
+                        keyAlias = auth.keyAlias,
+                        algorithm = auth.algorithm,
+                        requireBiometric = auth.requireBiometric,
+                    ),
+                    null,
+                )
+                "publickey,password,keyboard-interactive"
+            }
+            is SshAuthMethod.HardwareSecurityKey -> "publickey,keyboard-interactive,password"
+        }
         val session = jsch.getSession(
             route.entryUsername.ifBlank { machine.username },
             route.entryHost,
             route.entryPort,
         )
-        when (val auth = machine.authMethod) {
-            is SshAuthMethod.Password -> {
-                session.setPassword(auth.encryptedPasswordRef.encodeToByteArray())
-            }
-            else -> {
-                // Publickey or keyboard-interactive fallback
-            }
+        if (machine.authMethod is SshAuthMethod.Password) {
+            val passwordAuth = machine.authMethod as SshAuthMethod.Password
+            session.setPassword(passwordAuth.encryptedPasswordRef.encodeToByteArray())
         }
         val props = Properties().apply {
             put("StrictHostKeyChecking", "no")
-            put("PreferredAuthentications", "password,keyboard-interactive,publickey")
+            put("PreferredAuthentications", preferredAuths)
         }
         session.setConfig(props)
+        JschAndroidCrypto.configureSession(session)
         session.connect(6_000)
         sessions[machine.id] = session
         return session
