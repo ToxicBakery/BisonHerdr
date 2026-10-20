@@ -13,7 +13,7 @@ This file defines workspace-wide instructions and workflow rules for AI coding a
 
 ## 2. Project Mission & Architecture
 
-- **Mission:** Build **Bison** (`com.toxicbakery.app.bison`), a high-quality native Android tablet & foldable app for [Herdr](https://github.com/herdrdev/herdr) (operating against unmodified upstream Herdr servers) that:
+- **Mission:** Build **BisonHerdr** (`com.toxicbakery.app.bison`), a high-quality native Android tablet & foldable app for [Herdr](https://github.com/herdrdev/herdr) (operating against unmodified upstream Herdr servers) that:
   1. **Survives backgrounding and network roaming** without dropping terminal state (`BisonSessionService` foreground service, Mosh UDP SSP zero-traffic idle suspend, `client_shell.surface.set` zero-bandwidth daemon lease, and `NetworkCallback` fast-roaming).
   2. **Provides a strong, touch-first terminal experience as the primary input** ("Zen Canvas" 96%+ terminal viewport, split-thumb modifier/navigation clusters, native Compose prompt composer, direct BSP split gestures, and 120Hz `libghostty-vt` JNI rendering).
 - **Design Reference:** Always consult [`docs/plans/01-core-app-design.md`](docs/plans/01-core-app-design.md) before making architectural, protocol, or module-graph changes.

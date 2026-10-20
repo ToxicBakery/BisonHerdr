@@ -1,14 +1,14 @@
-# 01 — Bison (Herdr Tablet & Android) Core App Design
+# 01 — BisonHerdr (Herdr Tablet & Android) Core App Design
 
-This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for **Bison** (`com.toxicbakery.app.bison`), the native Android / Tablet client for Herdr.
+This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for **BisonHerdr** (`com.toxicbakery.app.bison`), the native Android / Tablet client for Herdr.
 
 ---
 
 ## Part I: Executive Summary & Problem Statement
 
-Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. **Bison** (`com.toxicbakery.app.bison`) is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built directly on Herdr's **Endpoint Generation 1** protocol.
+Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. **BisonHerdr** (`com.toxicbakery.app.bison`) is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built directly on Herdr's **Endpoint Generation 1** protocol.
 
-| Pain Point in Existing Mobile/Android Apps | Root Cause | Bison Architecture Solution |
+| Pain Point in Existing Mobile/Android Apps | Root Cause | BisonHerdr Architecture Solution |
 | :--- | :--- | :--- |
 | **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen in **<50ms with zero SSH reconnect**. |
 | **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Fast-Roam:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` remain rendered on screen with a non-intrusive `"Reconnecting..."` pill. `ConnectivityManager.NetworkCallback` detects interface switches in milliseconds, re-binds the SSH bridge immediately, and resyncs via `surface_reuse` / `surface_delta`. |
@@ -442,7 +442,7 @@ When `mosh-server` is available on the remote machine and UDP is reachable, **Mo
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Tablet as Bison Tablet App (Mosh + Control Engine)
+    participant Tablet as BisonHerdr Tablet App (Mosh + Control Engine)
     participant SSH as Remote sshd (TCP :22)
     participant MoshSrv as Remote mosh-server (UDP :60000-61000)
     participant HerdrSrv as Remote Herdr Daemon (herdr-client.sock + herdr.sock)
@@ -545,7 +545,7 @@ Both transport backbones are engineered so backgrounding the tablet app consumes
    - On the Herdr server (`src/server/headless/surface_interest.rs`), `set_client_shell_surface_active(client_id, false)` stops all `PaneSurfaceFrame` / `PaneSurfacePatch` rendering traffic while keeping the control socket open.
    - On `onStart()`, sending `client_shell.surface.set { active: true }` pushes a fresh coherent `PaneSurfaceFrame` in `<50ms` without re-running the SSH handshake, followed by `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }` once the frame is committed to release the server's `presentation_effects_fence`.
 3. **Actionable Android System Notifications (`BisonSessionService`):**
-   - Runs as a persistent `connectedDevice` / `specialUse` `ForegroundService` (*"Bison: 2 machines (Mosh UDP) · 1 agent working"*).
+   - Runs as a persistent `connectedDevice` / `specialUse` `ForegroundService` (*"BisonHerdr: 2 machines (Mosh UDP) · 1 agent working"*).
    - When an agent transitions to `Blocked` or `Done` (`SemanticNotification` or `ClientShellSnapshot` agent status change), posts a native Android notification with direct `PendingIntent` actions:
      - **Approve (`Enter`)** — sends `Enter` to the blocked pane in the background (via `ClientMessage::ClientShellPaneInput` or a `herdr remote-api-bridge` `pane.send_keys` / `agent.send_keys` exec channel).
      - **Inline Reply (`RemoteInput`)** — lets the user type or dictate a reply directly from the notification shade or smartwatch.
@@ -567,7 +567,7 @@ Both transport backbones are engineered so backgrounding the tablet app consumes
 
 ## Part V: Technical Stack, Project Structure (`SnapshotPB` Pattern) & Kodein DI
 
-The Android/KMP client (**Bison**, package namespace `com.toxicbakery.app.bison`) follows the exact multi-module architecture, Gradle build-logic conventions, state management patterns, and **Kodein (`org.kodein.di`)** dependency injection structure established in `SnapshotPB`.
+The Android/KMP client (**BisonHerdr**, package namespace `com.toxicbakery.app.bison`) follows the exact multi-module architecture, Gradle build-logic conventions, state management patterns, and **Kodein (`org.kodein.di`)** dependency injection structure established in `SnapshotPB`.
 
 ### 1. Layered Module Graph & Directory Structure
 
@@ -608,7 +608,7 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 │       │   ├── service/BisonSessionService.kt
 │       │   └── screen/ScreenModule.kt
 │       ├── src/debug/kotlin/com/toxicbakery/app/bison/
-│       │   ├── activity/DemoActivity.kt   # Launches MainActivity with EXTRA_FAKE_SERVER ("Bison Demo")
+│       │   ├── activity/DemoActivity.kt   # Launches MainActivity with EXTRA_FAKE_SERVER ("BisonHerdr Demo")
 │       │   └── debug/DebugModule.kt       # Imports fakeServerModule (debug-only compile guarantee)
 │       └── src/release/kotlin/com/toxicbakery/app/bison/
 │           └── debug/DebugModule.kt       # Binds inert NoDebugServer (zero fake code in release APK)
@@ -862,7 +862,7 @@ class Application : android.app.Application(), DIAware {
         if (BuildConfig.DEBUG) {
             Arbor.sow(LogCatSeedling())
         }
-        log.d { "Bison Application started" }
+        log.d { "BisonHerdr Application started" }
     }
 
     companion object {
@@ -928,7 +928,7 @@ Modeled on `SnapshotPB`'s `DebugBoard` / `FakeBoard`:
 - `:core:debug-server` defines the `DebugServer` interface and `NoDebugServer` inert object.
 - `:core:fake-server` implements `FakeHerdrServer`, simulating multiple SSH hosts (`workbox`, `gpu-rig`), workspaces, BSP split layouts, live terminal cell animations, and coding agents (`claude`, `codex`) cycling through `working`, `blocked` (with permission prompts), and `done`.
 - `:app:android` depends on `:core:fake-server` via `debugImplementation(projects.core.fakeServer)`.
-- In debug builds, tapping the **Bison Demo** launcher icon (`DemoActivity`) launches `MainActivity` with `EXTRA_FAKE_SERVER = true`. Release builds bind `NoDebugServer` in `src/release/kotlin/.../DebugModule.kt`, guaranteeing at compile time that no fake server code ships in production.
+- In debug builds, tapping the **BisonHerdr Demo** launcher icon (`DemoActivity`) launches `MainActivity` with `EXTRA_FAKE_SERVER = true`. Release builds bind `NoDebugServer` in `src/release/kotlin/.../DebugModule.kt`, guaranteeing at compile time that no fake server code ships in production.
 
 #### D. Type-Safe Navigation with `androidx.navigation3`
 Modeled on `SnapshotPB/core/common/.../navigation/Screens.kt` and `Controller.kt`:
