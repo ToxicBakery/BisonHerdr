@@ -10,11 +10,10 @@ This file defines workspace-wide instructions and workflow rules for AI coding a
   1. Verify that all relevant builds and unit tests complete **without warnings** or errors before committing.
   2. Check `git status` and `git diff` to ensure only intended files are staged and no temporary files or secrets are included.
   3. Commit to `main` with a clear, descriptive commit message (e.g., `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`, `refactor: ...`).
-  4. If a task modifies the `herdr/` submodule (e.g., extracting `herdr-protocol` or updating `client_shell` API schema entries), commit those changes inside `herdr/` first, then stage and commit the updated `herdr` submodule pointer on `main` in the root repository.
 
 ## 2. Project Mission & Architecture
 
-- **Mission:** Build a high-quality native Android tablet & foldable app for [Herdr](herdr/) that:
+- **Mission:** Build a high-quality native Android tablet & foldable app for [Herdr](https://github.com/herdrdev/herdr) (operating against unmodified upstream Herdr servers) that:
   1. **Survives backgrounding and network roaming** without dropping terminal state (`HerdrSessionService` foreground service, Mosh UDP SSP zero-traffic idle suspend, `client_shell.surface.set` zero-bandwidth daemon lease, and `NetworkCallback` fast-roaming).
   2. **Provides a strong, touch-first terminal experience as the primary input** ("Zen Canvas" 96%+ terminal viewport, split-thumb modifier/navigation clusters, native Compose prompt composer, direct BSP split gestures, and 120Hz `libghostty-vt` JNI rendering).
 - **Design Reference:** Always consult [`docs/plans/01-core-app-design.md`](docs/plans/01-core-app-design.md) before making architectural, protocol, or module-graph changes.
