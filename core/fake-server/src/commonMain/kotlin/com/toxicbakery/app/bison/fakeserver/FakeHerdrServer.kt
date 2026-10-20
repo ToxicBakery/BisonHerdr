@@ -486,14 +486,21 @@ class FakeHerdrServer(
     ): String? {
         if (!enabled) return null
         val state = machineStates[machineId] ?: return null
-        val params = runCatching { json.parseToJsonElement(paramsJson).jsonObject }
-            .getOrElse { JsonObject(emptyMap()) }
 
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
             message = "$method $paramsJson",
         )
+
+        val params by lazy(LazyThreadSafetyMode.NONE) {
+            if (paramsJson.isBlank() || paramsJson == "{}") {
+                EMPTY_JSON_OBJECT
+            } else {
+                runCatching { json.parseToJsonElement(paramsJson).jsonObject }
+                    .getOrElse { EMPTY_JSON_OBJECT }
+            }
+        }
 
         when (method) {
             "client_shell.surface.set" -> {
@@ -732,9 +739,10 @@ class FakeHerdrServer(
             }
 
             "agent.focus" -> {
+                val targetName = params["name"]?.jsonPrimitive?.content
                 val targetPaneId = params["pane_id"]?.jsonPrimitive?.content
                     ?: state.snapshot.agents.firstOrNull {
-                        it.name == params["name"]?.jsonPrimitive?.content
+                        it.name == targetName
                     }?.paneId
                     ?: state.snapshot.agents.firstOrNull()?.paneId
                 if (targetPaneId != null) {
@@ -1021,7 +1029,7 @@ class FakeHerdrServer(
     private fun buildSurfaceFrame(state: SimulatedMachineState): PaneSurfaceFrame {
         val totalCols = state.cols.toInt().coerceAtLeast(40)
         val totalRows = state.rows.toInt().coerceAtLeast(12)
-        val cells = MutableList(totalCols * totalRows) { CellData() }
+        val cells = MutableList(totalCols * totalRows) { CellData.EMPTY }
 
         val activeTab = state.snapshot.tabs.firstOrNull { it.tabId == state.snapshot.focusedTabId }
         val isZoomed = activeTab?.zoomed == true
@@ -1236,12 +1244,13 @@ class FakeHerdrServer(
             if (line.predicted) {
                 modifier = (modifier.toInt() or CellData.MOD_PREDICTED_ECHO.toInt()).toUShort()
             }
+            val rowOffset = row * gridCols
             for ((charIdx, ch) in line.text.withIndex()) {
                 if (charIdx >= maxCols) break
                 val col = startCol + charIdx
                 if (col !in 0..<gridCols) continue
-                cells[row * gridCols + col] = CellData(
-                    symbol = ch.toString(),
+                cells[rowOffset + col] = CellData(
+                    symbol = CellData.symbolForChar(ch),
                     fg = line.fg,
                     modifier = modifier,
                 )
@@ -1260,5 +1269,6 @@ class FakeHerdrServer(
         const val GPU_RIG_ID: String = "gpu-rig"
         val DEFAULT_COLS: UShort = 120u
         val DEFAULT_ROWS: UShort = 36u
+        private val EMPTY_JSON_OBJECT = JsonObject(emptyMap())
     }
 }

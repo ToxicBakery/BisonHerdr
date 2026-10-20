@@ -5,6 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.serialization.json.Json
 
@@ -182,7 +183,41 @@ class ProtocolTest {
         )
         assertNotNull(scrolled)
         assertEquals("A", scrolled.frame.frame.cellAt(1, 0)?.symbol)
-        assertEquals(" ", scrolled.frame.frame.cellAt(1, 2)?.symbol)
+        assertSame(CellData.EMPTY, scrolled.frame.frame.cellAt(1, 2))
+
+        // Scroll region down by 1 row with an inline trailing patch on row 0
+        val scrolledDownWithPatch = assembler.applySurfaceScroll(
+            machineId = "workbox",
+            region = SurfaceRect(0u, 0u, 4u, 3u),
+            deltaRows = -1,
+            patch = PaneSurfacePatch(
+                bootId = "boot-1",
+                revision = 4u,
+                width = 4u,
+                height = 3u,
+                rows = listOf(
+                    PaneSurfacePatchRow(
+                        y = 0u,
+                        startX = 0u,
+                        cells = listOf(CellData(symbol = "Z")),
+                    ),
+                ),
+            ),
+        )
+        assertNotNull(scrolledDownWithPatch)
+        assertEquals(4uL, scrolledDownWithPatch.frame.revision)
+        assertEquals("Z", scrolledDownWithPatch.frame.frame.cellAt(0, 0)?.symbol)
+        assertEquals("A", scrolledDownWithPatch.frame.frame.cellAt(1, 1)?.symbol)
+        assertEquals("B", scrolledDownWithPatch.frame.frame.cellAt(2, 1)?.symbol)
+    }
+
+    @Test
+    fun cellDataSymbolLookupReusesAsciiAndFormatsUnicodeCodepoints() {
+        assertSame(CellData.symbolForChar('A'), CellData.symbolForChar('A'))
+        assertSame(CellData.symbolForChar(' '), CellData.symbolForCodepoint(32))
+        assertEquals("❯", CellData.symbolForChar('❯'))
+        assertEquals("❯", CellData.symbolForCodepoint(0x276F))
+        assertEquals("🦬", CellData.symbolForCodepoint(0x1F9AC))
     }
 
     @Test
