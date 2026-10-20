@@ -31,7 +31,8 @@ import org.junit.runner.RunWith
  *
  * The test types a marker into the agy prompt through the real [SshTransportManager] path. The agy
  * caret is directly after the marker. The test makes sure that the frame cursor is at that cell,
- * because `TerminalSurfaceCanvas` draws the cursor from `frame.cursor`.
+ * because `TerminalSurfaceCanvas` draws the cursor from `frame.cursor`. The test also makes sure
+ * that the local typing echo shows the marker on the prompt row.
  */
 @RunWith(AndroidJUnit4::class)
 class AgyCursorPlacementE2ETest {
@@ -107,7 +108,8 @@ class AgyCursorPlacementE2ETest {
                 transport.sendPaneInput(machine.id, paneId, ClientPaneInputEvent.TextCommit(MARKER)),
                 "Sending the marker failed:\n${debugLogDump()}",
             )
-            surfaceBus.surfaceFor(machine.id)?.let { report("optimistic-echo", it) }
+            val echoFrame = assertNotNull(surfaceBus.surfaceFor(machine.id), "No frame after the input")
+            report("optimistic-echo", echoFrame)
 
             // Wait until the optimistic echo expires, so the frame shows only the Herdr pane content.
             delay(SETTLE_AFTER_INPUT_MS)
@@ -127,6 +129,14 @@ class AgyCursorPlacementE2ETest {
 
             assertEquals(markerRow, cursor.y.toInt(), "Cursor row is not on the agy prompt row. $summary")
             assertEquals(caretCol, cursor.x.toInt(), "Cursor column is not after the typed text. $summary")
+
+            // The local echo shows the typed text before Herdr confirms it. It must be on the prompt row too.
+            val echoRow = frameRows(echoFrame).indexOfFirst { it.contains(MARKER) }
+            assertEquals(
+                markerRow,
+                echoRow,
+                "The typing echo is not on the agy prompt row.\n${renderFrame(echoFrame)}",
+            )
         } finally {
             transport.disconnect(machine.id)
         }

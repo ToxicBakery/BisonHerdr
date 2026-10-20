@@ -27,6 +27,7 @@ import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
 import com.toxicbakery.app.bison.protocol.PaneSurfaceScroll
+import com.toxicbakery.app.bison.protocol.PaneSurfaceSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
@@ -56,6 +57,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -203,6 +205,21 @@ internal class RealHerdrSshClient(
     private val inputSequence = AtomicLong(0L)
     private val lastInputConfirmedSeq = ConcurrentHashMap<String, Long>()
     private val shellBatchCounter = AtomicLong(1L)
+    private val surfaceStreams = ConcurrentHashMap<String, EndpointSurfaceStream>()
+    private val streamSurfaces = ConcurrentHashMap<String, EndpointSurfaceSnapshot>()
+    private val streamRetryAtMs = ConcurrentHashMap<String, Long>()
+    private val pendingEchoRetires = ConcurrentHashMap<String, PendingEchoRetire>()
+
+    /**
+     * Input that Herdr confirmed, with the stream cursor at the time of the confirmation. The
+     * optimistic echo for this input stays until the stream shows a cursor move (the echo) or
+     * until [STREAM_ECHO_RETIRE_TIMEOUT_MS].
+     */
+    private data class PendingEchoRetire(
+        val seq: Long,
+        val confirmedAtMs: Long,
+        val cursorAtConfirm: WireCursor?,
+    )
 
     fun isSimulatedHost(machine: HostMachine): Boolean {
         val host = machine.hostname.trim().lowercase()
@@ -285,6 +302,7 @@ internal class RealHerdrSshClient(
         val job = scope.launch {
             while (isActive) {
                 if (isSurfaceActive()) {
+                    ensureSurfaceStream(machine, route)
                     runCatching {
                         refreshSnapshotAndSurface(machine, route)
                     }.onFailure { err ->
@@ -304,6 +322,10 @@ internal class RealHerdrSshClient(
 
     fun disconnect(machineId: String) {
         pollJobs.remove(machineId)?.cancel()
+        surfaceStreams.remove(machineId)?.close()
+        streamSurfaces.remove(machineId)
+        streamRetryAtMs.remove(machineId)
+        pendingEchoRetires.remove(machineId)
         inputFlushJobs.remove(machineId)?.cancel()
         inputFlushSignals.remove(machineId)?.close()
         pendingInputQueues.remove(machineId)?.clear()
@@ -328,6 +350,12 @@ internal class RealHerdrSshClient(
         val targetRows = rows.toInt().coerceIn(8, 150)
         val prev = viewportSizes.put(machineId, targetCols to targetRows)
         if (prev == (targetCols to targetRows)) return
+        val stream = surfaceStreams[machineId]
+        if (stream != null) {
+            // Herdr renders the next surface at the new size.
+            stream.resize(cols = targetCols, rows = targetRows)
+            if (stream.isLive) return
+        }
         val cached = cachedInputs[machineId] ?: return
         val frame = buildCompositeSurfaceFrame(
             machineId = machineId,
@@ -336,6 +364,234 @@ internal class RealHerdrSshClient(
             ansiByPane = cached.ansiByPane,
         )
         paneSurfaceBus.publish(machineId, frame)
+    }
+
+    /**
+     * Stops (`false`) or starts (`true`) the pane surface traffic of the Herdr surface stream.
+     */
+    fun setSurfaceActive(machineId: String, active: Boolean) {
+        surfaceStreams[machineId]?.setSurfaceActive(active)
+    }
+
+    /**
+     * Opens the surface stream for [machine] and waits up to [firstSurfaceTimeoutMs] for its first
+     * surface. Returns true when the stream is live. Call it before the first refresh, so that the
+     * first frame on screen already has the real cursor.
+     */
+    suspend fun startSurfaceStream(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        firstSurfaceTimeoutMs: Long = FIRST_STREAM_SURFACE_TIMEOUT_MS,
+    ): Boolean {
+        ensureSurfaceStream(machine, route)
+        return withTimeoutOrNull(firstSurfaceTimeoutMs) {
+            while (!isSurfaceStreamLive(machine.id)) {
+                if (!surfaceStreams.containsKey(machine.id)) return@withTimeoutOrNull false
+                delay(STREAM_START_POLL_MS)
+            }
+            true
+        } == true
+    }
+
+    /** True while [machineId] receives pane surfaces from `herdr remote-client-bridge`. */
+    internal fun isSurfaceStreamLive(machineId: String): Boolean =
+        surfaceStreams[machineId]?.isLive == true
+
+    /**
+     * Opens the `herdr remote-client-bridge` surface stream for [machine] if it is not open.
+     * The stream gives the real cells and the real terminal cursor. While it is not live, the
+     * client builds frames from `pane.read` text.
+     */
+    private suspend fun ensureSurfaceStream(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+    ) {
+        if (remoteBatchExecutor != null) return
+        if (surfaceStreams.containsKey(machine.id)) return
+        val now = System.currentTimeMillis()
+        if (now < (streamRetryAtMs[machine.id] ?: 0L)) return
+        streamRetryAtMs[machine.id] = now + SURFACE_STREAM_RETRY_MS
+        val stream = EndpointSurfaceStream(
+            machineId = machine.id,
+            sshDebugLog = sshDebugLog,
+            scope = scope,
+            onSurface = { snapshot -> onStreamSurface(machine.id, snapshot) },
+            onClosed = { closedStream, receivedSurface, error ->
+                onStreamClosed(machine.id, closedStream, receivedSurface, error)
+            },
+        )
+        if (surfaceStreams.putIfAbsent(machine.id, stream) != null) return
+        runCatching {
+            val session = getOrOpenSession(machine, route)
+            val (cols, rows) = viewportSizes[machine.id] ?: (DEFAULT_STREAM_COLS to DEFAULT_STREAM_ROWS)
+            withContext(Dispatchers.IO) {
+                stream.start(session = session, command = REMOTE_CLIENT_BRIDGE_COMMAND, cols = cols, rows = rows)
+            }
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "SurfaceStream",
+                message = "Started herdr remote-client-bridge surface stream (${cols}x$rows)",
+            )
+        }.onFailure { err ->
+            surfaceStreams.remove(machine.id, stream)
+            stream.close()
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "SurfaceStream",
+                message = "Could not start herdr remote-client-bridge: ${err.message}",
+                isError = true,
+            )
+        }
+    }
+
+    private fun onStreamClosed(
+        machineId: String,
+        stream: EndpointSurfaceStream,
+        receivedSurface: Boolean,
+        error: Throwable?,
+    ) {
+        if (!surfaceStreams.remove(machineId, stream)) return
+        streamSurfaces.remove(machineId)
+        pendingEchoRetires.remove(machineId)
+        if (!receivedSurface) {
+            // The server did not send a surface. It possibly does not support endpoint generation 1.
+            streamRetryAtMs[machineId] = System.currentTimeMillis() + SURFACE_STREAM_UNSUPPORTED_RETRY_MS
+        }
+        sshDebugLog.record(
+            machineId = machineId,
+            tag = "SurfaceStream",
+            message = "herdr remote-client-bridge closed (surfaceReceived=$receivedSurface): " +
+                (error?.message ?: "end of stream") + ". Using pane.read until the stream reconnects.",
+            isError = error != null,
+        )
+    }
+
+    private fun onStreamSurface(machineId: String, snapshot: EndpointSurfaceSnapshot) {
+        streamSurfaces[machineId] = snapshot
+        val wantedSize = viewportSizes[machineId]
+        if (wantedSize != null && (snapshot.width != wantedSize.first || snapshot.height != wantedSize.second)) {
+            surfaceStreams[machineId]?.resize(cols = wantedSize.first, rows = wantedSize.second)
+        }
+        val pending = pendingEchoRetires[machineId]
+        if (pending != null) {
+            val cursorMoved = snapshot.cursor != pending.cursorAtConfirm
+            val expired = System.currentTimeMillis() - pending.confirmedAtMs >= STREAM_ECHO_RETIRE_TIMEOUT_MS
+            if ((cursorMoved || expired) && pendingEchoRetires.remove(machineId, pending)) {
+                retireOptimisticEditsUpTo(machineId, pending.seq)
+            }
+        }
+        publishStreamSurface(machineId)
+    }
+
+    /** Publishes the latest stream surface with the active optimistic echo edits. */
+    private fun publishStreamSurface(machineId: String) {
+        val snapshot = streamSurfaces[machineId] ?: return
+        paneSurfaceBus.publish(machineId, overlayOptimisticEdits(machineId, buildStreamSurfaceFrame(machineId, snapshot)))
+    }
+
+    /** Records confirmed input in stream mode. See [PendingEchoRetire]. */
+    private fun markStreamInputConfirmed(machineId: String, confirmedSeq: Long) {
+        lastInputConfirmedSeq.compute(machineId) { _, prev ->
+            if (prev == null || confirmedSeq > prev) confirmedSeq else prev
+        }
+        val pending = PendingEchoRetire(
+            seq = confirmedSeq,
+            confirmedAtMs = System.currentTimeMillis(),
+            cursorAtConfirm = streamSurfaces[machineId]?.cursor,
+        )
+        pendingEchoRetires[machineId] = pending
+        scope.launch {
+            delay(STREAM_ECHO_RETIRE_TIMEOUT_MS)
+            if (pendingEchoRetires.remove(machineId, pending)) {
+                retireOptimisticEditsUpTo(machineId, pending.seq)
+                publishStreamSurface(machineId)
+            }
+        }
+    }
+
+    internal fun buildStreamSurfaceFrame(
+        machineId: String,
+        stream: EndpointSurfaceSnapshot,
+    ): PaneSurfaceFrame {
+        val snapshot = cachedInputs[machineId]?.snapshot ?: endpointSnapshotBus.snapshotFor(machineId)
+        val zoomed = cachedInputs[machineId]?.layout?.zoomed == true
+        val panes = stream.panes.map { pane ->
+            val agentMeta = snapshot?.agents?.firstOrNull { it.paneId == pane.paneId }
+            val paneMeta = snapshot?.panes?.firstOrNull { it.paneId == pane.paneId }
+            PaneSurfacePane(
+                paneId = pane.paneId,
+                rect = pane.rect,
+                innerRect = pane.innerRect,
+                scrollbarRect = pane.scrollbarRect,
+                scroll = PaneSurfaceScroll(
+                    offsetFromBottom = (pane.scroll?.offsetFromBottom ?: 0L).coerceIn(0L, UInt.MAX_VALUE.toLong()).toUInt(),
+                    maxScrollback = (pane.scroll?.maxOffsetFromBottom ?: 0L).coerceIn(0L, UInt.MAX_VALUE.toLong()).toUInt(),
+                    viewportRows = (pane.scroll?.viewportRows ?: pane.innerRect.height.toLong())
+                        .coerceIn(0L, UShort.MAX_VALUE.toLong()).toUShort(),
+                ),
+                focused = pane.focused,
+                zoomed = zoomed,
+                mouseReporting = pane.mouseReporting,
+                contentRevision = pane.contentRevision.toULong(),
+                title = agentMeta?.displayAgent?.takeIf { it.isNotBlank() }
+                    ?: paneMeta?.label
+                    ?: pane.paneId,
+                agentStatus = agentMeta?.agentStatus ?: AgentStatus.Unknown,
+            )
+        }
+        val splits = stream.splits.mapIndexed { index, split ->
+            val ratio = if (split.dividerIsColumn) {
+                (split.position - split.area.x.toInt()).toFloat() / split.area.width.toInt().coerceAtLeast(1)
+            } else {
+                (split.position - split.area.y.toInt()).toFloat() / split.area.height.toInt().coerceAtLeast(1)
+            }
+            val branch = if (split.path.isEmpty()) "root" else split.path.joinToString("") { if (it) "r" else "l" }
+            PaneSurfaceSplit(
+                id = "s$index:$branch",
+                direction = if (split.dividerIsColumn) {
+                    PaneSurfaceSplitDirection.Vertical
+                } else {
+                    PaneSurfaceSplitDirection.Horizontal
+                },
+                ratio = ratio.coerceIn(0.05f, 0.95f),
+                hitRect = split.hitRect,
+                path = split.path,
+                workspaceRect = split.area,
+            )
+        }
+        return PaneSurfaceFrame(
+            bootId = snapshot?.bootId ?: "herdr-$machineId",
+            revision = revisionCounter.incrementAndGet().toULong(),
+            frame = FrameData(
+                width = stream.width.toUShort(),
+                height = stream.height.toUShort(),
+                cells = stream.cells,
+                cursor = stream.cursor?.let { cursor ->
+                    CursorState(
+                        x = cursor.x.toUShort(),
+                        y = cursor.y.toUShort(),
+                        shape = cursor.shape,
+                        visible = cursor.visible,
+                    )
+                },
+            ),
+            panes = panes,
+            splits = splits,
+        )
+    }
+
+    /** Returns the last rows of text in [paneId] from the stream surface, for agent snippets. */
+    private fun streamPaneSnippet(stream: EndpointSurfaceSnapshot, paneId: String): String? {
+        val pane = stream.panes.firstOrNull { it.paneId == paneId } ?: return null
+        val rect = pane.innerRect
+        val lines = (rect.y.toInt() until (rect.y.toInt() + rect.height.toInt()).coerceAtMost(stream.height)).map { row ->
+            buildString {
+                for (col in rect.x.toInt() until (rect.x.toInt() + rect.width.toInt()).coerceAtMost(stream.width)) {
+                    append(stream.cells[row * stream.width + col].symbol)
+                }
+            }.trimEnd()
+        }
+        return lines.filter { it.isNotBlank() }.takeLast(4).joinToString("\n").takeIf { it.isNotBlank() }
     }
 
     suspend fun refreshSnapshotAndSurface(
@@ -353,10 +609,14 @@ internal class RealHerdrSshClient(
                     .ifEmpty { listOfNotNull(existing.snapshot.focusedPaneId) }
         }.orEmpty()
 
+        // The surface stream gives the pane cells, so pane.read is only necessary without it.
+        val streamLive = isSurfaceStreamLive(machine.id)
         val initialCommands = buildList {
             add(RemoteShellCommand.Exec("herdr api snapshot"))
-            predictedVisiblePanes.forEach { paneId ->
-                add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
+            if (!streamLive) {
+                predictedVisiblePanes.forEach { paneId ->
+                    add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
+                }
             }
         }
 
@@ -409,6 +669,26 @@ internal class RealHerdrSshClient(
                 .ifEmpty { listOfNotNull(parsed.snapshot.focusedPaneId) }
 
         if (visiblePaneIds.isEmpty()) return@withContext true
+
+        val liveStream = streamSurfaces[machine.id]
+        if (streamLive && liveStream != null) {
+            parsed.snapshot.agents.forEach { agent ->
+                streamPaneSnippet(liveStream, agent.paneId)?.let { snippet ->
+                    semanticNotificationBus.updateAgentSnippet(
+                        machineId = machine.id,
+                        paneId = agent.paneId,
+                        snippet = snippet,
+                    )
+                }
+            }
+            cachedInputs[machine.id] = CachedSurfaceInputs(
+                snapshot = parsed.snapshot,
+                layout = activeLayout,
+                ansiByPane = cachedInputs[machine.id]?.ansiByPane.orEmpty(),
+            )
+            publishStreamSurface(machine.id)
+            return@withContext true
+        }
 
         val missingPaneIds = visiblePaneIds.filter { it !in ansiByPane }
         if (missingPaneIds.isNotEmpty()) {
@@ -722,6 +1002,32 @@ internal class RealHerdrSshClient(
             val targetPaneId = batch.last().paneId
             val coalescedRpcCommands = buildCoalescedInputCommands(batch)
             if (coalescedRpcCommands.isEmpty()) continue
+
+            if (isSurfaceStreamLive(machine.id)) {
+                // The surface stream shows the echo, so the batch does not need a pane.read.
+                runCatching {
+                    executeBatchOnLane(
+                        machine = machine,
+                        route = route,
+                        lane = WorkerLane.Input,
+                        commands = coalescedRpcCommands,
+                    )
+                    markStreamInputConfirmed(machine.id, maxSeqInBatch)
+                    if (batch.any { shouldTriggerTopologyRefresh(it.event) }) {
+                        scope.launch {
+                            runCatching { refreshSnapshotAndSurface(machine, route) }
+                        }
+                    }
+                }.onFailure { err ->
+                    sshDebugLog.record(
+                        machineId = machine.id,
+                        tag = "RealSSH",
+                        message = "Failed to send input to $targetPaneId: ${err.message}",
+                        isError = true,
+                    )
+                }
+                continue
+            }
 
             val prevAnsi = cachedInputs[machine.id]?.ansiByPane?.get(targetPaneId)
             val readCommand = RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(targetPaneId))
@@ -1742,7 +2048,14 @@ internal class RealHerdrSshClient(
             splits = splits,
         )
 
-        // Overlay any unconfirmed optimistic local echo edits (<1.5s TTL) so polls/resizes never drop in-flight keys
+        return overlayOptimisticEdits(machineId, baseFrame)
+    }
+
+    /**
+     * Draws the unconfirmed optimistic echo edits (<1.5s TTL) over [baseFrame], so polls, stream
+     * frames, and resizes never drop in-flight keys.
+     */
+    private fun overlayOptimisticEdits(machineId: String, baseFrame: PaneSurfaceFrame): PaneSurfaceFrame {
         val editsDeque = optimisticEdits[machineId] ?: return baseFrame
         val activeEdits = synchronized(editsDeque) {
             val now = System.currentTimeMillis()
@@ -2113,6 +2426,15 @@ internal class RealHerdrSshClient(
         private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
         private const val MAX_OPTIMISTIC_EDITS = 128
+        private const val DEFAULT_STREAM_COLS = 120
+        private const val DEFAULT_STREAM_ROWS = 40
+        private const val SURFACE_STREAM_RETRY_MS = 10_000L
+        private const val SURFACE_STREAM_UNSUPPORTED_RETRY_MS = 120_000L
+        private const val STREAM_ECHO_RETIRE_TIMEOUT_MS = 250L
+        private const val FIRST_STREAM_SURFACE_TIMEOUT_MS = 1_500L
+        private const val STREAM_START_POLL_MS = 20L
+        private const val REMOTE_PATH_PREFIX = "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"; "
+        private const val REMOTE_CLIENT_BRIDGE_COMMAND = REMOTE_PATH_PREFIX + "exec herdr remote-client-bridge"
 
         private val BLANK_CELL = CellData()
         private val RESET_SGR_STATE = SgrState(0u, 0u, 0u)
