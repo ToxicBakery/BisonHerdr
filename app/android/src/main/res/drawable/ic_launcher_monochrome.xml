@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Monochrome Left and Right Bison Horns -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,42 C25,40 22,31 27,24 C29,29 33,33 40,35 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M74,42 C83,40 86,31 81,24 C79,29 75,33 68,35 Z" />
+
+    <!-- Monochrome Bison Head Silhouette with Cutout Terminal Prompt '>_ ' -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M38,31 L54,26 L70,31 L76,45 L70,68 L54,82 L38,68 L32,45 Z M38,40 L70,40 L66,64 L42,64 Z M43,46 L52,52 L43,58 L43,54.5 L47.5,52 L43,49.5 Z M54,55 L63,55 L63,58 L54,58 Z" />
+</vector>

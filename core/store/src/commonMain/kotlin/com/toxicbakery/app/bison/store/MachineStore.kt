@@ -20,7 +20,6 @@ import kotlinx.serialization.json.Json
 /**
  * Atomic, coroutine-safe persistent store for [HostMachine] profiles (`machines.json`).
  *
- * Modeled on `SnapshotPB`'s `DeviceStore`:
  * - Exposes [knownMachines] and [isLoaded] as reactive [StateFlow]s.
  * - Guards disk persistence behind [initialLoad] ([awaitLoaded]) and a coroutine [Mutex].
  * - Writes atomically via [StoreIOProvider.writeAtomic] and quarantines corrupt JSON files via

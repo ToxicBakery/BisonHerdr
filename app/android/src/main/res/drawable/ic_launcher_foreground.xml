@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Left and Right Curved Bison Horns (Gruvbox Cream #EBDBB2) -->
+    <path
+        android:fillColor="#EBDBB2"
+        android:pathData="M34,42 C25,40 22,31 27,24 C29,29 33,33 40,35 Z" />
+    <path
+        android:fillColor="#EBDBB2"
+        android:pathData="M74,42 C83,40 86,31 81,24 C79,29 75,33 68,35 Z" />
+
+    <!-- Geometric Bison Mane / Crown Shield (Gruvbox Amber #D79921) -->
+    <path
+        android:fillColor="#D79921"
+        android:pathData="M38,31 L54,26 L70,31 L76,45 L70,68 L54,82 L38,68 L32,45 Z" />
+
+    <!-- Inner Dark Terminal Screen Visor on Bison Forehead (#1D2021) -->
+    <path
+        android:fillColor="#1D2021"
+        android:pathData="M38,40 L70,40 L66,64 L42,64 Z" />
+
+    <!-- Bison Snout / Lower Jaw Plate (#B57614) -->
+    <path
+        android:fillColor="#B57614"
+        android:pathData="M42,66 L66,66 L61,77 L47,77 Z" />
+
+    <!-- Terminal Prompt Chevron '>' inside Visor (Gruvbox Green #B8BB26) -->
+    <path
+        android:fillColor="#B8BB26"
+        android:pathData="M43,46 L52,52 L43,58 L43,54.5 L47.5,52 L43,49.5 Z" />
+
+    <!-- Terminal Cursor Block '_' inside Visor (Gruvbox Bright Yellow #FABD2F) -->
+    <path
+        android:fillColor="#FABD2F"
+        android:pathData="M54,55 L63,55 L63,58 L54,58 Z" />
+</vector>
