@@ -3,18 +3,12 @@ import com.toxicbakery.app.bison.composite.util.configureOptIns
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
-    alias(libs.plugins.androidMultiplatformLibrary)
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
 }
 
 kotlin {
     configureOptIns()
-    android {
-        namespace = "com.toxicbakery.app.bison.resources"
-        compileSdk = libs.versions.android.compileSdk.get().toInt()
-        minSdk = libs.versions.android.minSdk.get().toInt()
-    }
     jvm()
     sourceSets {
         val commonMain by getting {
