@@ -77,11 +77,14 @@ data class ClientShellSnapshot(
 ) {
     /** Agents sorted by attention priority (`Blocked` -> `Done` -> `Working` -> `Idle` -> `Unknown`). */
     val prioritizedAgents: List<ClientShellAgent>
-        get() = agents.sortedWith(
+        get() = agents.sortedWith(AGENT_PRIORITY_COMPARATOR)
+
+    companion object {
+        private val AGENT_PRIORITY_COMPARATOR: Comparator<ClientShellAgent> =
             compareBy<ClientShellAgent> { it.agentStatus.priorityOrder }
                 .thenByDescending { it.focused }
                 .thenBy { it.paneId }
-        )
+    }
 }
 
 @Serializable

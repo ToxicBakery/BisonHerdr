@@ -95,20 +95,10 @@ class SurfaceDeltaAssembler {
         ) {
             previous.frame.cells.toMutableList()
         } else {
-            MutableList(width * height) { CellData() }
+            MutableList(width * height) { CellData.EMPTY }
         }
 
-        for (rowPatch in patch.rows) {
-            val y = rowPatch.y.toInt()
-            if (y !in 0..<height) continue
-            val startX = rowPatch.startX.toInt()
-            for ((offset, cell) in rowPatch.cells.withIndex()) {
-                val x = startX + offset
-                if (x in 0..<width) {
-                    mutableCells[y * width + x] = cell
-                }
-            }
-        }
+        applyPatchRowsInPlace(mutableCells, width, height, patch.rows)
 
         val committed = previous.copy(
             bootId = patch.bootId,
@@ -160,41 +150,88 @@ class SurfaceDeltaAssembler {
         val rh = region.height.toInt().coerceAtMost(gridHeight - ry)
 
         if (rw > 0 && rh > 0 && deltaRows != 0) {
-            val snapshot = mutableCells.toList()
-            for (localRow in 0..<rh) {
-                val targetRow = ry + localRow
+            val rowProgression = if (deltaRows > 0) 0..<rh else (rh - 1) downTo 0
+            for (localRow in rowProgression) {
+                val targetRowOffset = (ry + localRow) * gridWidth
                 val sourceLocalRow = localRow + deltaRows
-                for (localCol in 0..<rw) {
-                    val col = rx + localCol
-                    val targetIdx = targetRow * gridWidth + col
-                    mutableCells[targetIdx] = if (sourceLocalRow in 0..<rh) {
-                        val sourceRow = ry + sourceLocalRow
-                        snapshot[sourceRow * gridWidth + col]
-                    } else {
-                        CellData()
+                if (sourceLocalRow in 0..<rh) {
+                    val sourceRowOffset = (ry + sourceLocalRow) * gridWidth
+                    for (localCol in 0..<rw) {
+                        val col = rx + localCol
+                        mutableCells[targetRowOffset + col] = mutableCells[sourceRowOffset + col]
+                    }
+                } else {
+                    for (localCol in 0..<rw) {
+                        val col = rx + localCol
+                        mutableCells[targetRowOffset + col] = CellData.EMPTY
                     }
                 }
             }
         }
 
-        val scrolledFrame = previous.copy(
-            frame = previous.frame.copy(cells = mutableCells),
-        )
-        baselines[machineId] = scrolledFrame
-
-        return if (patch != null) {
-            applyPatch(machineId, patch)
+        val committed = if (patch != null) {
+            val patchWidth = patch.width.toInt()
+            val patchHeight = patch.height.toInt()
+            val targetCells = if (
+                previous.frame.width == patch.width &&
+                previous.frame.height == patch.height
+            ) {
+                mutableCells
+            } else {
+                MutableList(patchWidth * patchHeight) { CellData.EMPTY }
+            }
+            applyPatchRowsInPlace(targetCells, patchWidth, patchHeight, patch.rows)
+            previous.copy(
+                bootId = patch.bootId,
+                revision = patch.revision,
+                frame = FrameData(
+                    width = patch.width,
+                    height = patch.height,
+                    cells = targetCells,
+                    cursor = patch.cursor ?: previous.frame.cursor,
+                ),
+                panes = patch.panes ?: previous.panes,
+                splits = patch.splits ?: previous.splits,
+                popup = patch.popup ?: previous.popup,
+                graphics = patch.graphics ?: previous.graphics,
+                presentationEpoch = patch.presentationEpoch ?: previous.presentationEpoch,
+            )
         } else {
-            AssembledSurfaceResult(
-                frame = scrolledFrame,
-                presentationReadyControl = consumeReadyFenceIfSatisfied(machineId, scrolledFrame),
+            previous.copy(
+                frame = previous.frame.copy(cells = mutableCells),
             )
         }
+
+        baselines[machineId] = committed
+        return AssembledSurfaceResult(
+            frame = committed,
+            presentationReadyControl = consumeReadyFenceIfSatisfied(machineId, committed),
+        )
     }
 
     fun clear(machineId: String) {
         baselines.remove(machineId)
         pendingPresentationEpochs.remove(machineId)
+    }
+
+    private fun applyPatchRowsInPlace(
+        mutableCells: MutableList<CellData>,
+        width: Int,
+        height: Int,
+        rows: List<PaneSurfacePatchRow>,
+    ) {
+        for (rowPatch in rows) {
+            val y = rowPatch.y.toInt()
+            if (y !in 0..<height) continue
+            val startX = rowPatch.startX.toInt()
+            val rowOffset = y * width
+            for ((offset, cell) in rowPatch.cells.withIndex()) {
+                val x = startX + offset
+                if (x in 0..<width) {
+                    mutableCells[rowOffset + x] = cell
+                }
+            }
+        }
     }
 
     private fun consumeReadyFenceIfSatisfied(
@@ -221,7 +258,7 @@ class SurfaceDeltaAssembler {
     ): List<CellData> {
         val total = width.toInt() * height.toInt()
         if (cells.size == total) return cells
-        return List(total) { index -> cells.getOrElse(index) { CellData() } }
+        return List(total) { index -> cells.getOrElse(index) { CellData.EMPTY } }
     }
 
     companion object {

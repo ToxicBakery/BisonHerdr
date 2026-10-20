@@ -78,6 +78,27 @@ data class CellData(
         const val MOD_STRIKETHROUGH: UShort = 0x0040u
         const val MOD_PREDICTED_ECHO: UShort = 0x0080u
 
+        private val ASCII_SYMBOLS = Array(128) { it.toChar().toString() }
+
+        val EMPTY: CellData = CellData()
+
+        fun symbolForChar(ch: Char): String =
+            if (ch.code < 128) ASCII_SYMBOLS[ch.code] else ch.toString()
+
+        fun symbolForCodepoint(cp: Int): String =
+            if (cp in 0..<128) ASCII_SYMBOLS[cp] else cp.toUnicodeSymbol()
+
+        private fun Int.toUnicodeSymbol(): String = when (this) {
+            in 0..0xFFFF -> toChar().toString()
+            in 0x10000..0x10FFFF -> {
+                val offset = this - 0x10000
+                val high = ((offset ushr 10) + 0xD800).toChar()
+                val low = ((offset and 0x3FF) + 0xDC00).toChar()
+                charArrayOf(high, low).concatToString()
+            }
+            else -> "\uFFFD"
+        }
+
         fun rgbColor(r: Int, g: Int, b: Int): UInt =
             0x02000000u or
                 ((r.coerceIn(0, 255).toUInt()) shl 16) or
