@@ -430,6 +430,7 @@ class SshTransportManager(
         if (moshUdpEngine.isSessionActive(machineId)) {
             moshUdpEngine.resize(machineId, cols, rows)
         }
+        realHerdrSshClient.resizeViewport(machineId, cols, rows)
         sshDebugLog.record(
             machineId = machineId,
             tag = "Resize",

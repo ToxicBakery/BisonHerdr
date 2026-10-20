@@ -77,12 +77,20 @@ internal class RealHerdrSshClient(
         var focusedPaneId: String? = null,
     )
 
+    private data class CachedSurfaceInputs(
+        val snapshot: ClientShellSnapshot,
+        val layout: PaneLayoutSnapshot?,
+        val ansiByPane: Map<String, String>,
+    )
+
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = ConcurrentHashMap<String, Session>()
     private val sessionLocks = ConcurrentHashMap<String, Mutex>()
     private val pollJobs = ConcurrentHashMap<String, Job>()
     private val selectionState = ConcurrentHashMap<String, ClientSelectionState>()
+    private val cachedInputs = ConcurrentHashMap<String, CachedSurfaceInputs>()
+    private val viewportSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
     private val revisionCounter = AtomicLong(10L)
 
     fun isSimulatedHost(machine: HostMachine): Boolean {
@@ -167,9 +175,30 @@ internal class RealHerdrSshClient(
     fun disconnect(machineId: String) {
         pollJobs.remove(machineId)?.cancel()
         selectionState.remove(machineId)
+        cachedInputs.remove(machineId)
+        viewportSizes.remove(machineId)
         sessions.remove(machineId)?.let { session ->
             runCatching { session.disconnect() }
         }
+    }
+
+    fun resizeViewport(
+        machineId: String,
+        cols: UShort,
+        rows: UShort,
+    ) {
+        val targetCols = cols.toInt().coerceIn(20, 300)
+        val targetRows = rows.toInt().coerceIn(8, 150)
+        val prev = viewportSizes.put(machineId, targetCols to targetRows)
+        if (prev == (targetCols to targetRows)) return
+        val cached = cachedInputs[machineId] ?: return
+        val frame = buildCompositeSurfaceFrame(
+            machineId = machineId,
+            snapshot = cached.snapshot,
+            layout = cached.layout,
+            ansiByPane = cached.ansiByPane,
+        )
+        paneSurfaceBus.publish(machineId, frame)
     }
 
     suspend fun refreshSnapshotAndSurface(
@@ -264,6 +293,12 @@ internal class RealHerdrSshClient(
                 }
             }
         }
+
+        cachedInputs[machine.id] = CachedSurfaceInputs(
+            snapshot = parsed.snapshot,
+            layout = activeLayout,
+            ansiByPane = ansiByPane,
+        )
 
         val frame = buildCompositeSurfaceFrame(
             machineId = machine.id,
@@ -464,17 +499,17 @@ internal class RealHerdrSshClient(
             ClientKeyCode.PageUp -> "PageUp"
             ClientKeyCode.PageDown -> "PageDown"
             ClientKeyCode.Delete -> "Delete"
-            ClientKeyCode.CharC -> if (ev.ctrl) "C-c" else "c"
-            ClientKeyCode.CharB -> if (ev.ctrl) "C-b" else "b"
-            ClientKeyCode.CharD -> if (ev.ctrl) "C-d" else "d"
-            ClientKeyCode.CharZ -> if (ev.ctrl) "C-z" else "z"
+            ClientKeyCode.CharC -> "c"
+            ClientKeyCode.CharB -> "b"
+            ClientKeyCode.CharD -> "d"
+            ClientKeyCode.CharZ -> "z"
             ClientKeyCode.CharY -> "y"
             ClientKeyCode.CharN -> "n"
         }
-        if (base.startsWith("C-")) return base
         return buildString {
-            if (ev.ctrl) append("C-")
-            if (ev.alt) append("M-")
+            if (ev.ctrl) append("ctrl+")
+            if (ev.alt) append("alt+")
+            if (ev.shift && base.length > 1) append("shift+")
             append(base)
         }
     }
@@ -759,7 +794,7 @@ internal class RealHerdrSshClient(
         layout: PaneLayoutSnapshot?,
         ansiByPane: Map<String, String>,
     ): PaneSurfaceFrame {
-        val layoutPanes = layout?.panes?.takeIf { it.isNotEmpty() } ?: run {
+        val rawLayoutPanes = layout?.panes?.takeIf { it.isNotEmpty() } ?: run {
             val fallbackPaneId = snapshot.focusedPaneId ?: snapshot.panes.firstOrNull()?.paneId ?: "w1:p1"
             listOf(
                 PaneLayoutPane(
@@ -770,8 +805,34 @@ internal class RealHerdrSshClient(
             )
         }
 
-        val totalCols = layoutPanes.maxOf { (it.rect.x + it.rect.width).toInt() }.coerceIn(40, 240)
-        val totalRows = layoutPanes.maxOf { (it.rect.y + it.rect.height).toInt() }.coerceIn(12, 120)
+        val rawTotalCols = rawLayoutPanes.maxOf { (it.rect.x + it.rect.width).toInt() }.coerceIn(20, 300)
+        val rawTotalRows = rawLayoutPanes.maxOf { (it.rect.y + it.rect.height).toInt() }.coerceIn(8, 150)
+        val customViewport = viewportSizes[machineId]
+        val totalCols = customViewport?.first ?: rawTotalCols
+        val totalRows = customViewport?.second ?: rawTotalRows
+
+        fun scaleRect(r: SurfaceRect): SurfaceRect {
+            if (totalCols == rawTotalCols && totalRows == rawTotalRows) return r
+            val sx = ((r.x.toInt() * totalCols) / rawTotalCols).coerceIn(0, totalCols - 1)
+            val sy = ((r.y.toInt() * totalRows) / rawTotalRows).coerceIn(0, totalRows - 1)
+            val ex = (((r.x.toInt() + r.width.toInt()) * totalCols) / rawTotalCols).coerceIn(sx + 1, totalCols)
+            val ey = (((r.y.toInt() + r.height.toInt()) * totalRows) / rawTotalRows).coerceIn(sy + 1, totalRows)
+            return SurfaceRect(
+                x = sx.toUShort(),
+                y = sy.toUShort(),
+                width = (ex - sx).toUShort(),
+                height = (ey - sy).toUShort(),
+            )
+        }
+
+        val layoutPanes = rawLayoutPanes.map { lp ->
+            lp.copy(rect = scaleRect(lp.rect))
+        }
+        val scaledLayout = layout?.copy(
+            panes = layoutPanes,
+            splits = layout.splits.map { sp -> sp.copy(rect = scaleRect(sp.rect)) },
+        )
+
         val grid = Array(totalCols * totalRows) { CellData() }
 
         var focusedCursor: CursorState? = null
@@ -802,7 +863,7 @@ internal class RealHerdrSshClient(
                 rect = lp.rect,
                 innerRect = lp.rect,
                 focused = isFocused,
-                zoomed = layout?.zoomed == true,
+                zoomed = scaledLayout?.zoomed == true,
                 title = agentMeta?.displayAgent?.takeIf { it.isNotBlank() }
                     ?: paneMeta?.label
                     ?: lp.paneId,
@@ -813,11 +874,11 @@ internal class RealHerdrSshClient(
             )
         }
 
-        val splits = if (layout != null) deriveSplitsFromLayout(layout) else emptyList()
+        val splits = if (scaledLayout != null) deriveSplitsFromLayout(scaledLayout) else emptyList()
 
         return PaneSurfaceFrame(
             bootId = snapshot.bootId,
-            revision = snapshot.revision,
+            revision = revisionCounter.incrementAndGet().toULong(),
             frame = FrameData(
                 width = totalCols.toUShort(),
                 height = totalRows.toUShort(),
@@ -830,8 +891,9 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Parses ANSI SGR escape sequences (`\u001b[...m`) in [ansiText] and populates [grid]
-     * inside [rect], returning the final `(col, row)` cursor coordinates.
+     * Parses ANSI SGR and cursor escape sequences in [ansiText], wraps lines cleanly to [rect.width]
+     * (clamping horizontal box-drawing divider lines to 1 row), and populates [grid] inside [rect],
+     * returning the final `(col, row)` cursor coordinates.
      */
     private fun renderAnsiIntoRect(
         ansiText: String,
@@ -846,32 +908,33 @@ internal class RealHerdrSshClient(
         val maxH = rect.height.toInt().coerceAtLeast(1)
         val endX = min(gridCols, startX + maxW)
         val endY = min(gridRows, startY + maxH)
+        val usableW = (endX - startX).coerceAtLeast(1)
+        val usableH = (endY - startY).coerceAtLeast(1)
 
-        // Split lines and keep the bottom-most maxH visible lines if the output is longer than maxH
         val rawLines = ansiText.replace("\r\n", "\n").split('\n')
-        val visibleLines = if (rawLines.size > maxH) {
-            rawLines.takeLast(maxH)
-        } else {
-            rawLines
-        }
 
         var fg: UInt = 0u
         var bg: UInt = 0u
         var mod: UShort = 0u
-        var lastCol = startX
-        var lastRow = startY
 
-        for (lineIdx in visibleLines.indices) {
-            val row = startY + lineIdx
-            if (row >= endY) break
-            val line = visibleLines[lineIdx]
-            var col = startX
+        val wrappedRows = ArrayList<List<CellData>>(rawLines.size + 16)
+
+        for (line in rawLines) {
+            val lineCells = ArrayList<CellData>(min(line.length.coerceAtLeast(16), 256))
+            var col = 0
             var i = 0
+            val maxLineCols = 512
+
+            fun ensureCol(targetCol: Int) {
+                while (lineCells.size < targetCol && lineCells.size < maxLineCols) {
+                    lineCells.add(CellData())
+                }
+            }
+
             while (i < line.length) {
                 val ch = line[i]
                 if (ch == '\u001b') {
                     if (i + 1 < line.length && line[i + 1] == '[') {
-                        // CSI sequence: \u001b[ ... <final byte 0x40..0x7E>
                         var j = i + 2
                         while (j < line.length && line[j].code !in 0x40..0x7E) {
                             j++
@@ -879,17 +942,42 @@ internal class RealHerdrSshClient(
                         if (j < line.length) {
                             val finalChar = line[j]
                             val paramsStr = line.substring(i + 2, j)
-                            if (finalChar == 'm') {
-                                val sgrState = applySgrCodes(paramsStr, fg, bg, mod)
-                                fg = sgrState.first
-                                bg = sgrState.second
-                                mod = sgrState.third
+                            when (finalChar) {
+                                'm' -> {
+                                    val sgrState = applySgrCodes(paramsStr, fg, bg, mod)
+                                    fg = sgrState.first
+                                    bg = sgrState.second
+                                    mod = sgrState.third
+                                }
+                                'C' -> {
+                                    val n = paramsStr.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                                    col = (col + n).coerceAtMost(maxLineCols)
+                                    ensureCol(col)
+                                }
+                                'D' -> {
+                                    val n = paramsStr.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                                    col = (col - n).coerceAtLeast(0)
+                                }
+                                'G' -> {
+                                    val n = paramsStr.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                                    col = (n - 1).coerceIn(0, maxLineCols)
+                                    ensureCol(col)
+                                }
+                                'K' -> {
+                                    val mode = paramsStr.toIntOrNull() ?: 0
+                                    if (mode == 0 && col < lineCells.size) {
+                                        while (lineCells.size > col) {
+                                            lineCells.removeAt(lineCells.lastIndex)
+                                        }
+                                    } else if (mode == 2) {
+                                        lineCells.clear()
+                                    }
+                                }
                             }
                             i = j + 1
                             continue
                         }
                     } else if (i + 1 < line.length && line[i + 1] == ']') {
-                        // OSC sequence: skip until BEL (\u0007) or ST (\u001b\\)
                         var j = i + 2
                         while (j < line.length && line[j] != '\u0007') {
                             if (line[j] == '\u001b' && j + 1 < line.length && line[j + 1] == '\\') {
@@ -906,33 +994,127 @@ internal class RealHerdrSshClient(
                 }
 
                 if (ch == '\r') {
-                    col = startX
+                    col = 0
                     i++
                     continue
                 }
                 if (ch == '\t') {
-                    val nextStop = startX + (((col - startX) / 4) + 1) * 4
-                    col = min(endX - 1, nextStop)
+                    val nextStop = ((col / 4) + 1) * 4
+                    col = nextStop.coerceAtMost(maxLineCols)
+                    ensureCol(col)
                     i++
                     continue
                 }
-                if (ch.code < 32) {
+                if (ch == '\b') {
+                    col = max(0, col - 1)
                     i++
                     continue
                 }
 
-                if (col < endX && row < endY) {
-                    grid[row * gridCols + col] = CellData(
-                        symbol = ch.toString(),
+                val cp = Character.codePointAt(line, i)
+                val charCount = Character.charCount(cp)
+                if (cp < 32 || cp == 0x7F) {
+                    i += charCount
+                    continue
+                }
+
+                val charType = Character.getType(cp)
+                val isZeroWidth = cp in 0xFE00..0xFE0F ||
+                    cp == 0x200B ||
+                    cp == 0x200C ||
+                    cp == 0x200D ||
+                    charType == Character.NON_SPACING_MARK.toInt() ||
+                    charType == Character.ENCLOSING_MARK.toInt() ||
+                    charType == Character.FORMAT.toInt()
+                if (isZeroWidth) {
+                    i += charCount
+                    continue
+                }
+
+                if (col < maxLineCols) {
+                    ensureCol(col)
+                    val cell = CellData(
+                        symbol = String(Character.toChars(cp)),
                         fg = fg,
                         bg = bg,
                         modifier = mod,
                     )
+                    if (col < lineCells.size) {
+                        lineCells[col] = cell
+                    } else {
+                        lineCells.add(cell)
+                    }
+                    col++
+                }
+                i += charCount
+            }
+
+            // Trim trailing unstyled spaces so padding doesn't wrap into blank rows
+            while (lineCells.isNotEmpty()) {
+                val tail = lineCells.last()
+                if ((tail.symbol.isEmpty() || tail.symbol == " ") && tail.bg == 0u && tail.modifier == 0u.toUShort()) {
+                    lineCells.removeAt(lineCells.lastIndex)
+                } else {
+                    break
+                }
+            }
+
+            if (lineCells.size <= usableW) {
+                wrappedRows.add(lineCells)
+            } else {
+                // Check if this row is predominantly a horizontal rule (──────)
+                var nonSpaceCount = 0
+                var hLineCount = 0
+                for (c in lineCells) {
+                    val s = c.symbol
+                    if (s.isNotEmpty() && s != " ") {
+                        nonSpaceCount++
+                        val code = s[0].code
+                        if (code in 0x2500..0x2509 || code == 0x254C || code == 0x254D || code == 0x2550 || code == '-'.code || code == '='.code) {
+                            hLineCount++
+                        }
+                    }
+                }
+                val isHorizontalDivider = nonSpaceCount >= 8 && hLineCount * 4 >= nonSpaceCount * 3
+                if (isHorizontalDivider) {
+                    wrappedRows.add(lineCells.subList(0, usableW))
+                } else {
+                    var offset = 0
+                    while (offset < lineCells.size) {
+                        val end = min(lineCells.size, offset + usableW)
+                        wrappedRows.add(lineCells.subList(offset, end))
+                        offset = end
+                    }
+                }
+            }
+        }
+
+        // Trim trailing empty rows at the very bottom if they exceed usableH, then take the last usableH rows
+        while (wrappedRows.size > usableH && wrappedRows.last().isEmpty()) {
+            wrappedRows.removeAt(wrappedRows.lastIndex)
+        }
+        val visibleRows = if (wrappedRows.size > usableH) {
+            wrappedRows.takeLast(usableH)
+        } else {
+            wrappedRows
+        }
+
+        var lastCol = startX
+        var lastRow = startY
+
+        for (rowIdx in visibleRows.indices) {
+            val row = startY + rowIdx
+            if (row >= endY) break
+            val rowCells = visibleRows[rowIdx]
+            for (colIdx in rowCells.indices) {
+                val col = startX + colIdx
+                if (col >= endX) break
+                val cell = rowCells[colIdx]
+                grid[row * gridCols + col] = cell
+                if (cell.symbol.isNotEmpty() && cell.symbol != " ") {
                     lastCol = col
                     lastRow = row
                 }
-                col++
-                i++
             }
         }
         return min(endX - 1, lastCol + 1) to lastRow
@@ -947,13 +1129,27 @@ internal class RealHerdrSshClient(
         if (paramsStr.isEmpty()) {
             return Triple(0u, 0u, 0u)
         }
-        val codes = paramsStr.split(';').map { it.toIntOrNull() ?: 0 }
+        val rawTokens = paramsStr.split(';')
         var fg = currentFg
         var bg = currentBg
         var mod = currentMod.toInt()
         var idx = 0
-        while (idx < codes.size) {
-            when (val c = codes[idx]) {
+        while (idx < rawTokens.size) {
+            val token = rawTokens[idx]
+            if (token.contains(':')) {
+                val sub = token.split(':')
+                val mainCode = sub.firstOrNull()?.toIntOrNull() ?: -1
+                if (mainCode == 4) {
+                    when (sub.getOrNull(1)?.toIntOrNull() ?: 1) {
+                        0 -> mod = mod and (0x0008 or 0x0010).inv()
+                        3 -> mod = mod or 0x0010
+                        else -> mod = mod or 0x0008
+                    }
+                }
+                idx++
+                continue
+            }
+            when (val c = if (token.isEmpty()) 0 else (token.toIntOrNull() ?: -1)) {
                 0 -> {
                     fg = 0u
                     bg = 0u
@@ -967,7 +1163,7 @@ internal class RealHerdrSshClient(
                 9 -> mod = mod or 0x0100
                 22 -> mod = mod and (0x0001 or 0x0002).inv()
                 23 -> mod = mod and 0x0004.inv()
-                24 -> mod = mod and 0x0008.inv()
+                24 -> mod = mod and (0x0008 or 0x0010).inv()
                 27 -> mod = mod and 0x0040.inv()
                 29 -> mod = mod and 0x0100.inv()
                 in 30..37 -> fg = 0x01_00_00_00u or (c - 30).toUInt()
@@ -977,28 +1173,39 @@ internal class RealHerdrSshClient(
                 in 90..97 -> fg = 0x01_00_00_00u or (c - 90 + 8).toUInt()
                 in 100..107 -> bg = 0x01_00_00_00u or (c - 100 + 8).toUInt()
                 38 -> {
-                    if (idx + 2 < codes.size && codes[idx + 1] == 5) {
-                        val n = codes[idx + 2].coerceIn(0, 255)
+                    val mode = rawTokens.getOrNull(idx + 1)?.toIntOrNull()
+                    if (mode == 5 && idx + 2 < rawTokens.size) {
+                        val n = (rawTokens[idx + 2].toIntOrNull() ?: 0).coerceIn(0, 255)
                         fg = 0x01_00_00_00u or n.toUInt()
                         idx += 2
-                    } else if (idx + 4 < codes.size && codes[idx + 1] == 2) {
-                        val r = codes[idx + 2].coerceIn(0, 255)
-                        val g = codes[idx + 3].coerceIn(0, 255)
-                        val b = codes[idx + 4].coerceIn(0, 255)
+                    } else if (mode == 2 && idx + 4 < rawTokens.size) {
+                        val r = (rawTokens[idx + 2].toIntOrNull() ?: 0).coerceIn(0, 255)
+                        val g = (rawTokens[idx + 3].toIntOrNull() ?: 0).coerceIn(0, 255)
+                        val b = (rawTokens[idx + 4].toIntOrNull() ?: 0).coerceIn(0, 255)
                         fg = 0x02_00_00_00u or (r.toUInt() shl 16) or (g.toUInt() shl 8) or b.toUInt()
                         idx += 4
                     }
                 }
                 48 -> {
-                    if (idx + 2 < codes.size && codes[idx + 1] == 5) {
-                        val n = codes[idx + 2].coerceIn(0, 255)
+                    val mode = rawTokens.getOrNull(idx + 1)?.toIntOrNull()
+                    if (mode == 5 && idx + 2 < rawTokens.size) {
+                        val n = (rawTokens[idx + 2].toIntOrNull() ?: 0).coerceIn(0, 255)
                         bg = 0x01_00_00_00u or n.toUInt()
                         idx += 2
-                    } else if (idx + 4 < codes.size && codes[idx + 1] == 2) {
-                        val r = codes[idx + 2].coerceIn(0, 255)
-                        val g = codes[idx + 3].coerceIn(0, 255)
-                        val b = codes[idx + 4].coerceIn(0, 255)
+                    } else if (mode == 2 && idx + 4 < rawTokens.size) {
+                        val r = (rawTokens[idx + 2].toIntOrNull() ?: 0).coerceIn(0, 255)
+                        val g = (rawTokens[idx + 3].toIntOrNull() ?: 0).coerceIn(0, 255)
+                        val b = (rawTokens[idx + 4].toIntOrNull() ?: 0).coerceIn(0, 255)
                         bg = 0x02_00_00_00u or (r.toUInt() shl 16) or (g.toUInt() shl 8) or b.toUInt()
+                        idx += 4
+                    }
+                }
+                58 -> {
+                    // Underline color: consume its arguments so they aren't misinterpreted
+                    val mode = rawTokens.getOrNull(idx + 1)?.toIntOrNull()
+                    if (mode == 5 && idx + 2 < rawTokens.size) {
+                        idx += 2
+                    } else if (mode == 2 && idx + 4 < rawTokens.size) {
                         idx += 4
                     }
                 }

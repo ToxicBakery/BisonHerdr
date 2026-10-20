@@ -3,9 +3,14 @@ package com.toxicbakery.app.bison.common.terminal
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -25,9 +30,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -124,10 +132,30 @@ fun TerminalSurfaceCanvas(
 ) {
     val palette = LocalBisonPalette.current
     val density = LocalDensity.current
-    val textMeasurer = rememberTextMeasurer(cacheSize = 512)
+    val textMeasurer = rememberTextMeasurer(cacheSize = 2048)
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     var imeBuffer by remember { mutableStateOf(TextFieldValue(text = " ", selection = TextRange(1))) }
+
+    var liveFontSizeSp by remember { mutableFloatStateOf(fontSizeSp.coerceIn(7f, 28f)) }
+    var lastDispatchedFontSizeSp by remember { mutableFloatStateOf(fontSizeSp.coerceIn(7f, 28f)) }
+    var zoomIndicatorPulse by remember { mutableIntStateOf(0) }
+    var showZoomIndicator by remember { mutableStateOf(false) }
+
+    LaunchedEffect(fontSizeSp) {
+        if (abs(fontSizeSp - lastDispatchedFontSizeSp) > 0.35f) {
+            liveFontSizeSp = fontSizeSp.coerceIn(7f, 28f)
+            lastDispatchedFontSizeSp = liveFontSizeSp
+        }
+    }
+
+    LaunchedEffect(zoomIndicatorPulse) {
+        if (zoomIndicatorPulse > 0) {
+            showZoomIndicator = true
+            delay(1_400L)
+            showZoomIndicator = false
+        }
+    }
 
     LaunchedEffect(keyboardTriggerCount) {
         if (keyboardTriggerCount > 0) {
@@ -136,19 +164,19 @@ fun TerminalSurfaceCanvas(
         }
     }
 
-    val baseTextStyle = remember(fontSizeSp, palette.text) {
+    val baseTextStyle = remember(liveFontSizeSp, palette.text) {
         TextStyle(
             fontFamily = FontFamily.Monospace,
-            fontSize = fontSizeSp.sp,
+            fontSize = liveFontSizeSp.sp,
             color = palette.text,
-            lineHeight = (fontSizeSp * 1.28f).sp,
+            lineHeight = liveFontSizeSp.sp,
         )
     }
 
     val measuredCell = remember(baseTextStyle, density) {
         val result = textMeasurer.measure("M", style = baseTextStyle)
-        val w = max(result.size.width, 8)
-        val h = max(result.size.height, 14)
+        val w = max(result.size.width, 6)
+        val h = max(result.size.height, 10)
         w to h
     }
     val cellWidthPx = measuredCell.first
@@ -179,6 +207,39 @@ fun TerminalSurfaceCanvas(
         val frameRows = (surfaceFrame?.rows?.toInt()?.takeIf { it > 0 } ?: computedRows.toInt())
         val effectiveCellWidth = if (frameCols > 0) canvasWidthPx / frameCols else cellWidthPx.toFloat()
         val effectiveCellHeight = if (frameRows > 0) canvasHeightPx / frameRows else cellHeightPx.toFloat()
+
+        // Scale the monospace font size to fit strictly inside (effectiveCellWidth x effectiveCellHeight)
+        // so rows and columns never overlap regardless of the remote pane's column/row dimensions.
+        val renderTextStyle = remember(
+            liveFontSizeSp,
+            effectiveCellWidth,
+            effectiveCellHeight,
+            cellWidthPx,
+            cellHeightPx,
+            palette.text,
+        ) {
+            val widthScale = (effectiveCellWidth * 0.98f) / cellWidthPx.toFloat()
+            val heightScale = (effectiveCellHeight * 1.18f) / cellHeightPx.toFloat()
+            val scale = min(widthScale, heightScale).coerceIn(0.25f, 3.0f)
+            val scaledSp = (liveFontSizeSp * scale).coerceIn(4.5f, 40f)
+            TextStyle(
+                fontFamily = FontFamily.Monospace,
+                fontSize = scaledSp.sp,
+                color = palette.text,
+                lineHeight = scaledSp.sp,
+            )
+        }
+
+        val currentSurfaceFrame by rememberUpdatedState(surfaceFrame)
+        val currentEffectiveCellWidth by rememberUpdatedState(effectiveCellWidth)
+        val currentEffectiveCellHeight by rememberUpdatedState(effectiveCellHeight)
+        val currentFrameCols by rememberUpdatedState(frameCols)
+        val currentFrameRows by rememberUpdatedState(frameRows)
+        val currentOnPaneFocus by rememberUpdatedState(onPaneFocus)
+        val currentOnPaneZoomToggle by rememberUpdatedState(onPaneZoomToggle)
+        val currentOnFontSizeChange by rememberUpdatedState(onFontSizeChange)
+        val currentOnPaneScroll by rememberUpdatedState(onPaneScroll)
+        val currentOnSelectionChanged by rememberUpdatedState(onSelectionChanged)
 
         // Hidden IME receiver so tapping the terminal or pressing keys types directly into the focused pane
         BasicTextField(
@@ -289,37 +350,37 @@ fun TerminalSurfaceCanvas(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(surfaceFrame, effectiveCellWidth, effectiveCellHeight) {
+                .pointerInput(Unit) {
                     detectTapGestures(
                         onTap = { offset ->
                             activeSelection = null
-                            onSelectionChanged(null)
-                            val col = (offset.x / effectiveCellWidth).toInt()
-                            val row = (offset.y / effectiveCellHeight).toInt()
-                            val tappedPane = surfaceFrame?.panes?.firstOrNull { pane ->
+                            currentOnSelectionChanged(null)
+                            val col = (offset.x / currentEffectiveCellWidth).toInt()
+                            val row = (offset.y / currentEffectiveCellHeight).toInt()
+                            val tappedPane = currentSurfaceFrame?.panes?.firstOrNull { pane ->
                                 pane.rect.contains(col, row)
                             }
                             if (tappedPane != null && !tappedPane.focused) {
-                                onPaneFocus(tappedPane.paneId)
+                                currentOnPaneFocus(tappedPane.paneId)
                             }
                             runCatching { focusRequester.requestFocus() }
                             keyboardController?.show()
                         },
                         onDoubleTap = { offset ->
-                            val col = (offset.x / effectiveCellWidth).toInt()
-                            val row = (offset.y / effectiveCellHeight).toInt()
-                            val tappedPane = surfaceFrame?.panes?.firstOrNull { pane ->
+                            val col = (offset.x / currentEffectiveCellWidth).toInt()
+                            val row = (offset.y / currentEffectiveCellHeight).toInt()
+                            val tappedPane = currentSurfaceFrame?.panes?.firstOrNull { pane ->
                                 pane.rect.contains(col, row)
-                            } ?: surfaceFrame?.panes?.firstOrNull { it.focused }
+                            } ?: currentSurfaceFrame?.panes?.firstOrNull { it.focused }
                             if (tappedPane != null) {
-                                onPaneZoomToggle(tappedPane.paneId)
+                                currentOnPaneZoomToggle(tappedPane.paneId)
                             }
                         },
                         onLongPress = { offset ->
-                            val col = (offset.x / effectiveCellWidth).toInt().coerceIn(0, frameCols - 1)
-                            val row = (offset.y / effectiveCellHeight).toInt().coerceIn(0, frameRows - 1)
-                            val pane = surfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
-                                ?: surfaceFrame?.panes?.firstOrNull { it.focused }
+                            val col = (offset.x / currentEffectiveCellWidth).toInt().coerceIn(0, currentFrameCols - 1)
+                            val row = (offset.y / currentEffectiveCellHeight).toInt().coerceIn(0, currentFrameRows - 1)
+                            val pane = currentSurfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
+                                ?: currentSurfaceFrame?.panes?.firstOrNull { it.focused }
                             if (pane != null) {
                                 val startCol = max(pane.innerRect.x.toInt(), col - 4)
                                 val endCol = min(
@@ -334,33 +395,58 @@ fun TerminalSurfaceCanvas(
                                     endRow = row,
                                 )
                                 activeSelection = selection
-                                onSelectionChanged(selection)
+                                currentOnSelectionChanged(selection)
                             }
                         },
                     )
                 }
-                .pointerInput(surfaceFrame, fontSizeSp, effectiveCellHeight) {
-                    detectTransformGestures { centroid, pan, zoom, _ ->
-                        if (abs(zoom - 1f) > 0.025f) {
-                            val updatedFontSize = (fontSizeSp * zoom).coerceIn(8f, 28f)
-                            if (abs(updatedFontSize - fontSizeSp) >= 0.25f) {
-                                onFontSizeChange(updatedFontSize)
-                            }
-                        } else if (abs(pan.y) > abs(pan.x) && abs(pan.y) > 2f) {
-                            scrollAccumulatorPx += pan.y
-                            val lineDelta = (scrollAccumulatorPx / effectiveCellHeight).toInt()
-                            if (lineDelta != 0) {
-                                scrollAccumulatorPx -= lineDelta * effectiveCellHeight
-                                val col = (centroid.x / effectiveCellWidth).toInt()
-                                val row = (centroid.y / effectiveCellHeight).toInt()
-                                val targetPane = surfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
-                                    ?: surfaceFrame?.panes?.firstOrNull { it.focused }
-                                if (targetPane != null) {
-                                    val currentOffset = targetPane.scroll.offsetFromBottom.toInt()
-                                    val nextOffset = (currentOffset + lineDelta).coerceAtLeast(0)
-                                    onPaneScroll(targetPane.paneId, nextOffset)
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        var isPinching = false
+                        do {
+                            val event = awaitPointerEvent()
+                            val pressedCount = event.changes.count { it.pressed }
+                            if (pressedCount >= 2) {
+                                isPinching = true
+                                val zoomChange = event.calculateZoom()
+                                if (abs(zoomChange - 1f) > 0.002f) {
+                                    val updated = (liveFontSizeSp * zoomChange).coerceIn(7f, 28f)
+                                    liveFontSizeSp = updated
+                                    zoomIndicatorPulse++
+                                    if (abs(updated - lastDispatchedFontSizeSp) >= 0.15f) {
+                                        lastDispatchedFontSizeSp = updated
+                                        currentOnFontSizeChange(updated)
+                                    }
+                                }
+                                event.changes.forEach { it.consume() }
+                            } else if (!isPinching && pressedCount == 1) {
+                                val pan = event.calculatePan()
+                                if (abs(pan.y) > abs(pan.x) && abs(pan.y) > 3f) {
+                                    scrollAccumulatorPx += pan.y
+                                    val cellH = currentEffectiveCellHeight.coerceAtLeast(8f)
+                                    val lineDelta = (scrollAccumulatorPx / cellH).toInt()
+                                    if (lineDelta != 0) {
+                                        scrollAccumulatorPx -= lineDelta * cellH
+                                        val centroid = event.calculateCentroid(useCurrent = true)
+                                        val col = (centroid.x / currentEffectiveCellWidth).toInt()
+                                        val row = (centroid.y / cellH).toInt()
+                                        val targetPane = currentSurfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
+                                            ?: currentSurfaceFrame?.panes?.firstOrNull { it.focused }
+                                        if (targetPane != null) {
+                                            val currentOffset = targetPane.scroll.offsetFromBottom.toInt()
+                                            val nextOffset = (currentOffset + lineDelta).coerceAtLeast(0)
+                                            currentOnPaneScroll(targetPane.paneId, nextOffset)
+                                        }
+                                        event.changes.forEach { it.consume() }
+                                    }
                                 }
                             }
+                        } while (event.changes.any { it.pressed })
+
+                        if (isPinching && abs(liveFontSizeSp - lastDispatchedFontSizeSp) > 0.01f) {
+                            lastDispatchedFontSizeSp = liveFontSizeSp
+                            currentOnFontSizeChange(liveFontSizeSp)
                         }
                     }
                 }
@@ -372,7 +458,7 @@ fun TerminalSurfaceCanvas(
                     frame = surfaceFrame.frame,
                     cellWidth = effectiveCellWidth,
                     cellHeight = effectiveCellHeight,
-                    baseTextStyle = baseTextStyle,
+                    baseTextStyle = renderTextStyle,
                     textMeasurer = textMeasurer,
                     palette = palette,
                     predictiveEchoUnderlines = predictiveEchoUnderlines,
@@ -521,6 +607,88 @@ fun TerminalSurfaceCanvas(
             }
         }
 
+        // Live Pinch-to-Zoom text size indicator pill
+        if (showZoomIndicator) {
+            val zoomPercent = ((liveFontSizeSp / 13f) * 100f).roundToInt()
+            val roundedSp = ((liveFontSizeSp * 10f).roundToInt() / 10f)
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 12.dp)
+                    .testTag("zoomIndicatorPill"),
+                shape = RoundedCornerShape(18.dp),
+                color = palette.panelBg.copy(alpha = 0.94f),
+                tonalElevation = 6.dp,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .border(1.dp, palette.accent.copy(alpha = 0.65f), RoundedCornerShape(18.dp))
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "A-",
+                        style = baseTextStyle.copy(
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = palette.accent,
+                        ),
+                        modifier = Modifier
+                            .clickable {
+                                val next = (liveFontSizeSp - 1.5f).coerceIn(7f, 28f)
+                                liveFontSizeSp = next
+                                lastDispatchedFontSizeSp = next
+                                zoomIndicatorPulse++
+                                currentOnFontSizeChange(next)
+                            }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "${roundedSp}sp ($zoomPercent% · ${computedCols}x$computedRows)",
+                        style = baseTextStyle.copy(fontSize = 12.sp, color = palette.text),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "A+",
+                        style = baseTextStyle.copy(
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = palette.accent,
+                        ),
+                        modifier = Modifier
+                            .clickable {
+                                val next = (liveFontSizeSp + 1.5f).coerceIn(7f, 28f)
+                                liveFontSizeSp = next
+                                lastDispatchedFontSizeSp = next
+                                zoomIndicatorPulse++
+                                currentOnFontSizeChange(next)
+                            }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                    if (zoomPercent != 100) {
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            text = "Reset",
+                            style = baseTextStyle.copy(
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = palette.green,
+                            ),
+                            modifier = Modifier
+                                .clickable {
+                                    liveFontSizeSp = 13f
+                                    lastDispatchedFontSizeSp = 13f
+                                    zoomIndicatorPulse++
+                                    currentOnFontSizeChange(13f)
+                                }
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+            }
+        }
+
         // Long-press selection action pill ("Copy Selection" / "Clear")
         val currentSelection = activeSelection
         if (currentSelection != null) {
@@ -588,7 +756,7 @@ private fun DrawScope.drawFrameCells(
     val rows = frame.height.toInt()
     if (cols <= 0 || rows <= 0 || frame.cells.isEmpty()) return
 
-    // Pass 1: Draw non-default cell backgrounds and contiguous runs of characters per row
+    // Pass 1: Draw contiguous cell backgrounds and line decorations per row
     for (row in 0 until rows) {
         val yPx = row * cellHeight
         if (yPx > size.height) break
@@ -605,14 +773,11 @@ private fun DrawScope.drawFrameCells(
             val fgColor = if (cell.isReverse) rawBg else rawFg
             val bgColor = if (cell.isReverse) rawFg else rawBg
 
-            // Group contiguous cells on the same row that share identical styling to minimize draw calls
             var runEnd = col + 1
-            val runBuilder = StringBuilder(cell.symbol.ifEmpty { " " })
             while (runEnd < cols) {
                 val next = frame.cellAt(runEnd, row) ?: break
                 if (next.skip) break
                 if (next.fg != cell.fg || next.bg != cell.bg || next.modifier != cell.modifier) break
-                runBuilder.append(next.symbol.ifEmpty { " " })
                 runEnd++
             }
 
@@ -628,32 +793,25 @@ private fun DrawScope.drawFrameCells(
                 )
             }
 
-            val runText = runBuilder.toString()
-            if (runText.isNotBlank()) {
-                val decorations = buildList {
-                    if (cell.isUnderline || (predictiveEchoUnderlines && cell.isPredictedEcho)) {
-                        add(TextDecoration.Underline)
-                    }
-                    if (cell.isStrikethrough) {
-                        add(TextDecoration.LineThrough)
-                    }
-                }
-                val style = baseTextStyle.copy(
+            if (cell.isUnderline || (predictiveEchoUnderlines && cell.isPredictedEcho)) {
+                val stroke = max(1f, cellHeight * 0.07f)
+                val lineY = yPx + cellHeight - stroke
+                drawLine(
                     color = fgColor,
-                    fontWeight = if (cell.isBold) FontWeight.Bold else FontWeight.Normal,
-                    fontStyle = if (cell.isItalic) FontStyle.Italic else FontStyle.Normal,
-                    textDecoration = if (decorations.isEmpty()) {
-                        TextDecoration.None
-                    } else {
-                        TextDecoration.combine(decorations)
-                    },
+                    start = Offset(xPx, lineY),
+                    end = Offset(xPx + runWidthPx, lineY),
+                    strokeWidth = stroke,
                 )
-                drawText(
-                    textMeasurer = textMeasurer,
-                    text = runText,
-                    topLeft = Offset(xPx, yPx),
-                    style = style,
-                    softWrap = false,
+            }
+
+            if (cell.isStrikethrough) {
+                val stroke = max(1f, cellHeight * 0.07f)
+                val lineY = yPx + cellHeight * 0.52f
+                drawLine(
+                    color = fgColor,
+                    start = Offset(xPx, lineY),
+                    end = Offset(xPx + runWidthPx, lineY),
+                    strokeWidth = stroke,
                 )
             }
 
@@ -668,6 +826,189 @@ private fun DrawScope.drawFrameCells(
 
             col = runEnd
         }
+    }
+
+    // Pass 2: Draw each non-blank cell strictly at its exact (col * cellWidth, row * cellHeight) slot
+    // so variable-width fallback glyphs or font rounding can never accumulate drift or overlap across columns.
+    for (row in 0 until rows) {
+        val yPx = row * cellHeight
+        if (yPx > size.height) break
+        for (col in 0 until cols) {
+            val cell = frame.cellAt(col, row) ?: continue
+            if (cell.skip) continue
+            val symbol = cell.symbol
+            if (symbol.isEmpty() || symbol == " ") continue
+
+            val rawFg = TerminalColorResolver.resolveForeground(cell.fg, palette, isDim = cell.isDim)
+            val rawBg = TerminalColorResolver.resolveBackground(cell.bg, palette)
+            val fgColor = if (cell.isReverse) rawBg else rawFg
+            val xPx = col * cellWidth
+
+            val firstCode = symbol[0].code
+            if (symbol.length == 1 && firstCode in 0x2500..0x259F) {
+                if (drawBoxOrBlockElement(
+                        code = firstCode,
+                        cellX = xPx,
+                        cellY = yPx,
+                        cellWidth = cellWidth,
+                        cellHeight = cellHeight,
+                        color = fgColor,
+                        isBold = cell.isBold,
+                    )
+                ) {
+                    continue
+                }
+            }
+
+            val decorations = buildList {
+                if (cell.isUnderline) add(TextDecoration.None)
+            }
+            val style = baseTextStyle.copy(
+                color = fgColor,
+                fontWeight = if (cell.isBold) FontWeight.Bold else FontWeight.Normal,
+                fontStyle = if (cell.isItalic) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = if (decorations.isEmpty()) TextDecoration.None else TextDecoration.combine(decorations),
+            )
+            val layoutResult = textMeasurer.measure(
+                text = symbol,
+                style = style,
+                softWrap = false,
+                maxLines = 1,
+            )
+            val offsetX = xPx + max(0f, (cellWidth - layoutResult.size.width) * 0.5f)
+            val offsetY = yPx + (cellHeight - layoutResult.size.height) * 0.5f
+            drawText(
+                textLayoutResult = layoutResult,
+                topLeft = Offset(offsetX, offsetY),
+            )
+        }
+    }
+}
+
+private fun DrawScope.drawBoxOrBlockElement(
+    code: Int,
+    cellX: Float,
+    cellY: Float,
+    cellWidth: Float,
+    cellHeight: Float,
+    color: Color,
+    isBold: Boolean,
+): Boolean {
+    val midX = cellX + cellWidth * 0.5f
+    val midY = cellY + cellHeight * 0.5f
+    val rightX = cellX + cellWidth + 0.5f
+    val bottomY = cellY + cellHeight + 0.5f
+    val stroke = if (isBold || code in listOf(0x2501, 0x2503, 0x250F, 0x2513, 0x2517, 0x251B, 0x2523, 0x252B, 0x2533, 0x253B, 0x254B)) {
+        max(1.8f, cellHeight * 0.12f)
+    } else {
+        max(1.1f, cellHeight * 0.07f)
+    }
+
+    fun hLine(x1: Float, x2: Float) {
+        drawLine(color = color, start = Offset(x1, midY), end = Offset(x2, midY), strokeWidth = stroke)
+    }
+    fun vLine(y1: Float, y2: Float) {
+        drawLine(color = color, start = Offset(midX, y1), end = Offset(midX, y2), strokeWidth = stroke)
+    }
+
+    return when (code) {
+        // Horizontal lines
+        0x2500, 0x2501, in 0x2504..0x2509, 0x254C, 0x254D, 0x2550, 0x2574, 0x2576, 0x2578, 0x257A, 0x257C, 0x257E -> {
+            hLine(cellX, rightX)
+            true
+        }
+        // Vertical lines
+        0x2502, 0x2503, 0x2506, 0x2507, 0x250A, 0x250B, 0x254E, 0x254F, 0x2551, 0x2575, 0x2577, 0x2579, 0x257B, 0x257D, 0x257F -> {
+            vLine(cellY, bottomY)
+            true
+        }
+        // Top-left corners (┌ ┏ ╔ ╭)
+        in 0x250C..0x250F, in 0x2552..0x2554, 0x256D -> {
+            hLine(midX, rightX)
+            vLine(midY, bottomY)
+            true
+        }
+        // Top-right corners (┐ ┓ ╗ ╮)
+        in 0x2510..0x2513, in 0x2555..0x2557, 0x256E -> {
+            hLine(cellX, midX)
+            vLine(midY, bottomY)
+            true
+        }
+        // Bottom-left corners (└ ┗ ╚ ╰)
+        in 0x2514..0x2517, in 0x2558..0x255A, 0x2570 -> {
+            vLine(cellY, midY)
+            hLine(midX, rightX)
+            true
+        }
+        // Bottom-right corners (┘ ┛ ╝ ╯)
+        in 0x2518..0x251B, in 0x255B..0x255D, 0x256F -> {
+            vLine(cellY, midY)
+            hLine(cellX, midX)
+            true
+        }
+        // Left tees (├ ┣ ╠)
+        in 0x251C..0x2523, in 0x255E..0x2560 -> {
+            vLine(cellY, bottomY)
+            hLine(midX, rightX)
+            true
+        }
+        // Right tees (┤ ┫ ╣)
+        in 0x2524..0x252B, in 0x2561..0x2563 -> {
+            vLine(cellY, bottomY)
+            hLine(cellX, midX)
+            true
+        }
+        // Top tees (┬ ┳ ╦)
+        in 0x252C..0x2533, in 0x2564..0x2566 -> {
+            hLine(cellX, rightX)
+            vLine(midY, bottomY)
+            true
+        }
+        // Bottom tees (┴ ┻ ╩)
+        in 0x2534..0x253B, in 0x2567..0x2569 -> {
+            hLine(cellX, rightX)
+            vLine(cellY, midY)
+            true
+        }
+        // Crosses (┼ ╋ ╬)
+        in 0x253C..0x254B, in 0x256A..0x256C -> {
+            hLine(cellX, rightX)
+            vLine(cellY, bottomY)
+            true
+        }
+        // Block elements
+        0x2580 -> {
+            drawRect(color = color, topLeft = Offset(cellX, cellY), size = Size(cellWidth + 0.5f, cellHeight * 0.5f))
+            true
+        }
+        in 0x2581..0x2588 -> {
+            val frac = (code - 0x2580).toFloat() / 8f
+            val h = cellHeight * frac
+            drawRect(color = color, topLeft = Offset(cellX, cellY + cellHeight - h), size = Size(cellWidth + 0.5f, h + 0.5f))
+            true
+        }
+        in 0x2589..0x258F -> {
+            val frac = (0x2590 - code).toFloat() / 8f
+            drawRect(color = color, topLeft = Offset(cellX, cellY), size = Size(cellWidth * frac + 0.5f, cellHeight + 0.5f))
+            true
+        }
+        0x2590 -> {
+            drawRect(color = color, topLeft = Offset(midX, cellY), size = Size(cellWidth * 0.5f + 0.5f, cellHeight + 0.5f))
+            true
+        }
+        0x2591 -> {
+            drawRect(color = color.copy(alpha = 0.25f), topLeft = Offset(cellX, cellY), size = Size(cellWidth + 0.5f, cellHeight + 0.5f))
+            true
+        }
+        0x2592 -> {
+            drawRect(color = color.copy(alpha = 0.50f), topLeft = Offset(cellX, cellY), size = Size(cellWidth + 0.5f, cellHeight + 0.5f))
+            true
+        }
+        0x2593 -> {
+            drawRect(color = color.copy(alpha = 0.75f), topLeft = Offset(cellX, cellY), size = Size(cellWidth + 0.5f, cellHeight + 0.5f))
+            true
+        }
+        else -> false
     }
 }
 

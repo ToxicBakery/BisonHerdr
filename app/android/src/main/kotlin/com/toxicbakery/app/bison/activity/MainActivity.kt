@@ -40,6 +40,8 @@ class MainActivity : ComponentActivity(), DIAware {
         installSplashScreen()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
 
         applyFakeServerIntent(intent)
         startSessionService()
