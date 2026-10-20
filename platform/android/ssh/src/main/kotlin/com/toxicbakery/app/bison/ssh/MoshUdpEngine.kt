@@ -63,7 +63,9 @@ class MoshUdpEngine(
         val predictions: MutableList<PredictedCell> = mutableListOf(),
         val screenLines: MutableList<String> = mutableListOf(),
         var channel: DatagramChannel? = null,
-    )
+    ) {
+        val remoteAddress: InetSocketAddress by lazy { InetSocketAddress(host, udpPort) }
+    }
 
     override suspend fun startSession(
         machineId: String,
@@ -130,30 +132,32 @@ class MoshUdpEngine(
         // Apply client-side predictive echo for printable ASCII/UTF-8 input when enabled
         if (state.localEchoEnabled) {
             val text = bytes.decodeToString()
-            for (ch in text) {
-                when {
-                    ch == '\r' || ch == '\n' -> {
-                        state.predictions.clear()
-                        state.cursorCol = 0
-                        state.cursorRow = (state.cursorRow + 1).coerceAtMost(state.rows.toInt() - 1)
-                    }
-
-                    ch == '\u007f' || ch == '\b' -> {
-                        if (state.predictions.isNotEmpty()) {
-                            state.predictions.removeAt(state.predictions.lastIndex)
+            synchronized(state) {
+                for (ch in text) {
+                    when {
+                        ch == '\r' || ch == '\n' -> {
+                            state.predictions.clear()
+                            state.cursorCol = 0
+                            state.cursorRow = (state.cursorRow + 1).coerceAtMost(state.rows.toInt() - 1)
                         }
-                        state.cursorCol = (state.cursorCol - 1).coerceAtLeast(0)
-                    }
 
-                    !ch.isISOControl() -> {
-                        state.predictions.add(
-                            PredictedCell(
-                                col = state.cursorCol,
-                                row = state.cursorRow,
-                                symbol = ch.toString(),
+                        ch == '\u007f' || ch == '\b' -> {
+                            if (state.predictions.isNotEmpty()) {
+                                state.predictions.removeAt(state.predictions.lastIndex)
+                            }
+                            state.cursorCol = (state.cursorCol - 1).coerceAtLeast(0)
+                        }
+
+                        !ch.isISOControl() -> {
+                            state.predictions.add(
+                                PredictedCell(
+                                    col = state.cursorCol,
+                                    row = state.cursorRow,
+                                    symbol = charToSymbol(ch),
+                                )
                             )
-                        )
-                        state.cursorCol = (state.cursorCol + 1).coerceAtMost(state.cols.toInt() - 1)
+                            state.cursorCol = (state.cursorCol + 1).coerceAtMost(state.cols.toInt() - 1)
+                        }
                     }
                 }
             }
@@ -265,16 +269,18 @@ class MoshUdpEngine(
         tabCount: Int = 1,
     ) {
         val state = sessions[machineId] ?: return
-        state.tabCount = tabCount.coerceAtLeast(1)
-        // Strip row 0 (Herdr's 1-row top tab bar) when tabCount > 1 per Part IV.1
-        val effectiveLines = if (state.tabCount > 1 && lines.size > 1) {
-            lines.drop(1)
-        } else {
-            lines
+        synchronized(state) {
+            state.tabCount = tabCount.coerceAtLeast(1)
+            // Strip row 0 (Herdr's 1-row top tab bar) when tabCount > 1 per Part IV.1
+            val effectiveLines = if (state.tabCount > 1 && lines.size > 1) {
+                lines.drop(1)
+            } else {
+                lines
+            }
+            state.screenLines.clear()
+            state.screenLines.addAll(effectiveLines)
+            state.predictions.clear()
         }
-        state.screenLines.clear()
-        state.screenLines.addAll(effectiveLines)
-        state.predictions.clear()
         synthesizeAndPublishFrame(state)
     }
 
@@ -303,7 +309,7 @@ class MoshUdpEngine(
                 .putLong(seq)
                 .put(payload)
             packet.flip()
-            channel.send(packet, InetSocketAddress(state.host, state.udpPort))
+            channel.send(packet, state.remoteAddress)
         }.onFailure { error ->
             // Non-fatal in unit tests or unreachable networks
             log.d(error) { "UDP datagram send on ${state.host}:${state.udpPort} deferred" }
@@ -311,34 +317,49 @@ class MoshUdpEngine(
     }
 
     private fun synthesizeAndPublishFrame(state: MoshSessionState) {
-        val width = state.cols.toInt().coerceAtLeast(1)
-        val height = state.rows.toInt().coerceAtLeast(1)
-        val grid = MutableList(width * height) { CellData() }
+        val cols: UShort
+        val rows: UShort
+        val width: Int
+        val height: Int
+        val cursorCol: Int
+        val cursorRow: Int
+        val layout: PaneLayoutSnapshot?
+        val grid: MutableList<CellData>
 
-        for ((rowIdx, line) in state.screenLines.withIndex()) {
-            if (rowIdx >= height) break
-            for ((colIdx, ch) in line.withIndex()) {
-                if (colIdx >= width) break
-                grid[rowIdx * width + colIdx] = CellData(
-                    symbol = ch.toString(),
-                    fg = CellData.rgbColor(0xEB, 0xDB, 0xB2),
-                )
+        synchronized(state) {
+            cols = state.cols
+            rows = state.rows
+            width = cols.toInt().coerceAtLeast(1)
+            height = rows.toInt().coerceAtLeast(1)
+            cursorCol = state.cursorCol
+            cursorRow = state.cursorRow
+            layout = state.layoutSnapshot
+            grid = MutableList(width * height) { BLANK_CELL }
+
+            for ((rowIdx, line) in state.screenLines.withIndex()) {
+                if (rowIdx >= height) break
+                for ((colIdx, ch) in line.withIndex()) {
+                    if (colIdx >= width) break
+                    grid[rowIdx * width + colIdx] = CellData(
+                        symbol = charToSymbol(ch),
+                        fg = DEFAULT_FG_COLOR,
+                    )
+                }
+            }
+
+            // Overlay tentative client-side predictive echo cells with underline modifier
+            for (pred in state.predictions) {
+                if (pred.row in 0..<height && pred.col in 0..<width) {
+                    val idx = pred.row * width + pred.col
+                    grid[idx] = CellData(
+                        symbol = pred.symbol,
+                        fg = PREDICTED_ECHO_FG_COLOR,
+                        modifier = PREDICTED_ECHO_MODIFIER,
+                    )
+                }
             }
         }
 
-        // Overlay tentative client-side predictive echo cells with underline modifier
-        for (pred in state.predictions) {
-            if (pred.row in 0..<height && pred.col in 0..<width) {
-                val idx = pred.row * width + pred.col
-                grid[idx] = CellData(
-                    symbol = pred.symbol,
-                    fg = CellData.rgbColor(0xD7, 0x99, 0x21),
-                    modifier = (CellData.MOD_UNDERLINE.toInt() or CellData.MOD_PREDICTED_ECHO.toInt()).toUShort(),
-                )
-            }
-        }
-
-        val layout = state.layoutSnapshot
         val splits = if (layout != null) {
             deriveSplitsFromLayout(layout)
         } else {
@@ -350,7 +371,7 @@ class MoshUdpEngine(
                 listOf(
                     PaneSurfacePane(
                         paneId = focusedPane.paneId,
-                        rect = SurfaceRect(0u, 0u, state.cols, state.rows),
+                        rect = SurfaceRect(0u, 0u, cols, rows),
                         focused = true,
                         zoomed = true,
                         title = focusedPane.paneId,
@@ -364,7 +385,7 @@ class MoshUdpEngine(
             listOf(
                 PaneSurfacePane(
                     paneId = "w1:p1",
-                    rect = SurfaceRect(0u, 0u, state.cols, state.rows),
+                    rect = SurfaceRect(0u, 0u, cols, rows),
                     focused = true,
                     title = "${state.machineId} · mosh-ssp",
                     agentStatus = AgentStatus.Idle,
@@ -377,12 +398,12 @@ class MoshUdpEngine(
             bootId = "mosh-${state.machineId}",
             revision = rev,
             frame = FrameData(
-                width = state.cols,
-                height = state.rows,
+                width = cols,
+                height = rows,
                 cells = grid,
                 cursor = CursorState(
-                    x = state.cursorCol.coerceIn(0, width - 1).toUShort(),
-                    y = state.cursorRow.coerceIn(0, height - 1).toUShort(),
+                    x = cursorCol.coerceIn(0, width - 1).toUShort(),
+                    y = cursorRow.coerceIn(0, height - 1).toUShort(),
                     shape = CursorShape.Block,
                     visible = true,
                 ),
@@ -393,17 +414,29 @@ class MoshUdpEngine(
         paneSurfaceBus.publish(state.machineId, frame)
     }
 
+    private fun charToSymbol(ch: Char): String =
+        if (ch.code in 0..<128) ASCII_SYMBOLS[ch.code] else ch.toString()
+
     companion object {
         private const val SSP_HEARTBEAT_FRAME: Byte = 0x01
         private const val SSP_WAKEUP_HEARTBEAT_FRAME: Byte = 0x02
         private const val SSP_RESIZE_FRAME: Byte = 0x03
 
+        private val BLANK_CELL = CellData()
+        private val ASCII_SYMBOLS = Array(128) { it.toChar().toString() }
+        private val DEFAULT_FG_COLOR = CellData.rgbColor(0xEB, 0xDB, 0xB2)
+        private val PREDICTED_ECHO_FG_COLOR = CellData.rgbColor(0xD7, 0x99, 0x21)
+        private val PREDICTED_ECHO_MODIFIER =
+            (CellData.MOD_UNDERLINE.toInt() or CellData.MOD_PREDICTED_ECHO.toInt()).toUShort()
+
         private val log = Arbor.tag("MoshUdpEngine")
 
-        val isNativeLibraryLoaded: Boolean = runCatching {
-            System.loadLibrary("herdr_mobile_core")
-            true
-        }.getOrDefault(false)
+        val isNativeLibraryLoaded: Boolean by lazy {
+            runCatching {
+                System.loadLibrary("herdr_mobile_core")
+                true
+            }.getOrDefault(false)
+        }
     }
 }
 

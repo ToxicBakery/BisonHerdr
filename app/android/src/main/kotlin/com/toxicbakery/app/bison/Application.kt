@@ -8,6 +8,7 @@ import com.toxicbakery.logging.LogCatSeedling
 import org.kodein.di.DI
 import org.kodein.di.DIAware
 import org.kodein.di.bindProvider
+import org.kodein.di.bindSingleton
 import org.kodein.di.instance
 
 class Application : android.app.Application(), DIAware {
@@ -19,7 +20,7 @@ class Application : android.app.Application(), DIAware {
         import(appModule)
 
         // Inject Android-specific StoreIOProvider
-        bindProvider<StoreIOProvider>(overrides = true) {
+        bindSingleton<StoreIOProvider>(overrides = true) {
             StoreIOProviderAndroid(
                 context = instance<Application>()
             )

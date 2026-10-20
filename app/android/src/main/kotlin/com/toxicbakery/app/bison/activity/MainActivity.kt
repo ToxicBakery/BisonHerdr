@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity(), DIAware {
         setTurnScreenOn(true)
 
         applyFakeServerIntent(intent)
-        startSessionService()
+        window.decorView.post { startSessionService() }
 
         setContent {
             withDI(di) {

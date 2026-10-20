@@ -10,5 +10,5 @@ val appJson: Json = Json {
     ignoreUnknownKeys = true
     coerceInputValues = true
     encodeDefaults = true
-    prettyPrint = true
+    prettyPrint = false
 }

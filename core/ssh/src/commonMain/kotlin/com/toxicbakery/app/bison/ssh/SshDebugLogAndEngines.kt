@@ -42,7 +42,16 @@ class SshDebugLog(
             isError = isError,
         )
         _entries.update { current ->
-            (current + entry).takeLast(maxEntries)
+            if (maxEntries <= 0) {
+                emptyList()
+            } else if (current.size < maxEntries) {
+                current + entry
+            } else {
+                buildList(maxEntries) {
+                    addAll(current.subList(current.size - maxEntries + 1, current.size))
+                    add(entry)
+                }
+            }
         }
     }
 
