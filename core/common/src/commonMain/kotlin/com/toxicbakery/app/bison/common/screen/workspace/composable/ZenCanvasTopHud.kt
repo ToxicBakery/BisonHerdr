@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.toxicbakery.app.bison.common.screen.delegate.FederatedAgentItem
+import com.toxicbakery.app.bison.common.screen.machine.UPDATE_AVAILABLE_TAG
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
@@ -57,6 +58,7 @@ import com.toxicbakery.app.bison.protocol.ClientShellTab
 import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.common_close
+import com.toxicbakery.app.bison.resources.frame_update_available
 import com.toxicbakery.app.bison.resources.hud_agents_pill_label
 import com.toxicbakery.app.bison.resources.hud_pane_close
 import com.toxicbakery.app.bison.resources.hud_pane_zoom_toggle
@@ -103,6 +105,8 @@ fun ZenCanvasTopHud(
     onClosePane: () -> Unit,
     onToggleAgentDrawer: () -> Unit,
     onRequestKeyboard: () -> Unit = {},
+    availableUpdateVersion: String? = null,
+    onAcknowledgeUpdate: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalBisonPalette.current
@@ -297,11 +301,33 @@ fun ZenCanvasTopHud(
                 }
             }
 
-            // Right Action Buttons: Keyboard | Splits | Agents
+            // Right Action Buttons: Update | Keyboard | Splits | Agents
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
             ) {
+                if (availableUpdateVersion != null) {
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onAcknowledgeUpdate() }
+                            .testTag(UPDATE_AVAILABLE_TAG),
+                        shape = RoundedCornerShape(10.dp),
+                        color = palette.accent.copy(alpha = 0.20f),
+                    ) {
+                        Text(
+                            text = "↑ " + stringResource(Res.string.frame_update_available, availableUpdateVersion),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = palette.accent,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            modifier = Modifier
+                                .border(1.dp, palette.accent.copy(alpha = 0.50f), RoundedCornerShape(10.dp))
+                                .padding(horizontal = 8.dp, vertical = 5.dp),
+                        )
+                    }
+                }
+
                 // Soft Keyboard Button
                 Surface(
                     modifier = Modifier

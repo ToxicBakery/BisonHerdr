@@ -26,6 +26,7 @@ import com.toxicbakery.app.bison.common.screen.machine.MachineFederationScreen
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalScreen
 import com.toxicbakery.app.bison.common.theme.BisonTheme
 import com.toxicbakery.app.bison.common.theme.resolveTheme
+import com.toxicbakery.app.bison.common.version.VersionWatcher
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.logging.Arbor
@@ -46,6 +47,7 @@ fun App(
     val navigationController = remember(backStack) { NavigationController(backStack) }
     val machineStore: MachineStore by rememberInstance()
     val appSettingsStore: AppSettingsStore by rememberInstance()
+    val versionWatcher: VersionWatcher by rememberInstance()
     val knownMachinesCount by remember(machineStore) {
         machineStore.knownMachines.map { it.size }.distinctUntilChanged()
     }.collectAsState(initial = 0)
@@ -53,6 +55,10 @@ fun App(
 
     val globalPalette = remember(appSettings.themeId) {
         resolveTheme(globalThemeId = appSettings.themeId, hostOverrideThemeId = null)
+    }
+
+    LaunchedEffect(versionWatcher) {
+        versionWatcher.start(this)
     }
 
     LaunchedEffect(knownMachinesCount) {

@@ -5,6 +5,8 @@ import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewModel
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
+import com.toxicbakery.app.bison.common.version.ReleaseFetcher
+import com.toxicbakery.app.bison.common.version.VersionWatcher
 import com.toxicbakery.app.bison.debug.DebugServer
 import com.toxicbakery.app.bison.debug.NoDebugServer
 import com.toxicbakery.app.bison.fakeserver.fakeServerModule
@@ -77,6 +79,8 @@ class KodeinConnectionFlowE2ETest {
             assertNotNull(direct.instance<AppSettingsStore>())
             assertNotNull(direct.instance<MachineViewModelDelegate>())
             assertNotNull(direct.instance<AgentActionDelegate>())
+            assertNotNull(direct.instance<ReleaseFetcher>())
+            assertNotNull(direct.instance<VersionWatcher>())
             assertEquals(NoDebugServer, direct.instance<DebugServer>())
 
             val configureVmFactory: (String) -> ConfigureMachineViewModel = direct.factory()

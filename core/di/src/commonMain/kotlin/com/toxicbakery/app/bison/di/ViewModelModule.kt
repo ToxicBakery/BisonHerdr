@@ -7,6 +7,8 @@ import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewModel
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
+import com.toxicbakery.app.bison.common.version.ReleaseFetcher
+import com.toxicbakery.app.bison.common.version.VersionWatcher
 import org.kodein.di.DI
 import org.kodein.di.bindFactory
 import org.kodein.di.bindSingleton
@@ -52,6 +54,15 @@ val viewModelModule = DI.Module("viewModelModule") {
             sshRequestManager = instance(),
             semanticNotificationBus = instance(),
             endpointSnapshotBus = instance(),
+        )
+    }
+    bindSingleton<ReleaseFetcher> {
+        ReleaseFetcher.default(json = instance())
+    }
+    bindSingleton {
+        VersionWatcher(
+            appSettings = instance(),
+            releaseFetcher = instance(),
         )
     }
 }
