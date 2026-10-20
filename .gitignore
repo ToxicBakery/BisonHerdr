@@ -34,3 +34,7 @@ Thumbs.db
 # Python bytecode from scripts/ (cut_version.py + its tests)
 __pycache__/
 *.pyc
+
+# Release signing. Git tracks only the encrypted upload keystore.
+/signing/*
+!/signing/upload.keystore.gpg
