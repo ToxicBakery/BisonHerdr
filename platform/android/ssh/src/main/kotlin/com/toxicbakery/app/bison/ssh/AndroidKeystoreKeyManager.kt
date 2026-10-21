@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.logging.Arbor
@@ -8,6 +9,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.math.BigInteger
 import java.security.Key
+import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -154,9 +156,11 @@ class AndroidKeystoreKeyManager {
     /**
      * Returns the stored key for [keyAlias] from [load], or null when the caller must create a key.
      *
-     * - A stored key that is not of [algorithm] is deleted, and the result is null. Earlier versions
-     *   created a P-256 EC key for [KeyAlgorithm.Ed25519], which cannot sign as Ed25519. Such a key
-     *   never worked for SSH, so a new key does not remove a working login.
+     * - Earlier versions created a P-256 EC key with no digests for [KeyAlgorithm.Ed25519], which
+     *   cannot sign as Ed25519. Such a key never worked for SSH, so it is deleted, and the result is
+     *   null. A new key does not remove a working login.
+     * - Any other stored key that is not of [algorithm] causes an [IllegalStateException]. It can be
+     *   the working key of a different machine that uses the same alias, so it is not replaced.
      * - A stored key that does not load causes an [IllegalStateException]. The key is not replaced,
      *   because a new key would stop the logins that use the stored key.
      *
@@ -166,8 +170,12 @@ class AndroidKeystoreKeyManager {
         val stored = load(keyAlias)
         if (stored != null) {
             if (isKeyOfAlgorithm(stored, algorithm)) return stored
+            check(algorithm == KeyAlgorithm.Ed25519 && isLegacyBrokenEd25519Key(keyAlias)) {
+                "The key alias $keyAlias holds a ${stored.algorithm} key, not a ${algorithm.name} key. " +
+                    "Use a different alias for the ${algorithm.name} key."
+            }
             log.w {
-                "Replacing key $keyAlias: it is a ${stored.algorithm} key, not ${algorithm.name}. " +
+                "Replacing key $keyAlias: it is a P-256 key from an earlier version that cannot sign as Ed25519. " +
                     "Add the new public key to authorized_keys."
             }
             deleteKey(keyAlias)
@@ -175,6 +183,21 @@ class AndroidKeystoreKeyManager {
         }
         check(!storedKeyExists(keyAlias)) { "The key $keyAlias exists in AndroidKeyStore but cannot be loaded" }
         return null
+    }
+
+    /**
+     * True for the AndroidKeyStore key that earlier versions made for [KeyAlgorithm.Ed25519]: an EC
+     * key that allows no digests. An [KeyAlgorithm.EcdsaP256] key from this class allows SHA-256.
+     */
+    private fun isLegacyBrokenEd25519Key(keyAlias: String): Boolean {
+        val privateKey = loadPrivateKey(keyAlias) ?: return false
+        if (!privateKey.algorithm.equals(KeyProperties.KEY_ALGORITHM_EC, ignoreCase = true)) return false
+        return runCatching {
+            KeyFactory.getInstance(privateKey.algorithm, ANDROID_KEYSTORE_PROVIDER)
+                .getKeySpec(privateKey, KeyInfo::class.java)
+                .digests
+                .isEmpty()
+        }.getOrDefault(false)
     }
 
     private fun storedKeyExists(keyAlias: String): Boolean =

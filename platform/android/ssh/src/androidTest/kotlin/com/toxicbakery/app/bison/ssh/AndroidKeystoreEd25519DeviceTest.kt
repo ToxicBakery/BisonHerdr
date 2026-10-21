@@ -9,6 +9,7 @@ import java.nio.ByteBuffer
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import org.junit.After
 import org.junit.Assume.assumeTrue
@@ -86,6 +87,18 @@ class AndroidKeystoreEd25519DeviceTest {
 
         assertEquals("EdDSA", storedKeyAlgorithm())
         assertTrue(verifiesWithBouncyCastle(publicKey, CHALLENGE, signature), "The signature does not verify")
+    }
+
+    @Test
+    fun workingEcdsaKeyWithTheSameAliasIsNotReplaced() {
+        keyManager.deleteKey(KEY_ALIAS)
+        val ecdsaLine = keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256).openSshAuthorizedKeyLine
+
+        val error = runCatching { AndroidKeystoreKeyManager().getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.Ed25519) }
+            .exceptionOrNull()
+        assertIs<IllegalStateException>(error)
+        assertEquals(KeyProperties.KEY_ALGORITHM_EC, storedKeyAlgorithm())
+        assertEquals(ecdsaLine, AndroidKeystoreKeyManager().getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256).openSshAuthorizedKeyLine)
     }
 
     @Test
