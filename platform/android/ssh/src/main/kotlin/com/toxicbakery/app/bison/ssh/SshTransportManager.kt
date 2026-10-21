@@ -256,7 +256,6 @@ class SshTransportManager(
     suspend fun setSurfaceLease(machineId: String, active: Boolean) {
         surfaceLeaseActive[machineId] = active
         moshUdpEngine.setParked(machineId, parked = !active)
-        realHerdrSshClient.setSurfaceActive(machineId, active)
         val leaseRequest = HerdrRpcBuilder.clientShellSurfaceSet(active = active)
         sshDebugLog.record(
             machineId = machineId,
@@ -712,7 +711,6 @@ class SshTransportManager(
 
         if (shouldUseRealSsh(machine)) {
             val route = proxyJumpTunnel.resolveRoute(machine)
-            realHerdrSshClient.startSurfaceStream(machine, route)
             realHerdrSshClient.refreshSnapshotAndSurface(machine, route)
             realHerdrSshClient.startLivePolling(machine, route) {
                 surfaceLeaseActive[machineId] != false
