@@ -7,6 +7,7 @@ import com.toxicbakery.logging.Arbor
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.math.BigInteger
+import java.security.Key
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -56,6 +57,9 @@ class AndroidKeystoreKeyManager {
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
     private val exportedPublicKeys = ConcurrentHashMap<String, ExportedSshPublicKey>()
 
+    // Serializes key creation and replacement, so that one alias never gets two new keys.
+    private val keyLock = Any()
+
     /**
      * Generates or loads an existing key pair for [keyAlias] using [algorithm] and returns its
      * OpenSSH `authorized_keys` representation.
@@ -67,15 +71,19 @@ class AndroidKeystoreKeyManager {
         comment: String = "bison-tablet",
     ): ExportedSshPublicKey {
         val cacheKey = "$keyAlias:${algorithm.name}:$comment"
-        return exportedPublicKeys.computeIfAbsent(cacheKey) {
-            val publicKey = loadExistingPublicKey(keyAlias)
+        exportedPublicKeys[cacheKey]?.let { return it }
+        return synchronized(keyLock) {
+            exportedPublicKeys[cacheKey]?.let { return@synchronized it }
+            val publicKey = usableStoredKey(keyAlias, algorithm, ::loadExistingPublicKey)
                 ?: generateKeyPair(keyAlias, algorithm, requireBiometric).public
-            exportPublicKey(
+            val exported = exportPublicKey(
                 keyAlias = keyAlias,
                 algorithm = algorithm,
                 publicKey = publicKey,
                 comment = comment,
             )
+            exportedPublicKeys[cacheKey] = exported
+            exported
         }
     }
 
@@ -89,8 +97,11 @@ class AndroidKeystoreKeyManager {
         challenge: ByteArray,
         sshAlgorithmOverride: String? = null,
     ): ByteArray {
-        val privateKey = loadPrivateKey(keyAlias)
-            ?: generateKeyPair(keyAlias, algorithm, requireBiometric = false).private
+        val privateKey = loadPrivateKey(keyAlias)?.takeIf { isKeyOfAlgorithm(it, algorithm) }
+            ?: synchronized(keyLock) {
+                usableStoredKey(keyAlias, algorithm, ::loadPrivateKey)
+                    ?: generateKeyPair(keyAlias, algorithm, requireBiometric = false).private
+            }
         val resolvedSshAlg = sshAlgorithmOverride?.takeIf { it.isNotBlank() } ?: algorithm.sshKeyType
         val rawSignature = when (algorithm) {
             KeyAlgorithm.Ed25519 -> {
@@ -140,6 +151,48 @@ class AndroidKeystoreKeyManager {
         }
     }
 
+    /**
+     * Returns the stored key for [keyAlias] from [load], or null when the caller must create a key.
+     *
+     * - A stored key that is not of [algorithm] is deleted, and the result is null. Earlier versions
+     *   created a P-256 EC key for [KeyAlgorithm.Ed25519], which cannot sign as Ed25519. Such a key
+     *   never worked for SSH, so a new key does not remove a working login.
+     * - A stored key that does not load causes an [IllegalStateException]. The key is not replaced,
+     *   because a new key would stop the logins that use the stored key.
+     *
+     * Call it while [keyLock] is held.
+     */
+    private fun <K : Key> usableStoredKey(keyAlias: String, algorithm: KeyAlgorithm, load: (String) -> K?): K? {
+        val stored = load(keyAlias)
+        if (stored != null) {
+            if (isKeyOfAlgorithm(stored, algorithm)) return stored
+            log.w {
+                "Replacing key $keyAlias: it is a ${stored.algorithm} key, not ${algorithm.name}. " +
+                    "Add the new public key to authorized_keys."
+            }
+            deleteKey(keyAlias)
+            return null
+        }
+        check(!storedKeyExists(keyAlias)) { "The key $keyAlias exists in AndroidKeyStore but cannot be loaded" }
+        return null
+    }
+
+    private fun storedKeyExists(keyAlias: String): Boolean =
+        fallbackKeyPairs.containsKey(keyAlias) || runCatching {
+            KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }.containsAlias(keyAlias)
+        }.getOrDefault(false)
+
+    private fun isKeyOfAlgorithm(key: Key, algorithm: KeyAlgorithm): Boolean {
+        val keyAlgorithm = key.algorithm.orEmpty()
+        return when (algorithm) {
+            KeyAlgorithm.Ed25519 -> keyAlgorithm.equals("EdDSA", ignoreCase = true) ||
+                keyAlgorithm.equals("Ed25519", ignoreCase = true) ||
+                keyAlgorithm == ED25519_OID
+            KeyAlgorithm.Rsa4096 -> keyAlgorithm.equals(KeyProperties.KEY_ALGORITHM_RSA, ignoreCase = true)
+            KeyAlgorithm.EcdsaP256 -> keyAlgorithm.equals(KeyProperties.KEY_ALGORITHM_EC, ignoreCase = true)
+        }
+    }
+
     private fun loadExistingPublicKey(keyAlias: String): PublicKey? {
         fallbackKeyPairs[keyAlias]?.public?.let { return it }
         return runCatching {
@@ -154,7 +207,8 @@ class AndroidKeystoreKeyManager {
         return runCatching {
             val ks = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
             ks.load(null)
-            (ks.getEntry(keyAlias, null) as? KeyStore.PrivateKeyEntry)?.privateKey
+            // getKey() works for all key types. getEntry() fails for Ed25519 keys on some API levels.
+            ks.getKey(keyAlias, null) as? PrivateKey
         }.getOrNull()
     }
 
@@ -183,8 +237,12 @@ class AndroidKeystoreKeyManager {
         val purposes = KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         return when (algorithm) {
             KeyAlgorithm.Ed25519 -> {
-                val generator = KeyPairGenerator.getInstance("Ed25519", ANDROID_KEYSTORE_PROVIDER)
+                // AndroidKeyStore (API 33+) makes Ed25519 keys with the EC generator and the "ed25519"
+                // curve. Ed25519 hashes the message itself, so the key must allow DIGEST_NONE.
+                val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
                 val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
+                    .setAlgorithmParameterSpec(ECGenParameterSpec(ED25519_CURVE))
+                    .setDigests(KeyProperties.DIGEST_NONE)
                     .setUserAuthenticationRequired(requireBiometric)
                     .build()
                 generator.initialize(spec)
@@ -371,6 +429,8 @@ class AndroidKeystoreKeyManager {
 
     companion object {
         private const val ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore"
+        private const val ED25519_CURVE = "ed25519"
+        private const val ED25519_OID = "1.3.101.112"
         private val log = Arbor.tag("AndroidKeystoreKeyManager")
     }
 }
