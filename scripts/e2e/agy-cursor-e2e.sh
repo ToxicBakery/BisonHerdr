@@ -158,14 +158,17 @@ for _ in $(seq 1 300); do
 done
 [[ "$(adb -s "$SERIAL" shell getprop sys.boot_completed | tr -d '\r')" == "1" ]] || fail "The emulator did not boot."
 
-# The emulator network starts some seconds after boot. Wait until the emulator can reach the host loopback.
+# The emulator network starts some seconds after boot. Wait until the emulator can read the SSH
+# banner from the host loopback. Older toybox nc (API 32 and lower) has no -z option.
+sshd_reachable() {
+    [[ "$(adb -s "$SERIAL" shell "nc -w 2 10.0.2.2 $SSH_PORT </dev/null 2>/dev/null | head -c 4" | tr -d '\r')" == "SSH-" ]]
+}
 log "Wait until the emulator can reach 10.0.2.2:$SSH_PORT."
 for _ in $(seq 1 120); do
-    adb -s "$SERIAL" shell "nc -z -w 2 10.0.2.2 $SSH_PORT" >/dev/null 2>&1 && break
+    sshd_reachable && break
     sleep 1
 done
-adb -s "$SERIAL" shell "nc -z -w 2 10.0.2.2 $SSH_PORT" >/dev/null 2>&1 \
-    || fail "The emulator cannot reach the private sshd at 10.0.2.2:$SSH_PORT."
+sshd_reachable || fail "The emulator cannot reach the private sshd at 10.0.2.2:$SSH_PORT."
 
 log "Install the test APK on $SERIAL."
 adb -s "$SERIAL" install -r -t "$TEST_APK" >/dev/null

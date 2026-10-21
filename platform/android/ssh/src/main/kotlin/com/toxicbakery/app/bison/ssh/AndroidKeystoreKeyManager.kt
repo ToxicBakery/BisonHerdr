@@ -248,7 +248,12 @@ class AndroidKeystoreKeyManager {
         }
         log.d { "AndroidKeyStore unavailable for $keyAlias (${algorithm.name}); using JCA key pair" }
         return fallbackKeyPairs.computeIfAbsent(keyAlias) {
-            generateStandardJcaKeyPair(algorithm)
+            runCatching { generateStandardJcaKeyPair(algorithm) }.getOrElse { jcaError ->
+                throw UnsupportedOperationException(
+                    unsupportedAlgorithmMessage(algorithm),
+                    keystoreAttempt.exceptionOrNull() ?: jcaError,
+                )
+            }
         }
     }
 
@@ -296,6 +301,13 @@ class AndroidKeystoreKeyManager {
             }
         }
     }
+
+    private fun unsupportedAlgorithmMessage(algorithm: KeyAlgorithm): String =
+        if (algorithm == KeyAlgorithm.Ed25519) {
+            "Ed25519 SSH keys need Android 13 or later. Edit the machine and select ECDSA P-256."
+        } else {
+            "${algorithm.sshKeyType} SSH keys are not available on this device."
+        }
 
     private fun generateStandardJcaKeyPair(algorithm: KeyAlgorithm): KeyPair =
         when (algorithm) {

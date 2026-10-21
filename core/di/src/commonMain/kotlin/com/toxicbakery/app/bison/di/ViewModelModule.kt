@@ -9,10 +9,12 @@ import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewMode
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
 import com.toxicbakery.app.bison.common.version.ReleaseFetcher
 import com.toxicbakery.app.bison.common.version.VersionWatcher
+import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import org.kodein.di.DI
 import org.kodein.di.bindFactory
 import org.kodein.di.bindSingleton
 import org.kodein.di.instance
+import org.kodein.di.instanceOrNull
 
 val viewModelModule = DI.Module("viewModelModule") {
     bindFactory<String, WorkspaceTerminalViewModel> { machineId: String ->
@@ -31,6 +33,8 @@ val viewModelModule = DI.Module("viewModelModule") {
             machineId = machineId,
             machineStore = instance(),
             machineViewModelDelegate = instance(),
+            // The platform layer binds the real key support. Other hosts use all key types.
+            keystoreKeySupport = instanceOrNull<KeystoreKeySupport>() ?: KeystoreKeySupport.AllAlgorithms,
         )
     }
     bindFactory<String, ConnectingMachineViewModel> { machineId: String ->

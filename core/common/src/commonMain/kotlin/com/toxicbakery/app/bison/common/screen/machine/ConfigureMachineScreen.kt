@@ -311,7 +311,7 @@ fun ConfigureMachineScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                KeyAlgorithm.entries.forEach { alg ->
+                                state.availableKeyAlgorithms.forEach { alg ->
                                     FilterChip(
                                         selected = state.keyAlgorithm == alg,
                                         onClick = {
@@ -320,6 +320,13 @@ fun ConfigureMachineScreen(
                                         label = { Text(alg.sshKeyType, fontFamily = FontFamily.Monospace) },
                                     )
                                 }
+                            }
+                            if (KeyAlgorithm.Ed25519 !in state.availableKeyAlgorithms) {
+                                Text(
+                                    text = "Ed25519 keys need Android 13 or later.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                             Row(
                                 modifier = Modifier.fillMaxWidth(),

@@ -102,6 +102,22 @@ class AndroidKeystoreEd25519DeviceTest {
     }
 
     @Test
+    fun ed25519IsUnavailableBeforeAndroid13AndEcdsaWorks() {
+        assumeTrue("This test is for Android 12", Build.VERSION.SDK_INT < 33)
+        keyManager.deleteKey(KEY_ALIAS)
+        assertEquals(false, AndroidKeystoreKeySupport.isSupported(KeyAlgorithm.Ed25519))
+        assertEquals(KeyAlgorithm.EcdsaP256, AndroidKeystoreKeySupport.defaultAlgorithm)
+
+        val error = runCatching { keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.Ed25519) }.exceptionOrNull()
+        assertIs<UnsupportedOperationException>(error)
+        assertTrue(error.message.orEmpty().contains("Android 13"), "Unclear error: ${error.message}")
+
+        val exported = keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+        assertTrue(exported.openSshAuthorizedKeyLine.startsWith("ecdsa-sha2-nistp256 "))
+        assertTrue(keyManager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE).isNotEmpty())
+    }
+
+    @Test
     fun hostKeySignatureVerifiesOnTheDevice() {
         // RFC 8032 section 7.1, TEST 2. Android 12 to 15 cannot do this through a JCA KeyFactory.
         val publicKey = hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")

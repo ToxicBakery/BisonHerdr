@@ -1,7 +1,9 @@
 package com.toxicbakery.app.bison.di
 
 import android.app.Application
+import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.ssh.AndroidKeystoreKeyManager
+import com.toxicbakery.app.bison.ssh.AndroidKeystoreKeySupport
 import com.toxicbakery.app.bison.ssh.HardwareKeySigner
 import com.toxicbakery.app.bison.ssh.MoshSessionEngine
 import com.toxicbakery.app.bison.ssh.MoshUdpEngine
@@ -15,6 +17,9 @@ import org.kodein.di.instance
 internal val sshModule = DI.Module("sshModule") {
     bindSingleton {
         AndroidKeystoreKeyManager()
+    }
+    bindSingleton<KeystoreKeySupport> {
+        AndroidKeystoreKeySupport
     }
     bindSingleton {
         YubiKeyFido2Manager(
