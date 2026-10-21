@@ -6,6 +6,7 @@ import com.toxicbakery.app.bison.model.HardwareKeyTransport
 import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
+import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
@@ -17,8 +18,9 @@ class ConfigureMachineViewModel(
     val machineId: String,
     private val machineStore: MachineStore,
     private val machineViewModelDelegate: MachineViewModelDelegate,
+    keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
 ) : BaseViewModel<ConfigureMachineViewModel.State, ConfigureMachineViewModel.Event, ConfigureMachineViewModel.Action>(
-    initialState = createInitialState(machineId, machineStore.getMachine(machineId)),
+    initialState = createInitialState(machineId, machineStore.getMachine(machineId), keystoreKeySupport),
 ), MachineViewModelDelegate by machineViewModelDelegate {
 
     enum class AuthType {
@@ -39,8 +41,10 @@ class ConfigureMachineViewModel(
         val moshUdpPortRange: String = HostMachine.DEFAULT_MOSH_UDP_PORT_RANGE,
         val herdrSessionName: String = "",
         val authType: AuthType = AuthType.KeystoreKey,
-        val keystoreAlias: String = "bison_default_ed25519",
+        val keystoreAlias: String = KeyAlgorithm.Ed25519.defaultKeystoreAlias,
         val keyAlgorithm: KeyAlgorithm = KeyAlgorithm.Ed25519,
+        /** The key types that this device can create. The screen shows only these. */
+        val availableKeyAlgorithms: List<KeyAlgorithm> = KeyAlgorithm.entries.toList(),
         val requireBiometric: Boolean = false,
         val passwordRef: String = "",
         val hardwareKeyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
@@ -105,7 +109,16 @@ class ConfigureMachineViewModel(
             is Event.UpdateHerdrSessionName -> updateState { it.copy(herdrSessionName = event.sessionName) }
             is Event.UpdateAuthType -> updateState { it.copy(authType = event.authType) }
             is Event.UpdateKeystoreAlias -> updateState { it.copy(keystoreAlias = event.alias) }
-            is Event.UpdateKeyAlgorithm -> updateState { it.copy(keyAlgorithm = event.algorithm) }
+            is Event.UpdateKeyAlgorithm -> updateState { current ->
+                if (event.algorithm !in current.availableKeyAlgorithms) {
+                    current
+                } else {
+                    current.copy(
+                        keyAlgorithm = event.algorithm,
+                        keystoreAlias = aliasForAlgorithm(current.keystoreAlias, current.keyAlgorithm, event.algorithm),
+                    )
+                }
+            }
             is Event.UpdateRequireBiometric -> updateState { it.copy(requireBiometric = event.require) }
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
             is Event.UpdateHardwareKeyType -> updateState { it.copy(hardwareKeyType = event.keyType) }
@@ -146,7 +159,7 @@ class ConfigureMachineViewModel(
 
         val authMethod: SshAuthMethod = when (current.authType) {
             AuthType.KeystoreKey -> SshAuthMethod.KeystoreKey(
-                keyAlias = current.keystoreAlias.trim().ifBlank { "bison_default_ed25519" },
+                keyAlias = current.keystoreAlias.trim().ifBlank { current.keyAlgorithm.defaultKeystoreAlias },
                 algorithm = current.keyAlgorithm,
                 requireBiometric = current.requireBiometric,
             )
@@ -197,11 +210,28 @@ class ConfigureMachineViewModel(
     }
 
     companion object {
-        fun createInitialState(machineId: String, existing: HostMachine?): State {
+        /**
+         * Returns the alias for a change from [previous] to [next]. A blank alias or the default
+         * alias of [previous] becomes the default alias of [next], so that two key types never
+         * share the default alias. A custom alias does not change.
+         */
+        internal fun aliasForAlgorithm(alias: String, previous: KeyAlgorithm, next: KeyAlgorithm): String =
+            if (alias.isBlank() || alias.trim() == previous.defaultKeystoreAlias) next.defaultKeystoreAlias else alias
+
+        fun createInitialState(
+            machineId: String,
+            existing: HostMachine?,
+            keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
+        ): State {
+            val available = keystoreKeySupport.supportedAlgorithms
             if (existing == null) {
+                val algorithm = keystoreKeySupport.defaultAlgorithm
                 return State(
                     id = machineId,
                     isEditingExisting = false,
+                    keyAlgorithm = algorithm,
+                    keystoreAlias = algorithm.defaultKeystoreAlias,
+                    availableKeyAlgorithms = available,
                 )
             }
             val authType = when (existing.authMethod) {
@@ -212,6 +242,11 @@ class ConfigureMachineViewModel(
             val keystoreAuth = existing.authMethod as? SshAuthMethod.KeystoreKey
             val passwordAuth = existing.authMethod as? SshAuthMethod.Password
             val hwAuth = existing.authMethod as? SshAuthMethod.HardwareSecurityKey
+            // A key type that this device cannot create changes to the default type. Such a key
+            // was never created on this device, so no working key is lost.
+            val storedAlgorithm = keystoreAuth?.algorithm ?: keystoreKeySupport.defaultAlgorithm
+            val keyAlgorithm = storedAlgorithm.takeIf { keystoreKeySupport.isSupported(it) }
+                ?: keystoreKeySupport.defaultAlgorithm
             val pj = existing.proxyJump
             return State(
                 id = existing.id,
@@ -225,8 +260,13 @@ class ConfigureMachineViewModel(
                 moshUdpPortRange = existing.moshUdpPortRange,
                 herdrSessionName = existing.herdrSessionName.orEmpty(),
                 authType = authType,
-                keystoreAlias = keystoreAuth?.keyAlias ?: "bison_default_ed25519",
-                keyAlgorithm = keystoreAuth?.algorithm ?: KeyAlgorithm.Ed25519,
+                keystoreAlias = aliasForAlgorithm(
+                    alias = keystoreAuth?.keyAlias ?: storedAlgorithm.defaultKeystoreAlias,
+                    previous = storedAlgorithm,
+                    next = keyAlgorithm,
+                ),
+                keyAlgorithm = keyAlgorithm,
+                availableKeyAlgorithms = available,
                 requireBiometric = keystoreAuth?.requireBiometric ?: false,
                 passwordRef = passwordAuth?.encryptedPasswordRef.orEmpty(),
                 hardwareKeyType = hwAuth?.keyType ?: HardwareKeyType.SkSshEd25519,
