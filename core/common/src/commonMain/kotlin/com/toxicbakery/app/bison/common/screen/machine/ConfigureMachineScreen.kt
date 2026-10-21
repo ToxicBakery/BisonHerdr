@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -44,13 +45,20 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.toxicbakery.app.bison.common.navigation.NavigationController
+import com.toxicbakery.app.bison.common.platform.plainTextClipEntry
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
@@ -58,6 +66,7 @@ import com.toxicbakery.app.bison.model.HardwareKeyTransport
 import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
+import kotlinx.coroutines.launch
 import org.kodein.di.compose.viewmodel.rememberViewModel
 
 @Composable
@@ -344,6 +353,14 @@ fun ConfigureMachineScreen(
                                     },
                                 )
                             }
+                            if (state.canShowPublicKey) {
+                                PublicKeySection(
+                                    state = state,
+                                    onShowPublicKey = {
+                                        viewModel.onEvent(ConfigureMachineViewModel.Event.ShowPublicKey)
+                                    },
+                                )
+                            }
                         }
 
                         ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> {
@@ -543,6 +560,67 @@ fun ConfigureMachineScreen(
                 }
                 Spacer(modifier = Modifier.height(24.dp))
             }
+        }
+    }
+}
+
+/**
+ * Shows the OpenSSH public key of the key store key, with a button that copies it, so that the
+ * user can add it to `~/.ssh/authorized_keys` on the host.
+ */
+@Composable
+private fun PublicKeySection(
+    state: ConfigureMachineViewModel.State,
+    onShowPublicKey: () -> Unit,
+) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    val publicKeyLine = state.publicKeyLine
+    var copied by remember(publicKeyLine) { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (publicKeyLine == null) {
+            OutlinedButton(
+                onClick = onShowPublicKey,
+                enabled = !state.isLoadingPublicKey,
+                modifier = Modifier.testTag("showPublicKey"),
+            ) {
+                Text(if (state.isLoadingPublicKey) "Loading public key" else "Show public key")
+            }
+        } else {
+            Text(
+                text = "Add this line to ~/.ssh/authorized_keys on the host:",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            SelectionContainer {
+                Text(
+                    text = publicKeyLine,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.fillMaxWidth().testTag("publicKeyLine"),
+                )
+            }
+            Button(
+                onClick = {
+                    scope.launch {
+                        clipboard.setClipEntry(plainTextClipEntry(label = "SSH public key", text = publicKeyLine))
+                        copied = true
+                    }
+                },
+                modifier = Modifier.testTag("copyPublicKey"),
+            ) {
+                Text(if (copied) "Copied" else "Copy public key")
+            }
+        }
+        state.publicKeyError?.let { error ->
+            Text(
+                text = error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
