@@ -65,6 +65,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -204,6 +205,16 @@ internal class RealHerdrSshClient(
     private val lastInputConfirmedSeq = ConcurrentHashMap<String, Long>()
     private val shellBatchCounter = AtomicLong(1L)
 
+    /** Scroll position of each pane from the Herdr snapshot, by machine and then by pane. */
+    private val paneScrolls = ConcurrentHashMap<String, Map<String, PaneSurfaceScroll>>()
+
+    /** The newest `pane.scroll` request of each machine that is not sent yet. Older requests are dropped. */
+    private val pendingPaneScrolls = ConcurrentHashMap<String, PendingPaneScroll>()
+    private val paneScrollSignals = ConcurrentHashMap<String, Channel<Unit>>()
+    private val paneScrollJobs = ConcurrentHashMap<String, Job>()
+
+    private data class PendingPaneScroll(val paneId: String, val offsetFromBottom: Int)
+
     fun isSimulatedHost(machine: HostMachine): Boolean {
         val host = machine.hostname.trim().lowercase()
         val bastion = machine.proxyJump?.bastionHost?.trim()?.lowercase().orEmpty()
@@ -304,6 +315,10 @@ internal class RealHerdrSshClient(
 
     fun disconnect(machineId: String) {
         pollJobs.remove(machineId)?.cancel()
+        paneScrollJobs.remove(machineId)?.cancel()
+        paneScrollSignals.remove(machineId)?.close()
+        pendingPaneScrolls.remove(machineId)
+        paneScrolls.remove(machineId)
         inputFlushJobs.remove(machineId)?.cancel()
         inputFlushSignals.remove(machineId)?.close()
         pendingInputQueues.remove(machineId)?.clear()
@@ -393,6 +408,12 @@ internal class RealHerdrSshClient(
             }
 
         val resolvedSnapshotObj = snapshotObj ?: return@withContext false
+        val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
+        // A queued scroll position is newer than the snapshot, so a poll must not move the pane back.
+        paneScrolls[machine.id] = pendingPaneScrolls[machine.id]?.let { pending ->
+            val scroll = serverScrolls[pending.paneId] ?: PaneSurfaceScroll()
+            serverScrolls + (pending.paneId to scroll.copy(offsetFromBottom = pending.offsetFromBottom.toUInt()))
+        } ?: serverScrolls
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
         val parsed = parseSnapshotObject(machine.id, resolvedSnapshotObj, sel)
@@ -539,6 +560,18 @@ internal class RealHerdrSshClient(
             }
         }
 
+        // Scroll gestures send one request per line. Keep only the newest request, so that the pane
+        // follows the finger, and do not refresh the full snapshot for each line.
+        if (request.method == "pane.scroll") {
+            val paramsObj = parseParamsObject(request.paramsJson)
+            val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() }
+            val offset = paramsObj["offset_from_bottom"]?.jsonPrimitive?.intOrNull
+            if (paneId != null && offset != null) {
+                requestPaneScroll(machine, route, paneId, offset)
+                return@withContext PANE_SCROLL_ACCEPTED_RESPONSE
+            }
+        }
+
         // Fast-path key/input RPCs (e.g., sendKeyChord -> pane.send_keys) onto the Input lane
         // without running a full topology snapshot.
         val isPaneInputRpc = request.method == "pane.send_keys" ||
@@ -627,6 +660,12 @@ internal class RealHerdrSshClient(
 
         if (event is ClientPaneInputEvent.Mouse) {
             return true
+        }
+
+        // Herdr keeps the scroll position when input arrives. Go back to the bottom, like a terminal,
+        // so that the user sees the prompt and the echo.
+        if ((paneScrolls[machine.id]?.get(targetPaneId)?.offsetFromBottom ?: 0u) > 0u) {
+            requestPaneScroll(machine, route, targetPaneId, 0)
         }
 
         val seq = inputSequence.incrementAndGet()
@@ -973,6 +1012,115 @@ internal class RealHerdrSshClient(
                 edits.removeFirst()
             }
         }
+    }
+
+    /**
+     * Queues `pane.scroll` for [paneId] to [offsetFromBottom] and shows the new position at once.
+     * One worker for each machine sends only the newest position, then reads that pane.
+     */
+    private fun requestPaneScroll(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        paneId: String,
+        offsetFromBottom: Int,
+    ) {
+        val maxOffset = paneScrolls[machine.id]?.get(paneId)?.maxScrollback?.toInt() ?: 0
+        val target = if (maxOffset > 0) offsetFromBottom.coerceIn(0, maxOffset) else offsetFromBottom.coerceAtLeast(0)
+        pendingPaneScrolls[machine.id] = PendingPaneScroll(paneId, target)
+        setLocalPaneScrollOffset(machine.id, paneId, target)
+        republishCachedSurface(machine.id)
+
+        val signal = paneScrollSignals.computeIfAbsent(machine.id) { Channel(Channel.CONFLATED) }
+        paneScrollJobs.compute(machine.id) { _, job ->
+            job?.takeIf { it.isActive } ?: scope.launch {
+                for (trigger in signal) {
+                    while (isActive) {
+                        val next = pendingPaneScrolls.remove(machine.id) ?: break
+                        sendPaneScroll(machine, route, next)
+                    }
+                }
+            }
+        }
+        signal.trySend(Unit)
+    }
+
+    private suspend fun sendPaneScroll(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        scroll: PendingPaneScroll,
+    ) {
+        val scrollLine = HerdrRpcBuilder.toNdjsonLine(
+            HerdrRpcBuilder.paneScroll(paneId = scroll.paneId, offsetFromBottom = scroll.offsetFromBottom),
+        ).trim()
+        runCatching {
+            val out = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Input,
+                commands = listOf(
+                    RemoteShellCommand.ApiBridgeLine(scrollLine),
+                    RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(scroll.paneId)),
+                ),
+            )
+            // A newer request replaces this one. Keep the newer position on the screen.
+            if (pendingPaneScrolls[machine.id] == null) {
+                setLocalPaneScrollOffset(machine.id, scroll.paneId, scroll.offsetFromBottom)
+            }
+            val paneAnsi = extractPaneAnsiFromResponse(out, scroll.paneId)
+            if (paneAnsi != null) {
+                updateFocusedPaneSurfaceFromInput(
+                    machineId = machine.id,
+                    paneId = scroll.paneId,
+                    paneAnsi = paneAnsi,
+                    confirmedSeq = 0L,
+                )
+            }
+        }.onFailure { err ->
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "pane.scroll for ${scroll.paneId} failed: ${err.message}",
+                isError = true,
+            )
+        }
+    }
+
+    private fun setLocalPaneScrollOffset(machineId: String, paneId: String, offsetFromBottom: Int) {
+        paneScrolls.compute(machineId) { _, existing ->
+            val current = existing.orEmpty()
+            val previous = current[paneId] ?: PaneSurfaceScroll()
+            current + (paneId to previous.copy(offsetFromBottom = offsetFromBottom.coerceAtLeast(0).toUInt()))
+        }
+    }
+
+    private fun republishCachedSurface(machineId: String) {
+        val cached = cachedInputs[machineId] ?: return
+        paneSurfaceBus.publish(
+            machineId,
+            buildCompositeSurfaceFrame(
+                machineId = machineId,
+                snapshot = cached.snapshot,
+                layout = cached.layout,
+                ansiByPane = cached.ansiByPane,
+            ),
+        )
+    }
+
+    /** Reads `panes[].scroll` (`offset_from_bottom`, `max_offset_from_bottom`, `viewport_rows`) from a snapshot. */
+    private fun parsePaneScrolls(snapshotObj: JsonObject): Map<String, PaneSurfaceScroll> {
+        val panesArray = snapshotObj["panes"] as? JsonArray ?: return emptyMap()
+        return panesArray.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val id = (obj["pane_id"] ?: obj["id"])?.jsonPrimitive?.content ?: return@mapNotNull null
+            val scrollObj = obj["scroll"] as? JsonObject ?: return@mapNotNull null
+            fun field(name: String): Long =
+                scrollObj[name]?.jsonPrimitive?.longOrNull?.coerceIn(0L, UInt.MAX_VALUE.toLong()) ?: 0L
+            id to PaneSurfaceScroll(
+                offsetFromBottom = field("offset_from_bottom").toUInt(),
+                maxScrollback = field("max_offset_from_bottom").toUInt(),
+                viewportRows = field("viewport_rows").coerceAtMost(UShort.MAX_VALUE.toLong()).toUShort(),
+            )
+        }.toMap()
     }
 
     private fun updateFocusedPaneSurfaceFromInput(
@@ -1721,9 +1869,8 @@ internal class RealHerdrSshClient(
                     ?: paneMeta?.label
                     ?: lp.paneId,
                 agentStatus = agentMeta?.agentStatus ?: AgentStatus.Unknown,
-                scroll = PaneSurfaceScroll(
-                    viewportRows = lp.rect.height,
-                ),
+                scroll = paneScrolls[machineId]?.get(lp.paneId)?.copy(viewportRows = lp.rect.height)
+                    ?: PaneSurfaceScroll(viewportRows = lp.rect.height),
             )
         }
 
@@ -2113,6 +2260,7 @@ internal class RealHerdrSshClient(
         private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
         private const val MAX_OPTIMISTIC_EDITS = 128
+        private const val PANE_SCROLL_ACCEPTED_RESPONSE = """{"id":"pane_scroll","result":{"type":"pane_scroll_queued"}}"""
 
         private val BLANK_CELL = CellData()
         private val RESET_SGR_STATE = SgrState(0u, 0u, 0u)

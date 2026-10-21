@@ -26,6 +26,7 @@ import kotlin.test.assertNotSame
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.test.runTest
 
 class SshPlatformTest {
@@ -298,6 +299,9 @@ class SshPlatformTest {
 
         val recordedBatches = mutableListOf<Pair<RealHerdrSshClient.WorkerLane, List<RealHerdrSshClient.RemoteShellCommand>>>()
         var remotePaneBuffer = "$ "
+        // Holds the Input lane until the test has checked the optimistic echo. Without it, the
+        // background flush can replace the echo with the server read before the check.
+        val inputLaneGate = CompletableDeferred<Unit>()
 
         val client = RealHerdrSshClient(
             sshDebugLog = debugLog,
@@ -305,6 +309,7 @@ class SshPlatformTest {
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
             remoteBatchExecutor = { _, _, lane, commands ->
+                if (lane == RealHerdrSshClient.WorkerLane.Input) inputLaneGate.await()
                 synchronized(recordedBatches) {
                     recordedBatches.add(lane to commands)
                 }
@@ -379,6 +384,7 @@ class SshPlatformTest {
         val predictedCell = assertNotNull(optimisticAfterL.frame.cellAt(1, 0))
         assertEquals("l", predictedCell.symbol)
         assertTrue(predictedCell.isPredictedEcho)
+        inputLaneGate.complete(Unit)
 
         assertTrue(client.sendPaneInput(machine, route, "%1", ClientPaneInputEvent.TextCommit("s")))
         client.awaitInputFlush("lan-box")

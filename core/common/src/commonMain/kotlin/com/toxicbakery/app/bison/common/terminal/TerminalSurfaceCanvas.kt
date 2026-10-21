@@ -455,6 +455,11 @@ fun TerminalSurfaceCanvas(
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         var isPinching = false
+                        // One drag scrolls one pane. The offset starts from the pane offset at the
+                        // first scroll step and then follows the finger, so that each step adds to it.
+                        var dragScrollPaneId: String? = null
+                        var dragScrollOffset = 0
+                        var dragScrollMax = 0
                         do {
                             val event = awaitPointerEvent()
                             val pressedCount = event.changes.count { it.pressed }
@@ -477,12 +482,22 @@ fun TerminalSurfaceCanvas(
                                         val centroid = event.calculateCentroid(useCurrent = true)
                                         val col = (centroid.x / currentEffectiveCellWidth).toInt()
                                         val row = (centroid.y / cellH).toInt()
-                                        val targetPane = currentSurfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
-                                            ?: currentSurfaceFrame?.panes?.firstOrNull { it.focused }
-                                        if (targetPane != null) {
-                                            val currentOffset = targetPane.scroll.offsetFromBottom.toInt()
-                                            val nextOffset = (currentOffset + lineDelta).coerceAtLeast(0)
-                                            currentOnPaneScroll(targetPane.paneId, nextOffset)
+                                        if (dragScrollPaneId == null) {
+                                            val targetPane = currentSurfaceFrame?.panes?.firstOrNull { it.rect.contains(col, row) }
+                                                ?: currentSurfaceFrame?.panes?.firstOrNull { it.focused }
+                                            if (targetPane != null) {
+                                                dragScrollPaneId = targetPane.paneId
+                                                dragScrollOffset = targetPane.scroll.offsetFromBottom.toInt()
+                                                dragScrollMax = targetPane.scroll.maxScrollback.toInt()
+                                            }
+                                        }
+                                        val scrollPaneId = dragScrollPaneId
+                                        if (scrollPaneId != null) {
+                                            val nextOffset = nextPaneScrollOffset(dragScrollOffset, lineDelta, dragScrollMax)
+                                            if (nextOffset != dragScrollOffset) {
+                                                dragScrollOffset = nextOffset
+                                                currentOnPaneScroll(scrollPaneId, nextOffset)
+                                            }
                                         }
                                         event.changes.forEach { it.consume() }
                                     }
@@ -1209,6 +1224,16 @@ private fun DrawScope.drawPaneChrome(
             cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth / 2f),
         )
     }
+}
+
+/**
+ * Returns the scroll offset (lines from the bottom) after [lineDelta] lines from [current]. A
+ * positive [lineDelta] moves up into the history. The result is in `0..maxOffset`. When
+ * [maxOffset] is 0 (not known), only the bottom limit applies.
+ */
+internal fun nextPaneScrollOffset(current: Int, lineDelta: Int, maxOffset: Int): Int {
+    val next = (current.toLong() + lineDelta).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+    return if (maxOffset > 0) next.coerceAtMost(maxOffset) else next
 }
 
 private fun DrawScope.drawCursor(
