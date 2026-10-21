@@ -115,17 +115,16 @@ sleep 2
 herdr_s pane read "$PANE_ID" --source visible --format text > "$WORKDIR/agy-pane-before.txt"
 
 # 3. Start a private sshd that points at the isolated Herdr session.
-# Use an ECDSA host key. Android 12 to 15 have no software Ed25519 KeyFactory, so JSch cannot
-# verify an Ed25519 host key on these API levels.
-if [[ ! -f "$SSHD_DIR/host_ecdsa" ]]; then
-    ssh-keygen -q -t ecdsa -b 256 -N '' -f "$SSHD_DIR/host_ecdsa"
+# Use an Ed25519 host key, like a default OpenSSH server.
+if [[ ! -f "$SSHD_DIR/host_ed25519" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$SSHD_DIR/host_ed25519"
 fi
 : > "$SSHD_DIR/authorized_keys"
 chmod 600 "$SSHD_DIR/authorized_keys"
 cat > "$SSHD_DIR/sshd_config" <<EOF
 Port $SSH_PORT
 ListenAddress 127.0.0.1
-HostKey $SSHD_DIR/host_ecdsa
+HostKey $SSHD_DIR/host_ed25519
 PidFile $SSHD_DIR/sshd.pid
 AuthorizedKeysFile $SSHD_DIR/authorized_keys
 AllowUsers $USER
@@ -135,6 +134,7 @@ KbdInteractiveAuthentication no
 UsePAM no
 StrictModes no
 SetEnv HERDR_SOCKET_PATH=$HERDR_SOCKET
+LogLevel DEBUG1
 EOF
 "$SSHD_BIN" -t -f "$SSHD_DIR/sshd_config" || fail "The private sshd config is not valid."
 log "Start the private sshd on 127.0.0.1:$SSH_PORT."

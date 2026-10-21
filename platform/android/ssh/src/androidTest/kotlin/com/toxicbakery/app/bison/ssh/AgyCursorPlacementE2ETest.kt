@@ -191,11 +191,10 @@ class AgyCursorPlacementE2ETest {
         const val ARG_USER = "bisonUser"
         const val DEFAULT_PORT = 2299
         const val MACHINE_ID = "agy-cursor-e2e"
-        const val KEY_ALIAS = "bison_agy_cursor_e2e_p256"
+        const val KEY_ALIAS = "bison_agy_cursor_e2e_ed25519"
 
-        // Use ECDSA P-256. The AndroidKeyStore Ed25519 key of AndroidKeystoreKeyManager cannot sign
-        // at this time, because its KeyGenParameterSpec does not set DIGEST_NONE.
-        val KEY_ALGORITHM = KeyAlgorithm.EcdsaP256
+        // Ed25519 is the default key type of the app.
+        val KEY_ALGORITHM = KeyAlgorithm.Ed25519
         const val KEY_COMMENT = "bison-agy-cursor-e2e"
         const val AGY_BANNER = "Antigravity CLI"
         const val MARKER = "bisoncursorprobe"
