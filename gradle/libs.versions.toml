@@ -22,6 +22,7 @@ compose-material-icons = "1.7.3"
 compose-multiplatform = "1.12.2"
 jna = "5.19.1"
 jsch = "2.28.8"
+bouncycastle = "1.86"
 kodein = "7.33.0"
 kotlin = "2.4.21"
 kotlinx-coroutines = "1.11.0"
@@ -78,6 +79,7 @@ arbor-android = { module = "com.toxicbakery.logging:arbor-android", version.ref 
 coil = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 jsch = { module = "com.github.mwiede:jsch", version.ref = "jsch" }
+bouncycastle-bcprov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
 
 # Kodein
 kodein = { module = "org.kodein.di:kodein-di", version.ref = "kodein" }

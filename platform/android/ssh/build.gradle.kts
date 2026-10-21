@@ -25,6 +25,7 @@ dependencies {
     implementation(projects.core.store)
 
     implementation(libs.arbor)
+    implementation(libs.bouncycastle.bcprov)
     implementation(libs.jsch)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)

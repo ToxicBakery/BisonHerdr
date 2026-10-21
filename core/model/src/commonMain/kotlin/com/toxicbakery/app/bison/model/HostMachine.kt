@@ -73,7 +73,7 @@ sealed interface SshAuthMethod {
     @Serializable
     @SerialName("keystore_key")
     data class KeystoreKey(
-        val keyAlias: String = "bison_default_ed25519",
+        val keyAlias: String = KeyAlgorithm.Ed25519.defaultKeystoreAlias,
         val algorithm: KeyAlgorithm = KeyAlgorithm.Ed25519,
         val requireBiometric: Boolean = false,
     ) : SshAuthMethod
@@ -98,10 +98,14 @@ sealed interface SshAuthMethod {
  * Supported asymmetric key algorithms for Android Keystore SSH keys.
  */
 @Serializable
-enum class KeyAlgorithm(val sshKeyType: String) {
-    Ed25519("ssh-ed25519"),
-    Rsa4096("rsa-sha2-512"),
-    EcdsaP256("ecdsa-sha2-nistp256"),
+enum class KeyAlgorithm(
+    val sshKeyType: String,
+    /** The default key store alias for this algorithm. Each algorithm has its own alias. */
+    val defaultKeystoreAlias: String,
+) {
+    Ed25519("ssh-ed25519", "bison_default_ed25519"),
+    Rsa4096("rsa-sha2-512", "bison_default_rsa4096"),
+    EcdsaP256("ecdsa-sha2-nistp256", "bison_default_ecdsa_p256"),
 }
 
 /**
