@@ -11,20 +11,24 @@ import java.security.InvalidKeyException
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.NoSuchAlgorithmException
-import java.security.Signature
-import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.KeyAgreement
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
 
 /**
- * Registers Android API 31+ / Java 11+ standard JCA providers (`Ed25519` and `X25519`) with [JSch].
+ * Registers the `ssh-ed25519` signature and the `X25519` key agreement implementations with [JSch].
  *
  * `jsch-2.28.8` ships `jce.SignatureEd25519` and `jce.XDH` inside `META-INF/versions/15` and
  * `META-INF/versions/11` using Java 15 `EdECPublicKeySpec` / `XECPublicKeySpec` classes that are not
- * exposed in the Android SDK, and defaults its root `JSch` config to `com.jcraft.jsch.bc.*` (BouncyCastle).
- * Using RFC 8410 ASN.1 DER `X509EncodedKeySpec` / `PKCS8EncodedKeySpec` wrappers allows standard
- * Android `Conscrypt` / `AndroidOpenSSL` and JVM JCA providers to negotiate `ssh-ed25519` and
- * `curve25519-sha256` without external BouncyCastle dependencies.
+ * exposed in the Android SDK.
+ *
+ * - `ssh-ed25519` uses the BouncyCastle lightweight API ([AndroidJschSignatureEd25519]). Android 12 to 15
+ *   have no software Ed25519 `KeyFactory`. There, `KeyFactory.getInstance("Ed25519")` returns the
+ *   `AndroidKeyStore` provider, which cannot import a server host key.
+ * - `X25519` uses RFC 8410 ASN.1 DER `X509EncodedKeySpec` wrappers with the platform `Conscrypt` /
+ *   `AndroidOpenSSL` provider ([AndroidJschXdh]).
  */
 internal object JschAndroidCrypto {
     private val ED25519_CLASS_NAME: String = AndroidJschSignatureEd25519::class.java.name
@@ -45,65 +49,46 @@ internal object JschAndroidCrypto {
 }
 
 /**
- * JCA `Ed25519` implementation of JSch's [SignatureEdDSA] using RFC 8410 SubjectPublicKeyInfo
- * and PKCS#8 PrivateKeyInfo DER encodings.
+ * `ssh-ed25519` implementation of JSch's [SignatureEdDSA] with the BouncyCastle lightweight
+ * [Ed25519Signer]. It does not use a JCA provider, so it works the same on all API levels.
  */
 class AndroidJschSignatureEd25519 : SignatureEdDSA {
-    private lateinit var signature: Signature
+    private var signer: Ed25519Signer? = null
+
+    private fun signer(): Ed25519Signer =
+        signer ?: throw IllegalStateException("init() was not called")
 
     override fun init() {
-        signature = Signature.getInstance("Ed25519")
+        signer = Ed25519Signer()
     }
 
     override fun setPubKey(y_arr: ByteArray) {
         if (y_arr.size != ED25519_KEY_LEN) {
             throw InvalidKeyException("Ed25519 public key must be $ED25519_KEY_LEN bytes (got ${y_arr.size})")
         }
-        val der = ByteArray(ED25519_X509_PREFIX.size + ED25519_KEY_LEN)
-        System.arraycopy(ED25519_X509_PREFIX, 0, der, 0, ED25519_X509_PREFIX.size)
-        System.arraycopy(y_arr, 0, der, ED25519_X509_PREFIX.size, ED25519_KEY_LEN)
-        val pubKey = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(der))
-        signature.initVerify(pubKey)
+        signer().init(false, Ed25519PublicKeyParameters(y_arr, 0))
     }
 
     override fun setPrvKey(bytes: ByteArray) {
         if (bytes.size != ED25519_KEY_LEN) {
             throw InvalidKeyException("Ed25519 private seed must be $ED25519_KEY_LEN bytes (got ${bytes.size})")
         }
-        val der = ByteArray(ED25519_PKCS8_PREFIX.size + ED25519_KEY_LEN)
-        System.arraycopy(ED25519_PKCS8_PREFIX, 0, der, 0, ED25519_PKCS8_PREFIX.size)
-        System.arraycopy(bytes, 0, der, ED25519_PKCS8_PREFIX.size, ED25519_KEY_LEN)
-        val prvKey = KeyFactory.getInstance("Ed25519").generatePrivate(PKCS8EncodedKeySpec(der))
-        signature.initSign(prvKey)
+        signer().init(true, Ed25519PrivateKeyParameters(bytes, 0))
     }
 
-    override fun sign(): ByteArray = signature.sign()
+    override fun sign(): ByteArray = signer().generateSignature()
 
     override fun update(foo: ByteArray) {
-        signature.update(foo)
+        signer().update(foo, 0, foo.size)
     }
 
-    override fun verify(sig: ByteArray): Boolean {
-        val rawSig = unwrapSshEd25519SignatureBlob(sig)
-        return signature.verify(rawSig)
-    }
+    override fun verify(sig: ByteArray): Boolean =
+        signer().verifySignature(unwrapSshEd25519SignatureBlob(sig))
 
     companion object {
         private const val ED25519_KEY_LEN = 32
         private const val ED25519_SIG_LEN = 64
         private const val SSH_ED25519_ALG = "ssh-ed25519"
-
-        // ASN.1 DER SubjectPublicKeyInfo prefix for OID 1.3.101.112 (id-Ed25519):
-        // 30 2a 30 05 06 03 2b 65 70 03 21 00
-        private val ED25519_X509_PREFIX = byteArrayOf(
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        )
-
-        // ASN.1 DER PKCS#8 PrivateKeyInfo prefix for OID 1.3.101.112 (id-Ed25519):
-        // 30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20
-        private val ED25519_PKCS8_PREFIX = byteArrayOf(
-            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-        )
 
         internal fun unwrapSshEd25519SignatureBlob(sig: ByteArray): ByteArray {
             if (sig.size <= ED25519_SIG_LEN || sig.size < 8) {
