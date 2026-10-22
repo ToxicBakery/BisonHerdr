@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewMo
 import com.toxicbakery.app.bison.common.version.ReleaseFetcher
 import com.toxicbakery.app.bison.common.version.VersionWatcher
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
+import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import org.kodein.di.DI
 import org.kodein.di.bindFactory
 import org.kodein.di.bindSingleton
@@ -35,6 +36,7 @@ val viewModelModule = DI.Module("viewModelModule") {
             machineViewModelDelegate = instance(),
             // The platform layer binds the real key support. Other hosts use all key types.
             keystoreKeySupport = instanceOrNull<KeystoreKeySupport>() ?: KeystoreKeySupport.AllAlgorithms,
+            sshPublicKeyProvider = instanceOrNull<SshPublicKeyProvider>(),
         )
     }
     bindFactory<String, ConnectingMachineViewModel> { machineId: String ->

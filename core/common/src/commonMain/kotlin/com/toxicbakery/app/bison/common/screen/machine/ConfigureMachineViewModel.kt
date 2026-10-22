@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.util.BaseViewModel
 import kotlinx.coroutines.launch
@@ -19,8 +20,10 @@ class ConfigureMachineViewModel(
     private val machineStore: MachineStore,
     private val machineViewModelDelegate: MachineViewModelDelegate,
     keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
+    private val sshPublicKeyProvider: SshPublicKeyProvider? = null,
 ) : BaseViewModel<ConfigureMachineViewModel.State, ConfigureMachineViewModel.Event, ConfigureMachineViewModel.Action>(
-    initialState = createInitialState(machineId, machineStore.getMachine(machineId), keystoreKeySupport),
+    initialState = createInitialState(machineId, machineStore.getMachine(machineId), keystoreKeySupport)
+        .copy(canShowPublicKey = sshPublicKeyProvider != null),
 ), MachineViewModelDelegate by machineViewModelDelegate {
 
     enum class AuthType {
@@ -46,6 +49,12 @@ class ConfigureMachineViewModel(
         /** The key types that this device can create. The screen shows only these. */
         val availableKeyAlgorithms: List<KeyAlgorithm> = KeyAlgorithm.entries.toList(),
         val requireBiometric: Boolean = false,
+        /** True when the platform can give the public key of a key store key. */
+        val canShowPublicKey: Boolean = false,
+        /** The `authorized_keys` line for [keystoreAlias] and [keyAlgorithm], after [Event.ShowPublicKey]. */
+        val publicKeyLine: String? = null,
+        val isLoadingPublicKey: Boolean = false,
+        val publicKeyError: String? = null,
         val passwordRef: String = "",
         val hardwareKeyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
         val hardwareKeyTransport: HardwareKeyTransport = HardwareKeyTransport.UsbAndNfc,
@@ -77,6 +86,9 @@ class ConfigureMachineViewModel(
         data class UpdateAuthType(val authType: AuthType) : Event
         data class UpdateKeystoreAlias(val alias: String) : Event
         data class UpdateKeyAlgorithm(val algorithm: KeyAlgorithm) : Event
+
+        /** Loads the public key of the key store key. This creates the key if it does not exist. */
+        data object ShowPublicKey : Event
         data class UpdateRequireBiometric(val require: Boolean) : Event
         data class UpdatePasswordRef(val passwordRef: String) : Event
         data class UpdateHardwareKeyType(val keyType: HardwareKeyType) : Event
@@ -108,7 +120,7 @@ class ConfigureMachineViewModel(
             is Event.UpdateMoshUdpPortRange -> updateState { it.copy(moshUdpPortRange = event.range) }
             is Event.UpdateHerdrSessionName -> updateState { it.copy(herdrSessionName = event.sessionName) }
             is Event.UpdateAuthType -> updateState { it.copy(authType = event.authType) }
-            is Event.UpdateKeystoreAlias -> updateState { it.copy(keystoreAlias = event.alias) }
+            is Event.UpdateKeystoreAlias -> updateState { it.copy(keystoreAlias = event.alias).withoutPublicKey() }
             is Event.UpdateKeyAlgorithm -> updateState { current ->
                 if (event.algorithm !in current.availableKeyAlgorithms) {
                     current
@@ -116,10 +128,11 @@ class ConfigureMachineViewModel(
                     current.copy(
                         keyAlgorithm = event.algorithm,
                         keystoreAlias = aliasForAlgorithm(current.keystoreAlias, current.keyAlgorithm, event.algorithm),
-                    )
+                    ).withoutPublicKey()
                 }
             }
             is Event.UpdateRequireBiometric -> updateState { it.copy(requireBiometric = event.require) }
+            is Event.ShowPublicKey -> loadPublicKey()
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
             is Event.UpdateHardwareKeyType -> updateState { it.copy(hardwareKeyType = event.keyType) }
             is Event.UpdateHardwareKeyTransport -> updateState { it.copy(hardwareKeyTransport = event.transport) }
@@ -136,6 +149,35 @@ class ConfigureMachineViewModel(
                 viewModelScope.launch {
                     removeMachine(targetId)
                     sendAction(Action.Deleted)
+                }
+            }
+        }
+    }
+
+    private fun State.withoutPublicKey(): State =
+        copy(publicKeyLine = null, isLoadingPublicKey = false, publicKeyError = null)
+
+    private fun loadPublicKey() {
+        val provider = sshPublicKeyProvider ?: return
+        val request = state.value
+        if (request.isLoadingPublicKey) return
+        val alias = request.keystoreAlias.trim().ifBlank { request.keyAlgorithm.defaultKeystoreAlias }
+        val algorithm = request.keyAlgorithm
+        updateState { it.copy(isLoadingPublicKey = true, publicKeyError = null) }
+        viewModelScope.launch {
+            val result = runCatching { provider.authorizedKeyLine(alias, algorithm, request.requireBiometric) }
+            updateState { current ->
+                val currentAlias = current.keystoreAlias.trim().ifBlank { current.keyAlgorithm.defaultKeystoreAlias }
+                when {
+                    // The user changed the key while it loaded. This result is for the old key.
+                    currentAlias != alias || current.keyAlgorithm != algorithm -> current
+                    else -> current.copy(
+                        isLoadingPublicKey = false,
+                        publicKeyLine = result.getOrNull(),
+                        publicKeyError = result.exceptionOrNull()?.let { err ->
+                            "Could not get the public key: ${err.message ?: err::class.simpleName}"
+                        },
+                    )
                 }
             }
         }

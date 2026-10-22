@@ -22,6 +22,8 @@ import java.security.spec.ECGenParameterSpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Exported SSH public key metadata in OpenSSH `authorized_keys` and RFC 4253 binary wire format.
@@ -54,7 +56,7 @@ data class ExportedSshPublicKey(
  * Manages on-device SSH asymmetric keys (`Ed25519`, `RSA-4096`, `ECDSA-P256`) backed by Android's
  * hardware-backed `AndroidKeyStore`, with automatic JCA fallback for local JVM unit tests.
  */
-class AndroidKeystoreKeyManager {
+class AndroidKeystoreKeyManager : SshPublicKeyProvider {
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
     private val exportedPublicKeys = ConcurrentHashMap<String, ExportedSshPublicKey>()
@@ -87,6 +89,18 @@ class AndroidKeystoreKeyManager {
             exportedPublicKeys[cacheKey] = exported
             exported
         }
+    }
+
+    override suspend fun authorizedKeyLine(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean,
+    ): String = withContext(Dispatchers.IO) {
+        getOrCreatePublicKey(
+            keyAlias = keyAlias,
+            algorithm = algorithm,
+            requireBiometric = requireBiometric,
+        ).openSshAuthorizedKeyLine
     }
 
     /**
