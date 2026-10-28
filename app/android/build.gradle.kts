@@ -20,6 +20,22 @@ val hardwareSecurityKeys: Boolean = providers.gradleProperty("bison.hardwareSecu
     .map(String::toBoolean)
     .getOrElse(false)
 
+// Stop a release build with FIDO2 security keys on, because nobody did the manual test yet (issue #23). The debug and
+// benchmark build types are test builds, so they can have the flag. The pull request that turns on the flag removes
+// this check.
+val checkReleaseFeatureFlags = tasks.register("checkReleaseFeatureFlags") {
+    val enabled = hardwareSecurityKeys
+    doLast {
+        if (enabled) {
+            throw GradleException(
+                "bison.hardwareSecurityKeys=true is only for a debug or benchmark test build (issue #23). " +
+                    "Remove the property to build a release.",
+            )
+        }
+    }
+}
+tasks.named { it == "preReleaseBuild" }.configureEach { dependsOn(checkReleaseFeatureFlags) }
+
 android {
     namespace = "com.toxicbakery.app.bison"
     compileSdk {
@@ -38,7 +54,8 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // FIDO2 hardware security keys (issue #23). Off in each build type until the manual test in
-        // docs/testing/fido2-security-keys.md passes. Add -Pbison.hardwareSecurityKeys=true to a build to test it.
+        // docs/testing/fido2-security-keys.md passes. Add -Pbison.hardwareSecurityKeys=true to a debug or benchmark
+        // build to test it. A release build with the property stops (checkReleaseFeatureFlags).
         buildConfigField("boolean", "HARDWARE_SECURITY_KEYS", hardwareSecurityKeys.toString())
     }
 

@@ -74,6 +74,19 @@ class SessionServiceManifestTest {
         )
     }
 
+    /** The app does not use the OTP and prompt screens of yubikit-android. The merged manifest must not have them. */
+    @Test
+    fun manifestRemovesTheActivitiesOfYubikit() {
+        val removed = elements("activity")
+            .filter { element -> element.getAttributeNS(TOOLS_NAMESPACE, "node") == "remove" }
+            .map { element -> element.androidAttribute("name") }
+
+        assertEquals(
+            listOf("com.yubico.yubikit.android.ui.OtpActivity", "com.yubico.yubikit.android.ui.YubiKeyPromptActivity"),
+            removed,
+        )
+    }
+
     /**
      * Backups keep the machine list, the settings, and the known hosts, because they hold no secret. The include
      * lists keep all other files out, for example the temporary files and the corrupt copies. The encrypted
@@ -121,5 +134,6 @@ class SessionServiceManifestTest {
 
     private companion object {
         const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+        const val TOOLS_NAMESPACE = "http://schemas.android.com/tools"
     }
 }

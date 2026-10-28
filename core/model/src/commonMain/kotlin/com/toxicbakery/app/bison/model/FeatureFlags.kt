@@ -13,7 +13,8 @@ data class FeatureFlags(
      *
      * Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds this feature. The flag stays off until
      * the manual test in `docs/testing/fido2-security-keys.md` passes. The Gradle property
-     * `bison.hardwareSecurityKeys=true` sets it for a test build.
+     * `bison.hardwareSecurityKeys=true` sets it for a debug or benchmark test build. A release build with the
+     * property stops (`checkReleaseFeatureFlags`). The pull request that turns on the flag removes that check.
      */
     val hardwareSecurityKeys: Boolean = false,
 )
