@@ -3,6 +3,8 @@ package com.toxicbakery.app.bison.model
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -111,8 +113,8 @@ class ModelSerializationTest {
     }
 
     /**
-     * An old version could save a machine with a hardware security key. This version does not support the
-     * method (issue #23), but the file must still load, and the method must not change.
+     * An old version could save a machine with a hardware security key. That file has no credential fields
+     * (issue #23). The file must still load, the method must not change, and the key is not enrolled.
      */
     @Test
     fun oldMachinesFileWithAHardwareSecurityKeyStillLoads() {
@@ -134,8 +136,8 @@ class ModelSerializationTest {
         val machines = json.decodeFromString<List<HostMachine>>(oldMachinesFile)
 
         assertEquals(listOf("workbox", "gpu-rig"), machines.map { it.id })
-        assertTrue(machines[0].authMethod.isSupported)
-        val hardwareKey = machines[1].authMethod
+        assertTrue(machines[0].authMethod.isSupported(FeatureFlags()))
+        val hardwareKey = assertIs<SshAuthMethod.HardwareSecurityKey>(machines[1].authMethod)
         assertEquals(
             SshAuthMethod.HardwareSecurityKey(
                 keyType = HardwareKeyType.SkEcdsaSha2Nistp256,
@@ -144,9 +146,56 @@ class ModelSerializationTest {
             ),
             hardwareKey,
         )
-        assertFalse(hardwareKey.isSupported)
-        assertTrue(SshAuthMethod.Password().isSupported)
+        assertNull(hardwareKey.credentialId)
+        assertNull(hardwareKey.publicKey)
+        assertFalse(hardwareKey.residentKey)
+        assertFalse(hardwareKey.isEnrolled)
         assertEquals(machines, json.decodeFromString<List<HostMachine>>(json.encodeToString(machines)))
+    }
+
+    /** The flag decides if the app can use a FIDO2 key. A PIV key is never supported. */
+    @Test
+    fun hardwareSecurityKeyIsSupportedOnlyWithTheFlagAndAFido2KeyType() {
+        val off = FeatureFlags()
+        val on = FeatureFlags(hardwareSecurityKeys = true)
+        assertFalse(off.hardwareSecurityKeys)
+
+        for (keyType in listOf(HardwareKeyType.SkSshEd25519, HardwareKeyType.SkEcdsaSha2Nistp256)) {
+            val key = SshAuthMethod.HardwareSecurityKey(keyType = keyType)
+            assertTrue(keyType.isFido2)
+            assertFalse(key.isSupported(off), "$keyType with the flag off")
+            assertTrue(key.isSupported(on), "$keyType with the flag on")
+        }
+        assertFalse(HardwareKeyType.PivSmartCard.isFido2)
+        assertFalse(SshAuthMethod.HardwareSecurityKey(keyType = HardwareKeyType.PivSmartCard).isSupported(on))
+
+        for (flags in listOf(off, on)) {
+            assertTrue(SshAuthMethod.KeystoreKey().isSupported(flags))
+            assertTrue(SshAuthMethod.Password().isSupported(flags))
+        }
+    }
+
+    /** An enrolled key keeps its credential ID, its public key, and the resident key flag in `machines.json`. */
+    @Test
+    fun enrolledHardwareSecurityKeyRoundTrips() {
+        val enrolled = SshAuthMethod.HardwareSecurityKey(
+            keyType = HardwareKeyType.SkEcdsaSha2Nistp256,
+            transport = HardwareKeyTransport.UsbOnly,
+            credentialId = "AAECAwQFBgcICQ==",
+            publicKey = "BAECAw==",
+            residentKey = true,
+        )
+        assertTrue(enrolled.isEnrolled)
+        assertFalse(enrolled.copy(credentialId = "").isEnrolled)
+        assertFalse(enrolled.copy(publicKey = null).isEnrolled)
+
+        val machine = HostMachine(id = "yubikey-box", name = "YubiKey Box", hostname = "10.0.0.5", username = "ian")
+            .copy(authMethod = enrolled)
+        val encoded = json.encodeToString(machine)
+        assertTrue("\"credentialId\":\"AAECAwQFBgcICQ==\"" in encoded, encoded)
+        assertTrue("\"publicKey\":\"BAECAw==\"" in encoded, encoded)
+        assertTrue("\"residentKey\":true" in encoded, encoded)
+        assertEquals(machine, json.decodeFromString<HostMachine>(encoded))
     }
 
     @Test

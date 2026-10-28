@@ -29,7 +29,7 @@ class CredentialValidator(
             is SshAuthMethod.Password -> passwordState(machine, auth.encryptedPasswordRef)
             is SshAuthMethod.KeystoreKey ->
                 if (keyExists(auth.keyAlias)) CredentialState.Ready else CredentialState.KeyMissing(auth.keyAlias)
-            // This version does not support the method. The machine card tells it.
+            // The credential is on the security key, so the device cannot check it. The connect tells the cause.
             is SshAuthMethod.HardwareSecurityKey -> CredentialState.Ready
         }
     }

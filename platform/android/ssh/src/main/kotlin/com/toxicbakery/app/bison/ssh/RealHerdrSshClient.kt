@@ -6,6 +6,7 @@ import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SocketFactory
 import com.toxicbakery.app.bison.model.ActiveBackbone
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -126,6 +127,10 @@ import kotlinx.serialization.json.put
  * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
  * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
  * second. A connect, a disconnect, and a reconnect of the supervisor start a new average.
+ *
+ * A machine with a FIDO2 security key logs in with a [HardwareKeyJschIdentity] over [hardwareKeySigner]. The user
+ * touches the key for each new session. A ProxyJump machine thus needs two touches: one for the bastion and one for
+ * the target. When [hardwareKeySigner] is null, the client refuses such a machine before the network connection.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -165,6 +170,11 @@ internal class RealHerdrSshClient(
     private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
     /** Gives the address of each socket, and finds the connections that the local network protection stops. */
     internal val localNetworkGuard: LocalNetworkGuard,
+    /**
+     * Signs the login of a machine with a FIDO2 security key. It is null when [FeatureFlags.hardwareSecurityKeys] is
+     * false. Then the client refuses such a machine.
+     */
+    private val hardwareKeySigner: HardwareKeySigner? = null,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -361,6 +371,9 @@ internal class RealHerdrSshClient(
     private val selectionState = ConcurrentHashMap<String, ClientSelectionState>()
     private val cachedInputs = ConcurrentHashMap<String, CachedSurfaceInputs>()
     private val viewportSizes = ConcurrentHashMap<String, Pair<Int, Int>>()
+
+    /** The machines whose last poll got no snapshot. See [recordMissingSnapshot]. */
+    private val machinesWithoutSnapshot: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val revisionCounter = AtomicLong(10L)
     private val inputSequence = AtomicLong(0L)
     private val lastInputConfirmedSeq = ConcurrentHashMap<String, Long>()
@@ -475,6 +488,8 @@ internal class RealHerdrSshClient(
     ): Result<Unit> = withContext(Dispatchers.IO) {
         supervisors.remove(machine.id)?.stop()
         roundTripMeter.reset(machine.id)
+        // A new connect starts a new series of polls with no snapshot. See recordMissingSnapshot.
+        machinesWithoutSnapshot.remove(machine.id)
         connectSteps += machine.id
         runCatching {
             val out = executeBatchOnLane(
@@ -610,6 +625,7 @@ internal class RealHerdrSshClient(
             viewportSizes.remove(machineId)
         }
         lastInputConfirmedSeq.remove(machineId)
+        machinesWithoutSnapshot.remove(machineId)
         inputWorkers.remove(machineId)?.close()
         pollWorkers.remove(machineId)?.close()
         closeSessions(machineId)
@@ -791,7 +807,9 @@ internal class RealHerdrSshClient(
         }.orEmpty()
 
         val initialCommands = buildList {
-            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot"))
+            // Herdr writes an error answer only to standard error. The parse below ignores the lines that are not JSON,
+            // for example a warning with a good answer. See recordMissingSnapshot.
+            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot 2>&1"))
             predictedVisiblePanes.forEach { paneId ->
                 add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
             }
@@ -834,7 +852,11 @@ internal class RealHerdrSshClient(
                 }
             }
 
-        val resolvedSnapshotObj = snapshotObj ?: return@withContext false
+        val resolvedSnapshotObj = snapshotObj ?: run {
+            recordMissingSnapshot(machine, combinedRawOutput)
+            return@withContext false
+        }
+        machinesWithoutSnapshot.remove(machine.id)
         val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
@@ -1940,6 +1962,61 @@ internal class RealHerdrSshClient(
         return found
     }
 
+    /**
+     * Writes an error to the debug log when the snapshot batch of [machine] gave no snapshot in [output].
+     *
+     * The snapshot command sends its standard error to [output] (`2>&1`), because Herdr writes each error answer only
+     * to standard error. The error of the log tells the first cause that applies:
+     * - a session name that Herdr does not accept. Herdr then writes a line of text, not a JSON answer.
+     * - the `error.message` of a JSON answer in [output], for example for `server_not_running`.
+     * - the last line of [output] that is not JSON, for example `sh: 1: herdr: not found`.
+     *
+     * The client writes only the first error of each series of polls with no snapshot. A poll with a snapshot, a new
+     * [connectAndVerify], or a [disconnect] ends the series. Thus a host that stays in this state does not fill the
+     * debug log.
+     */
+    private fun recordMissingSnapshot(machine: HostMachine, output: String) {
+        if (!machinesWithoutSnapshot.add(machine.id)) return
+        val sessionName = machine.herdrSessionName?.trim()?.takeIf { it.isNotEmpty() }
+        val cause = sessionName?.takeIf { !HostMachine.isValidHerdrSessionName(it) }
+            ?.let { "Herdr does not accept the session name \"$it\". Change the name in the machine settings." }
+            ?: herdrErrorMessage(output)
+            ?: lastTextLine(output)
+            ?: "Herdr gave no output."
+        sshDebugLog.record(
+            machineId = machine.id,
+            tag = "RealSSH",
+            message = "No snapshot from `${HerdrCommand.of(machine)} api snapshot`: $cause",
+            isError = true,
+        )
+    }
+
+    /**
+     * Returns the `error.message` of the first Herdr answer in [output] that has an error, or null. The result has at
+     * most [MAX_LOGGED_CAUSE_LENGTH] characters.
+     */
+    private fun herdrErrorMessage(output: String): String? =
+        output.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .firstNotNullOfOrNull { line ->
+                runCatching {
+                    val error = json.parseToJsonElement(line).jsonObject["error"]?.jsonObject
+                    error?.get("message")?.jsonPrimitive?.content
+                }.getOrNull()
+            }
+            ?.take(MAX_LOGGED_CAUSE_LENGTH)
+
+    /**
+     * Returns the last line of [output] that has text and is not a JSON object, or null. The result has at most
+     * [MAX_LOGGED_CAUSE_LENGTH] characters.
+     */
+    private fun lastTextLine(output: String): String? =
+        output.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.isNotEmpty() && !(it.startsWith("{") && it.endsWith("}")) }
+            ?.take(MAX_LOGGED_CAUSE_LENGTH)
+
     private fun parsePaneReadLinesInto(
         rawResponse: String,
         targetMap: MutableMap<String, String>,
@@ -2088,9 +2165,22 @@ internal class RealHerdrSshClient(
                     )
                     "publickey,password,keyboard-interactive"
                 }
-                // This version does not support the method (issue #23). Stop before the network connection.
-                is SshAuthMethod.HardwareSecurityKey ->
-                    throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
+                is SshAuthMethod.HardwareSecurityKey -> {
+                    // Without the signer, this build does not support the method. Stop before the network connection.
+                    val signer = hardwareKeySigner
+                        ?: throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
+                    if (!auth.isEnrolled) throw HardwareKeyException(HardwareKeyException.Reason.NotEnrolled)
+                    jsch.addIdentity(
+                        HardwareKeyJschIdentity(
+                            machineId = machine.id,
+                            key = auth,
+                            signer = signer,
+                            callerJob = currentCoroutineContext()[Job],
+                        ),
+                        null,
+                    )
+                    "publickey,password,keyboard-interactive"
+                }
             }
             val passwordAuth = machine.authMethod as? SshAuthMethod.Password
             val loginPassword = passwordAuth?.let { loginPassword(machine, route, it) }
@@ -2207,6 +2297,9 @@ internal class RealHerdrSshClient(
             session.setServerAliveCountMax(SERVER_ALIVE_COUNT_MAX)
         }
         JschAndroidCrypto.configureSession(session)
+        if (logins.machine.authMethod is SshAuthMethod.HardwareSecurityKey) {
+            JschAndroidCrypto.enableSecurityKeyAlgorithms(session)
+        }
         return session
     }
 
@@ -2424,7 +2517,8 @@ internal class RealHerdrSshClient(
         channel.setCommand(initCmd)
         val rawIn = channel.inputStream
         val rawOut = channel.outputStream
-        channel.setErrStream(ByteArrayOutputStream())
+        // The worker keeps only the last bytes of its standard error. See StderrTail.
+        channel.setErrStream(StderrTail(WORKER_STDERR_TAIL_BYTES))
         channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
         val worker = PersistentShellWorker(
             channel = channel,
@@ -2464,13 +2558,15 @@ internal class RealHerdrSshClient(
         // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
         // the lane.
         awaitSession(machine)
+        // The worker, the new worker after a failure, and the one-shot fallback all use this one value.
+        val herdr = HerdrCommand.of(machine)
         return laneMutexFor(machine.id, lane).withLock {
             onLaneLocked?.invoke()
             val session = getOrOpenSession(machine, route)
             runCatching {
                 val worker = getOrOpenWorkerLocked(machine.id, lane, session)
                 val timing = onRoundTrip.takeIf { worker.ranBatch }
-                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, machine.herdrSessionName) }
+                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, herdr) }
                     .also { worker.ranBatch = true }
             }.recoverCatching {
                 // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
@@ -2478,10 +2574,9 @@ internal class RealHerdrSshClient(
                 val freshSession = getOrOpenSession(machine, route)
                 runCatching {
                     val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
-                    runCommandsOnWorker(freshWorker, commands, machine.herdrSessionName)
-                        .also { freshWorker.ranBatch = true }
+                    runCommandsOnWorker(freshWorker, commands, herdr).also { freshWorker.ranBatch = true }
                 }.getOrElse {
-                    execBatchOneShot(freshSession, commands, machine.herdrSessionName)
+                    execBatchOneShot(freshSession, commands, herdr)
                 }
             }.getOrThrow()
         }
@@ -2522,10 +2617,10 @@ internal class RealHerdrSshClient(
     private fun runCommandsOnWorker(
         worker: PersistentShellWorker,
         commands: List<RemoteShellCommand>,
-        herdrSessionName: String?,
+        herdr: String,
     ): String {
         val batchId = shellBatchCounter.incrementAndGet()
-        val (script, sentinel) = buildShellBatchScript(batchId, commands, herdrSessionName)
+        val (script, sentinel) = buildShellBatchScript(batchId, commands, herdr)
         worker.stdin.write(script.toByteArray(Charsets.UTF_8))
         worker.stdin.flush()
 
@@ -2552,9 +2647,9 @@ internal class RealHerdrSshClient(
     private fun execBatchOneShot(
         session: Session,
         commands: List<RemoteShellCommand>,
-        herdrSessionName: String?,
+        herdr: String,
     ): String {
-        val body = buildOneShotBatchScript(shellBatchCounter.incrementAndGet(), commands, herdrSessionName)
+        val body = buildOneShotBatchScript(shellBatchCounter.incrementAndGet(), commands, herdr)
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(body)
         val stdout = channel.inputStream
@@ -2568,15 +2663,14 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Builds the script of [execBatchOneShot]. Each `herdr` call of a [RemoteShellCommand.ApiBridgeLine] uses the Herdr
-     * session [herdrSessionName]. See [HerdrCommand].
+     * Builds the script of [execBatchOneShot]. Each `herdr` call of a [RemoteShellCommand.ApiBridgeLine] starts with
+     * [herdr], the result of [HerdrCommand.of] for the machine.
      */
     internal fun buildOneShotBatchScript(
         batchId: Long,
         commands: List<RemoteShellCommand>,
-        herdrSessionName: String?,
+        herdr: String,
     ): String {
-        val herdr = HerdrCommand.forSession(herdrSessionName)
         return buildString(commands.size * 160 + 96) {
             append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
             commands.forEachIndexed { index, cmd ->
@@ -2601,15 +2695,14 @@ internal class RealHerdrSshClient(
 
     /**
      * Builds the script of one batch on a persistent worker, and the sentinel line at its end. Each `herdr` call of a
-     * [RemoteShellCommand.ApiBridgeLine] uses the Herdr session [herdrSessionName]. See [HerdrCommand].
+     * [RemoteShellCommand.ApiBridgeLine] starts with [herdr], the result of [HerdrCommand.of] for the machine.
      */
     internal fun buildShellBatchScript(
         batchId: Long,
         commands: List<RemoteShellCommand>,
-        herdrSessionName: String?,
+        herdr: String,
     ): Pair<String, String> {
         val sentinel = "__BISON_DONE_${batchId}__"
-        val herdr = HerdrCommand.forSession(herdrSessionName)
         val script = buildString(commands.size * 160 + 64) {
             commands.forEachIndexed { index, cmd ->
                 when (cmd) {
@@ -3332,6 +3425,12 @@ internal class RealHerdrSshClient(
         private const val SERVER_ALIVE_INTERVAL_MS = 10_000
         private const val SERVER_ALIVE_COUNT_MAX = 3
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
+
+        /** The number of bytes of standard error that each persistent worker keeps. See [StderrTail]. */
+        private const val WORKER_STDERR_TAIL_BYTES = 4 * 1024
+
+        /** The maximum length of a cause from the host in the debug log. See [recordMissingSnapshot]. */
+        private const val MAX_LOGGED_CAUSE_LENGTH = 512
         private const val IPTOS_LOWDELAY = 0x10
         private const val LIVE_POLL_INTERVAL_MS = 400L
 
