@@ -12,7 +12,7 @@ This document consolidates the complete reference for **Herdr's Server API & Pro
 
 ## Part I: Executive Summary & Problem Statement
 
-Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. **BisonHerdr** (`com.toxicbakery.app.bison`) is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built directly on Herdr's **Endpoint Generation 1** protocol.
+Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. **BisonHerdr** (`com.toxicbakery.app.bison`) is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built on Herdr's API over SSH. This version runs `herdr api snapshot` and `herdr remote-api-bridge` requests, and the target design adds Herdr's **Endpoint Generation 1** protocol.
 
 | Pain Point in Existing Mobile/Android Apps | Root Cause | BisonHerdr Architecture Solution |
 | :--- | :--- | :--- |
@@ -560,7 +560,7 @@ Both transport backbones are engineered so backgrounding the tablet app consumes
    - **This version:** the app does not send `client_shell.surface.set`. On `onStop()`, the surface lease pauses the pane reads of the client, and the SSH session stays open. On `onStart()`, the app shows the last frame at once, and the next poll reads the new state.
    - On `onStart()`, sending `client_shell.surface.set { active: true }` pushes a fresh coherent `PaneSurfaceFrame` without re-running the SSH handshake, followed by `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }` once the frame is committed to release the server's `presentation_effects_fence`.
 3. **Actionable Android System Notifications (`BisonSessionService`):**
-   - Runs as a `specialUse` `ForegroundService` (*"BisonHerdr: 2 machines (SSH Endpoint)"*). The ongoing notification has a **Disconnect All** action. The service stops itself after 30 s with no connected machine, no connection in progress, and no started activity.
+   - Runs as a `specialUse` `ForegroundService` (*"BisonHerdr: 2 machines (SSH)"*). The ongoing notification has a **Disconnect All** action. The service stops itself after 30 s with no connected machine, no connection in progress, and no started activity.
    - When an agent transitions to `Blocked` or `Done` (`SemanticNotification` or `ClientShellSnapshot` agent status change), posts a native Android notification with direct `PendingIntent` actions. **This version:** only the demo server sends these agent events, so a real host gives no agent alert. Agent alerts for real hosts are planned. The actions:
      - **Approve (`Enter`)** — sends `Enter` to the blocked pane in the background (via `ClientMessage::ClientShellPaneInput` or a `herdr remote-api-bridge` `pane.send_keys` / `agent.send_keys` exec channel).
      - **Reject (`Esc`)** — sends `Esc` to the blocked pane in the background.
