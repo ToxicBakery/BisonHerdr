@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.di
 
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.PaneSurfaceBus
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshDebugLog
@@ -16,4 +17,5 @@ val sshCoreModule = DI.Module("sshCoreModule") {
     bindSingleton { EndpointSnapshotBus() }
     bindSingleton { PaneSurfaceBus() }
     bindSingleton { SemanticNotificationBus() }
+    bindSingleton { LocalNetworkAccess() }
 }

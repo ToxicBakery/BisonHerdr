@@ -277,6 +277,8 @@ class SshTransportManagerTest {
             SshAuthResult.InputCancelled("lan-box.lan:22") to NeedsUserCause.InputCancelled("lan-box.lan:22"),
             SshAuthResult.Failed(UserInputException.of("lan-box.lan:22", KeyboardInteractiveOutcome.Cancelled)) to
                 NeedsUserCause.InputCancelled("lan-box.lan:22"),
+            SshAuthResult.LocalNetworkBlocked("lan-box.lan:22") to
+                NeedsUserCause.LocalNetworkPermission("lan-box.lan:22"),
         )
 
         expected.forEach { (result, cause) ->
@@ -537,6 +539,31 @@ class SshTransportManagerTest {
         // Cancel in the UI disconnects the machine and removes the cause.
         manager.disconnect(lanBox.id)
         assertNull(stateManager.needsUser.value[lanBox.id])
+    }
+
+    @Test
+    fun aLoopThatTheLocalNetworkStopsPutsTheCauseAndAConnectAfterTheGrantRemovesIt() = runTest {
+        val backend = RecordingSshBackend()
+        val manager = manager(backend)
+        connectAll(manager, backend, lanBox)
+
+        val blocked = SshAuthResult.LocalNetworkBlocked("192.168.1.42:22")
+        assertNotNull(backend.sessionEvents).onNeedsUser(lanBox.id, blocked)
+
+        assertFalse(stateManager.isMachineConnected(lanBox.id))
+        assertEquals(ConnectionProgress.Failed, stateManager.connectionProgress.value[lanBox.id])
+        assertEquals(NeedsUserCause.LocalNetworkPermission("192.168.1.42:22"), stateManager.needsUser.value[lanBox.id])
+        assertNull(stateManager.hostKeyPrompts.value[lanBox.id])
+        assertEquals(listOf("disconnect lan-box"), backend.calls)
+
+        // A network change does not connect the machine again.
+        manager.onNetworkAvailable()
+        assertEquals(listOf("disconnect lan-box"), backend.calls)
+
+        // After the grant, the app connects again with the last profile of the machine.
+        assertTrue(manager.connect(lanBox.id))
+        assertNull(stateManager.needsUser.value[lanBox.id])
+        assertTrue(stateManager.isMachineConnected(lanBox.id))
     }
 
     private fun knownHost(fingerprint: String): KnownHost = KnownHost(

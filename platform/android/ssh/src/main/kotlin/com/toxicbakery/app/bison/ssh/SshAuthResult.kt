@@ -111,4 +111,12 @@ sealed interface SshAuthResult {
 
     /** The user cancelled the questions of [hostPort]. A reconnect loop must stop. It is not a [NetworkError]. */
     data class InputCancelled(val hostPort: String) : SshAuthResult
+
+    /**
+     * Android stops the connection to [hostPort] on the local network, because the app does not have the local
+     * network permission (`ACCESS_LOCAL_NETWORK`). [hostPort] is the bastion or the target. The client opened no
+     * socket. A retry gives the same result until the user allows the permission, so a reconnect loop must stop. It is
+     * not a [NetworkError].
+     */
+    data class LocalNetworkBlocked(val hostPort: String) : SshAuthResult
 }

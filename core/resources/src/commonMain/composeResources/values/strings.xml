@@ -160,6 +160,7 @@
     <string name="needs_user_input_timed_out">You did not answer the questions of %1$s in the time limit. Connect again and answer them.</string>
     <string name="needs_user_input_cancelled">You cancelled the questions of %1$s. Connect again and answer them.</string>
     <string name="needs_user_unreachable">The app cannot connect to the host: %1$s</string>
+    <string name="needs_user_local_network">Android stopped the connection to %1$s on the local network, because the app does not have the Nearby devices permission. Connect again from the app to allow the permission. You can also allow Nearby devices in the app settings.</string>
     <string name="needs_user_other">The connection failed: %1$s</string>
 
     <!-- Settings & Color Themes (Gruvbox Dark Default + 18 Palettes) -->

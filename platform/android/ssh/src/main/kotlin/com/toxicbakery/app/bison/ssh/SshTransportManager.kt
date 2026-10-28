@@ -725,6 +725,7 @@ class SshTransportManager(
                 "InputRequired (${result.hostPort}, ${if (result.timedOut) "time limit" else "no UI"})"
 
             is SshAuthResult.InputCancelled -> "InputCancelled (${result.hostPort})"
+            is SshAuthResult.LocalNetworkBlocked -> "LocalNetworkBlocked (${result.hostPort})"
         }
 
     /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */
@@ -757,6 +758,7 @@ class SshTransportManager(
             }
             is SshAuthResult.InputRequired -> causeOf(result)
             is SshAuthResult.InputCancelled -> NeedsUserCause.InputCancelled(result.hostPort)
+            is SshAuthResult.LocalNetworkBlocked -> NeedsUserCause.LocalNetworkPermission(result.hostPort)
             is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
             is SshAuthResult.Failed -> causeOf(result.cause)
             // A login that passed needs nothing. Only an error in the caller gets here.
