@@ -37,8 +37,8 @@ On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-clas
 | :--- | :--- | :--- |
 | **UI & Ergonomics** | Compose Multiplatform + Material 3 | 120Hz `TerminalSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, agent command drawer, multi-machine fleet screen |
 | **Shared Client Logic** | Kotlin Multiplatform (`commonMain`) + Kodein DI | Unidirectional MVI state stores, session lifecycle orchestration, SSH host management, theme & keymap persistence |
-| **Terminal & Transport Core** | Kotlin (`:core:protocol`, `:platform:android:ssh`) + [JSch](https://github.com/mwiede/jsch) | SSH transport over JSch + Herdr Endpoint Generation 1 models and `SurfaceDeltaAssembler` in `:core:protocol`. A Mosh UDP SSP client and a `libghostty-vt` VT parser are planned. |
-| **Remote Host Daemon** | [Herdr](https://github.com/herdrdev/herdr) (`remote-client-bridge` / `remote-api-bridge`) | Unmodified remote daemon providing persistent workspaces, BSP panes, PTY multiplexer, coding-agent status detection (`claude`, `codex`, `gemini`, `aider`, `opencode`), and JSON-RPC control plane |
+| **Terminal & Transport Core** | Kotlin (`:core:protocol`, `:platform:android:ssh`) + [JSch](https://github.com/mwiede/jsch) | SSH transport over JSch: `herdr api snapshot` and `herdr remote-api-bridge` requests on persistent `sh` channels. `:core:protocol` has the Herdr Endpoint Generation 1 models and `SurfaceDeltaAssembler`. A Mosh UDP SSP client and a `libghostty-vt` VT parser are planned. |
+| **Remote Host Daemon** | [Herdr](https://github.com/herdrdev/herdr) (`herdr api snapshot` / `remote-api-bridge`) | Unmodified remote daemon providing persistent workspaces, BSP panes, PTY multiplexer, coding-agent status detection (`claude`, `codex`, `gemini`, `aider`, `opencode`), and JSON-RPC control plane |
 
 For the complete technical specification, transport state machine, and implementation roadmap, see the **[Core App Design Document](docs/plans/01-core-app-design.md)**.
 

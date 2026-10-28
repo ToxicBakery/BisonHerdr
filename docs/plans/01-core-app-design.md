@@ -2,7 +2,11 @@
 
 This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for **BisonHerdr** (`com.toxicbakery.app.bison`), the native Android / Tablet client for Herdr.
 
-> **Status.** This document describes the target design. Some parts do not ship in this version. The Mosh UDP backbone (Part IV), the Rust JNI core, `russh`, and `libghostty-vt` rendering over JNI are planned. The SSH endpoint path over JSch is the only transport, and Compose draws the Herdr `PaneSurfaceFrame` cells. Item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) records this decision, and [issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work for Mosh. Of the SSH features in section E of Part V, only the hardware security keys do not work yet. [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds that work. The real SSH path of this version does not run `herdr remote-client-bridge`. Each machine has one JSch session with two persistent `sh` channels. They run `herdr api snapshot` and `herdr remote-api-bridge` requests (`pane.read`, `pane.send_input`, and others). The client reads the visible panes each 400 ms while the surface lease is on. The surface lease pauses this poll in the client, and the app does not send `client_shell.surface.set` to the server.
+> **Status.** This document describes the target design. Some parts do not ship in this version. The Mosh UDP backbone (Part IV), the Rust JNI core, `russh`, and `libghostty-vt` rendering over JNI are planned. Item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) records this decision, and [issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work for Mosh.
+>
+> The SSH path over JSch is the only transport of this version, and Compose draws the Herdr `PaneSurfaceFrame` cells. This path does not run `herdr remote-client-bridge`. Each machine has one JSch session with two persistent `sh` channels. They run `herdr api snapshot` and `herdr remote-api-bridge` requests (`pane.read`, `pane.send_input`, and others). The client reads the visible panes each 400 ms while the surface lease is on. The surface lease pauses this poll in the client, and the app does not send `client_shell.surface.set` to the server.
+>
+> Of the SSH features in section E of Part V, only the hardware security keys do not work yet. [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds that work.
 
 ---
 
@@ -14,7 +18,7 @@ Mobile and tablet terminal clients typically fail coding-agent workflows because
 | :--- | :--- | :--- |
 | **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen **with no SSH reconnect**. In this version, the lease only pauses the pane reads of the client, and the app does not send `client_shell.surface.set`. |
 | **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Session Check:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` stay on screen with a non-intrusive `"Reconnecting..."` pill. On a new default network, `ConnectivityManager.NetworkCallback` starts a check of each SSH session: a keepalive and `exec true`, with a limit of 3 s. When the check fails, the app connects again at once and reads the surface again. On `onLost`, the app closes the SSH sockets, so that no attempt waits for a TCP timeout. |
-| **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste before atomic submission via `agent.prompt` or `pane.send_input`. |
+| **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste (planned) before atomic submission via `agent.prompt` or `pane.send_input`. |
 | **Clunky workspace, tab & split-pane navigation** | Desktop keyboard shortcuts (`prefix+w`, `prefix+h/j/k/l`) require awkward multi-key chords on touchscreens. | **Native Compose Shell Chrome + Direct Split Gestures:** Herdr's server renders *only* the pane grid (`PaneSurfaceFrame`). Android renders the Sidebar, Tab Bar, draggable BSP split handles (`layout.set_split_ratio`), and double-tap pane zoom (`pane.zoom`) natively at 120Hz. |
 | **Hard to see or act on `blocked` / `done` coding agents** | Agents are buried across multiple SSH hosts, workspaces, and split panes. | **Unified Multi-Machine Agent Rail + Blocked Action Strip:** Aggregates `ClientShellAgent` states across all connected SSH machines. When viewing a `blocked` agent, a contextual action bar provides 1-tap `Approve (Enter)`, `Cancel (Esc)`, `y`, `n`, and option number buttons. |
 
@@ -385,7 +389,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet 
    - **Center Floating Prompt Composer Pill (`❯ ... [✓ Approve] [Send ⏎]`):**
      - Sits ergonomically between the left and right thumb pads.
      - Shows contextual one-tap **`[ ✓ Approve ]`** / **`[ ✕ Reject ]`** buttons whenever the focused pane's agent is `Blocked`.
-     - Tapping the prompt input expands into a multi-line native Compose `OutlinedTextField` card supporting **Gboard swipe typing, Android Voice Dictation, multi-line editing, image clipboard paste (`ClientMessage::ClipboardImage`), and an offline prompt queue during a reconnect**.
+     - Tapping the prompt input expands into a multi-line native Compose `OutlinedTextField` card supporting **Gboard swipe typing, Android Voice Dictation, multi-line editing, image clipboard paste (`ClientMessage::ClipboardImage`, planned), and an offline prompt queue during a reconnect**.
      - Submitting sends the prompt atomically (`agent.prompt` over a `herdr remote-api-bridge` SSH exec channel or `ClientShellPaneInput` `Paste` + `Enter`, tracking subsequent state transitions reactively via `shell.snapshot.v1`).
 
 ---
@@ -437,7 +441,7 @@ All 18 color palettes from Herdr's `src/app/state.rs` (`Palette`) plus `OLED Pit
 
 ## Part IV: Mosh UDP Connection Backbone, Always-On Backgrounding & Roaming
 
-> **Status: planned.** This version does not include Mosh. The app always uses the SSH Endpoint path (`herdr remote-client-bridge`), and the parts of Part IV that apply to Mosh describe the target design only. The surface lease and the `NetworkCallback` fast-roam (Part I) are the answer to roaming in this version. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work and the acceptance list for a real Mosh path.
+> **Status: planned.** This version does not include Mosh. The app always uses the SSH path that the status note at the top of this document describes, and the parts of Part IV that apply to Mosh describe the target design only. The surface lease and the `NetworkCallback` session check (Part I) are the answer to roaming in this version. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work and the acceptance list for a real Mosh path.
 
 ### 1. Mosh (`mosh-server` / UDP SSP) as the Primary Connection Backbone
 
@@ -1015,7 +1019,7 @@ data class ScreenKeyMachineConfigure(
 
 ### Phase 4: Split-Thumb Floating Controls, Prompt Composer & Notifications
 - Build the ergonomic **Left & Right Split-Thumb Floating Key Clusters** (sticky/chorded `Ctrl`/`Alt`/`Shift`/`Esc`/`Tab` + swipe arrow trackpad).
-- Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste, and an offline prompt queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
+- Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste (planned), and an offline prompt queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
 
 ### Definition of Done (All Phases)
 - **Zero-Warning Builds:** Every Gradle/Kotlin build (`./gradlew build`) and the Cargo checks of `rust/herdr-protocol` (`cargo test -p herdr-protocol`, `cargo clippy -p herdr-protocol --all-targets -- -D warnings`) must complete **with zero warnings** and zero errors.
