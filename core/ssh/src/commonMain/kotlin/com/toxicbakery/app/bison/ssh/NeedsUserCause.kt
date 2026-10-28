@@ -24,7 +24,10 @@ sealed interface NeedsUserCause {
     /** The device key store has no key for [keyAlias]. */
     data class KeyMissing(val keyAlias: String) : NeedsUserCause
 
-    /** The secret store has no password for the machine. */
+    /**
+     * The secret store has no password for the machine, and no UI was open to ask for it, for example during a
+     * reconnect in the background. A connect from the app asks for the password.
+     */
     data object PasswordMissing : NeedsUserCause
 
     /**
@@ -38,6 +41,18 @@ sealed interface NeedsUserCause {
      * unlock it, so the user must make a new key.
      */
     data class KeyFromEarlierVersion(val keyAlias: String) : NeedsUserCause
+
+    /**
+     * The host [hostPort] asks for answers with the `keyboard-interactive` method, and no UI was open to ask the
+     * user, for example during a reconnect in the background. [hostPort] is the bastion or the target.
+     */
+    data class InputRequired(val hostPort: String) : NeedsUserCause
+
+    /** The user did not answer the questions of [hostPort] before the time limit. */
+    data class InputTimedOut(val hostPort: String) : NeedsUserCause
+
+    /** The user cancelled the questions of [hostPort]. */
+    data class InputCancelled(val hostPort: String) : NeedsUserCause
 
     /**
      * The app did not get a connection to the host. Only a connect from the user gives this cause, because the

@@ -715,6 +715,10 @@ class SshTransportManager(
 
             is SshAuthResult.KeyMissing -> "KeyMissing (${result.message})"
             is SshAuthResult.UserAuthRequired -> "UserAuthRequired (${result.message})"
+            is SshAuthResult.InputRequired ->
+                "InputRequired (${result.hostPort}, ${if (result.timedOut) "time limit" else "no UI"})"
+
+            is SshAuthResult.InputCancelled -> "InputCancelled (${result.hostPort})"
         }
 
     /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */
@@ -745,16 +749,28 @@ class SshTransportManager(
                     NeedsUserCause.UserAuthRequired(keyAlias)
                 }
             }
+            is SshAuthResult.InputRequired -> causeOf(result)
+            is SshAuthResult.InputCancelled -> NeedsUserCause.InputCancelled(result.hostPort)
             is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
             is SshAuthResult.Failed -> causeOf(result.cause)
             // A login that passed needs nothing. Only an error in the caller gets here.
             SshAuthResult.Success -> NeedsUserCause.Other(describe(result))
         }
 
+    /** Returns the [NeedsUserCause] that the UI shows for a login that needs answers from the user. */
+    private fun causeOf(result: SshAuthResult.InputRequired): NeedsUserCause =
+        if (result.timedOut) {
+            NeedsUserCause.InputTimedOut(result.hostPort)
+        } else {
+            NeedsUserCause.InputRequired(result.hostPort)
+        }
+
     /** Returns the [NeedsUserCause] that the UI shows for a connect step that threw [error]. */
     private fun causeOf(error: Throwable): NeedsUserCause {
         val chain = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
+        val userInput = chain.filterIsInstance<UserInputException>().firstOrNull()
         return when {
+            userInput != null -> causeOf(userInput.result)
             chain.any { it is MissingSecretException } -> NeedsUserCause.PasswordMissing
             chain.any { it is IOException } -> NeedsUserCause.Unreachable(detailOf(error))
             else -> NeedsUserCause.Other(detailOf(error))

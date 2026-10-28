@@ -143,6 +143,15 @@
     <string name="known_hosts_empty">This machine has no saved host key. The app asks you to accept the key at the next connection.</string>
     <string name="known_hosts_delete">Delete the host key of %1$s</string>
 
+    <!-- SSH keyboard-interactive questions and a missing password -->
+    <string name="keyboard_interactive_title">Questions from the Host</string>
+    <string name="keyboard_interactive_body">The host %1$s asks these questions before the login to %2$s.</string>
+    <string name="keyboard_interactive_submit">Send</string>
+    <string name="password_missing_title">Type the Password</string>
+    <string name="password_missing_body">This device does not have the password of %1$s. Type the password to connect to %2$s.</string>
+    <string name="password_missing_label">Password</string>
+    <string name="password_missing_save">Save the password on this device</string>
+
     <!-- Connection stopped until the user does an action -->
     <string name="needs_user_login_refused">The host did not accept the login. Make sure that the user name, the password, and the key are correct.</string>
     <string name="needs_user_host_key_unknown">The app does not know the host key of %1$s. Accept or reject the key before you connect.</string>
@@ -151,7 +160,10 @@
     <string name="needs_user_key_locked">The key %1$s is locked. Connect again from the app, and unlock the key with your biometric or your screen lock.</string>
     <string name="needs_user_key_locked_no_alias">The SSH key is locked. Connect again from the app, and unlock the key with your biometric or your screen lock.</string>
     <string name="needs_user_key_from_earlier_version">The key %1$s is from an earlier version and needs a user authentication for each sign. This version cannot use it. Open the machine settings, make a new key, and add its public key to the host.</string>
-    <string name="needs_user_password_missing">This device does not have the password of this machine. Edit the machine and type the password again.</string>
+    <string name="needs_user_password_missing">This device does not have the password of this machine. Connect from the app and type the password.</string>
+    <string name="needs_user_input_required">The host %1$s asks questions before the login. Connect from the app and answer them.</string>
+    <string name="needs_user_input_timed_out">You did not answer the questions of %1$s in the time limit. Connect again and answer them.</string>
+    <string name="needs_user_input_cancelled">You cancelled the questions of %1$s. Connect again and answer them.</string>
     <string name="needs_user_unreachable">The app cannot connect to the host: %1$s</string>
     <string name="needs_user_other">The connection failed: %1$s</string>
 

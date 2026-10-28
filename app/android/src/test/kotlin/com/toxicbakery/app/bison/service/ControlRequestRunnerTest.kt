@@ -2,6 +2,9 @@ package com.toxicbakery.app.bison.service
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.ssh.KeyboardInteractiveOutcome
+import com.toxicbakery.app.bison.ssh.KeyboardInteractivePrompt
+import com.toxicbakery.app.bison.ssh.KeyboardInteractiveQuestion
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.UserAuthOutcome
@@ -12,6 +15,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -168,6 +172,33 @@ class ControlRequestRunnerTest {
         stateManager.cancelUserAuthBeforeQueue(SshRequest.Disconnect("workbox"))
 
         assertEquals(UserAuthOutcome.Cancelled, waiting.await())
+        assertEquals(0L, currentTime, "The connect waited for the time-out")
+    }
+
+    @Test
+    fun aDisconnectEndsTheKeyboardInteractiveWaitOfItsMachineBeforeTheQueue() = runTest {
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.hostUserAuthPrompts { awaitCancellation() }
+        }
+        val prompt = KeyboardInteractivePrompt(
+            machineId = "workbox",
+            machineName = "workbox",
+            hostPort = "workbox.lan:22",
+            name = "",
+            instruction = "",
+            questions = listOf(KeyboardInteractiveQuestion(text = "One-time code: ", echo = true)),
+        )
+        // The connect in the control queue waits for the answers of the user.
+        val waiting = async { stateManager.requestKeyboardInteractive(prompt, 90.seconds) }
+        runCurrent()
+
+        stateManager.cancelUserAuthBeforeQueue(SshRequest.Connect("workbox"))
+        runCurrent()
+        assertTrue(waiting.isActive, "A request that is not a disconnect of the machine ended the wait")
+
+        stateManager.cancelUserAuthBeforeQueue(SshRequest.Disconnect("workbox"))
+
+        assertEquals(KeyboardInteractiveOutcome.Cancelled, waiting.await())
         assertEquals(0L, currentTime, "The connect waited for the time-out")
     }
 

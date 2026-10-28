@@ -18,6 +18,7 @@ import org.apache.sshd.common.config.keys.PublicKeyEntry
 import org.apache.sshd.common.config.keys.PublicKeyEntryResolver
 import org.apache.sshd.common.keyprovider.KeyPairProvider
 import org.apache.sshd.server.SshServer
+import org.apache.sshd.server.auth.password.PasswordAuthenticator
 import org.apache.sshd.server.auth.keyboard.InteractiveChallenge
 import org.apache.sshd.server.auth.keyboard.KeyboardInteractiveAuthenticator
 import org.apache.sshd.server.command.CommandFactory
@@ -79,6 +80,13 @@ internal class TestSshServer(
     @Volatile
     var interactivePrompts: List<InteractivePrompt> = listOf(InteractivePrompt(prompt = "Password: ", answer = PASSWORD))
 
+    /**
+     * When false, the server does not offer the `password` method, so a client can log in to [INTERACTIVE_USER] only
+     * with the `keyboard-interactive` method. A change has an effect at the next [start].
+     */
+    @Volatile
+    var offerPasswordMethod: Boolean = true
+
     private val credentialCheckCount = AtomicInteger()
 
     /** The number of login requests that got to an authenticator of the server, for all users and methods. */
@@ -132,9 +140,13 @@ internal class TestSshServer(
             host = HOST
             port = this@TestSshServer.port
             keyPairProvider = KeyPairProvider { listOf(this@TestSshServer.hostKey) + extraHostKeys }
-            setPasswordAuthenticator { username, password, _ ->
-                credentialCheckCount.incrementAndGet()
-                username == PASSWORD_USER && password == PASSWORD
+            passwordAuthenticator = if (offerPasswordMethod) {
+                PasswordAuthenticator { username, password, _ ->
+                    credentialCheckCount.incrementAndGet()
+                    username == PASSWORD_USER && password == PASSWORD
+                }
+            } else {
+                null
             }
             setPublickeyAuthenticator { username, key, _ ->
                 credentialCheckCount.incrementAndGet()

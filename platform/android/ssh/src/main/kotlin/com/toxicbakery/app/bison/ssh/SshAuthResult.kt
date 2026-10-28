@@ -94,4 +94,21 @@ sealed interface SshAuthResult {
 
         private fun String.lowercaseKey(): String = replaceFirstChar { it.lowercaseChar() }
     }
+
+    /**
+     * The login needs answers from the user, and the user did not give them. [hostPort] is the bastion or the
+     * target that asks.
+     *
+     * - [timedOut] is false: the host asked questions with the `keyboard-interactive` method, and no UI was open
+     *   to ask the user, for example during a reconnect in the background.
+     * - [timedOut] is true: the user did not answer the questions of the host, or the question for a missing
+     *   password, before the time limit.
+     *
+     * A retry gives the same result until the user answers, so a reconnect loop must stop. It is not a
+     * [NetworkError]. A missing password with no UI gives [Failed] with a [MissingSecretException].
+     */
+    data class InputRequired(val hostPort: String, val timedOut: Boolean) : SshAuthResult
+
+    /** The user cancelled the questions of [hostPort]. A reconnect loop must stop. It is not a [NetworkError]. */
+    data class InputCancelled(val hostPort: String) : SshAuthResult
 }

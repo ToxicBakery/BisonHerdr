@@ -92,8 +92,9 @@ class MainActivity : FragmentActivity(), DIAware {
             requestNotificationPermissionIfNeeded()
         }
 
-        // Show the user authentication prompts of SSH keys only while this activity is started. In the
-        // background, a login with such a key stops at once and does not wait for the user.
+        // Show the user authentication prompts of SSH keys and the keyboard-interactive questions of a login only
+        // while this activity is started. In the background, such a login stops at once and does not wait for the
+        // user. The App composable shows the keyboard-interactive questions.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 sshStateManager.hostUserAuthPrompts { prompt -> showUserAuthPrompt(prompt) }
