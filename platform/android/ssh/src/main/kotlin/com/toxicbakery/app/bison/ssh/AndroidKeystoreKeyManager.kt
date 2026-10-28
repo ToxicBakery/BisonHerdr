@@ -440,7 +440,7 @@ class AndroidKeystoreKeyManager internal constructor(
 
     /**
      * Returns the cause of the AndroidKeyStore [error]. AndroidKeyStore gives an [IllegalStateException]
-     * when a key needs user authentication and the device has no secure screen lock or no biometric.
+     * when a key needs user authentication and the device has no secure screen lock.
      */
     private fun keyCreationFailure(
         algorithm: KeyAlgorithm,
@@ -459,7 +459,7 @@ class AndroidKeystoreKeyManager internal constructor(
         when (failure) {
             KeyCreationFailure.NoSecureLockScreen ->
                 "AndroidKeyStore did not make the key $keyAlias. The key needs user authentication, " +
-                    "but the device has no secure screen lock or no biometric."
+                    "but the device has no secure screen lock."
             is KeyCreationFailure.AlgorithmNotSupported -> unsupportedAlgorithmMessage(failure.algorithm)
             is KeyCreationFailure.Other -> "AndroidKeyStore did not make the key $keyAlias: ${failure.detail}"
         }

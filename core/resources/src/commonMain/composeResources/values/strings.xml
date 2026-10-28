@@ -98,7 +98,7 @@
     <string name="machine_field_mosh_ports_label">Mosh UDP Port Range</string>
     <string name="machine_field_auth_method_label">Authentication Method</string>
     <string name="machine_auth_keystore">Android Keystore Private Key (Ed25519 / RSA / ECDSA)</string>
-    <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock and a biometric. Set them in the device settings. Then show the public key again.</string>
+    <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock. Set a PIN, a pattern, or a password in the device settings. Then show the public key again.</string>
     <string name="machine_key_error_algorithm_not_supported">This device cannot make %1$s keys. Select a different key type.</string>
     <string name="machine_key_error_other">The device key store did not make the key: %1$s</string>
     <string name="machine_key_regenerate_hint">The biometric setting applies only when the app makes a key. To apply a changed setting, or to update a key from an earlier version, make a new key.</string>
