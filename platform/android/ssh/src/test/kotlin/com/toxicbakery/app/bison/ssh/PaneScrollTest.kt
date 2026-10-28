@@ -632,7 +632,7 @@ class PaneScrollTest {
         held.release()
         poll.join()
         val frame = assertNotNull(surfaceBus.surfaceFor("box"))
-        assertEquals(12, frame.offset(), "After a failed request, a poll must show the position of Herdr")
+        assertEquals(12, frame.offset(), "After a failed request, the poll must show the position of its snapshot")
         assertTrue(frame.showsText("line at 12 NEW"), "The poll must not show the text of the older answer")
     }
 

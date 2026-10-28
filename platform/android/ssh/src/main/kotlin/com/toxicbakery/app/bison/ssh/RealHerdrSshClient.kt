@@ -412,6 +412,9 @@ internal class RealHerdrSshClient(
      *   publish first, and the frame of the flush then shows older text at the new position until the next frame.
      * - A poll publishes its snapshot in its first locked step, and it can drop its frame in its second locked step.
      *   Then the snapshot bus is newer than the frame bus until the next poll.
+     * - A poll can show the older position of its snapshot for one poll. This occurs when Herdr answers a scroll
+     *   request during the poll, and a later request of that pane fails. For example, the snapshot shows 12, Herdr
+     *   answers 30, and a request to 40 fails. Then the poll shows 12, and the next poll shows 30.
      *
      * Each machine has its own lock, so a step does not wait for the frames of a different machine. No step holds the
      * lock across network I/O. A frame build has no network I/O. In the app, [sendPaneInput] and [resizeViewport] run
@@ -452,8 +455,8 @@ internal class RealHerdrSshClient(
         /**
          * A poll with a lower number publishes nothing, because its data is older than the data on the buses. A poll
          * that publishes sets this value to its own number. A change of the selection and [disconnect] set it to a new
-         * number. A poll that got its number before can have read the old selection. It can also end after the
-         * disconnect. See [refreshSnapshotAndSurface].
+         * number. A poll that got its number before such a step asked for its snapshot before the step. Thus that poll
+         * publishes nothing. See [refreshSnapshotAndSurface].
          */
         var minPollSeq: Long = 0L
     }
@@ -476,7 +479,7 @@ internal class RealHerdrSshClient(
 
     /**
      * Stops the polls of [machineId] that started before this call: they publish nothing. Call it after a change of
-     * the selection, because these polls can have read the old selection.
+     * the selection. These polls asked for their snapshots before the change.
      */
     private fun discardRunningPolls(machineId: String) {
         withFrames(machineId) { frames -> frames.minPollSeq = pollSequence.incrementAndGet() }
@@ -1000,9 +1003,9 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Removes the scroll requests of each pane that is not in [snapshotPaneIds], when the pane has no request in the
-     * queue and no request with no answer. Thus the requests of closed panes do not stay until [disconnect]. The
-     * caller holds the frame lock.
+     * Removes the scroll requests of each closed pane, that is, a pane that is not in [snapshotPaneIds]. The client
+     * keeps the requests of a closed pane while it has a request in the queue or a request with no answer. Thus the
+     * requests of closed panes do not stay until [disconnect]. The caller holds the frame lock.
      */
     private fun pruneScrollRequests(frames: MachineFrames, snapshotPaneIds: Set<String>) {
         frames.scrollRequests.entries.removeAll { (paneId, requests) ->
@@ -1016,9 +1019,10 @@ internal class RealHerdrSshClient(
      * frame lock of the machine, and gives its [frames].
      *
      * For each pane, Herdr answered the scroll requests up to the number in [answeredBeforeSnapshot] before the
-     * snapshot, so the snapshot shows their positions. A newer request can be newer than the snapshot: it is not sent
-     * yet, Herdr did not answer it yet, or Herdr answered it during the poll. Thus each pane of the snapshot with such
-     * a request keeps the position of its newest request. A pane that is not in [snapshotPaneIds] gets no position.
+     * snapshot, so the snapshot shows their positions. A newer request can be newer than the snapshot. Such a request
+     * is not sent yet, or Herdr did not answer it yet, or Herdr answered it during the poll. Thus each pane of the
+     * snapshot with such a request keeps the position of its newest request. A pane that is not in [snapshotPaneIds]
+     * gets no position.
      */
     private fun mergePaneScrolls(
         machineId: String,
@@ -1047,13 +1051,18 @@ internal class RealHerdrSshClient(
      * when all of these conditions are true:
      * - Herdr answered a scroll request of the pane during the batch that read the pane.
      * - The answer had the pane text, so the cache has text that is newer than the scroll.
-     * - The poll can have read the pane before the scroll: the snapshot does not show the position of that answer,
-     *   or Herdr answered two or more requests of the pane after the snapshot. In the second case, the pane can move
-     *   and come back between the snapshot and the read, for example from 12 to 40 and back to 12.
+     * - The order of the read and the scroll is not known. This is the case when the snapshot does not show the
+     *   position of that answer. It is also the case when Herdr answered two or more requests of the pane after the
+     *   snapshot. Then the pane can move and come back between the snapshot and the read, for example from 12 to 40
+     *   and back to 12.
      *
-     * The second batch reads after the snapshot. When the snapshot shows the position of the answer, and Herdr
-     * answered only that request after the snapshot, both batches read the pane after the scroll. Then the poll keeps
-     * the text that it read. A failed request gives no text.
+     * The second batch reads after the snapshot. Two conditions show that both batches read the pane after the
+     * scroll. The snapshot shows the position of the answer, and Herdr answered only that request after the snapshot.
+     * Then the poll keeps the text that it read. A failed request gives no text.
+     *
+     * The rule for two answers has a cost in the first batch. A poll that reads the pane after two answers shows the
+     * cached answer text for one poll, not the newer output of the shell. The position is correct. The fake Herdr of
+     * the tests cannot stop between the snapshot and the reads of one batch. Thus no test covers this case.
      */
     private fun keepScrollAnswerText(
         machineId: String,
