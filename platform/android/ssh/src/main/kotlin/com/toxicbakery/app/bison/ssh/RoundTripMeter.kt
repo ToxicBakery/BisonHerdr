@@ -16,8 +16,9 @@ import kotlin.time.TimeSource
  *
  * [record] gives the average in whole milliseconds to its publish function, at most one time in each
  * [PUBLISH_INTERVAL] for a machine. The value is 1 or more, because [ActiveBackbone.UNMEASURED_RTT_MS] (0) tells
- * that the app did not measure a poll yet. The publish function returns true when it changed the value that the app shows. When it returns false,
- * for example because the value did not change, the interval does not start, and the next sample can publish.
+ * that the app did not measure a poll yet. The publish function returns true when it changed the value that the app
+ * shows. When it returns false, for example because the value did not change, the interval does not start, and the
+ * next sample can publish.
  *
  * [timeSource] measures the publish interval. A test gives a source with virtual time.
  */

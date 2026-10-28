@@ -5,6 +5,7 @@ import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SocketFactory
+import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -118,7 +119,7 @@ import kotlinx.serialization.json.put
  *
  * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
  * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
- * second.
+ * second. A connect, a disconnect, and a reconnect of the supervisor start a new average.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -311,6 +312,10 @@ internal class RealHerdrSshClient(
         }
 
         override suspend fun onReconnected(machineId: String) {
+            // The poll time of the old session does not apply to the new session. The UI shows no value until the
+            // first sample of the new session.
+            roundTripMeter.reset(machineId)
+            roundTripListener?.invoke(machineId, ActiveBackbone.UNMEASURED_RTT_MS)
             sessionEvents?.onReconnected(machineId)
         }
 
