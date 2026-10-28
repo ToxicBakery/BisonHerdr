@@ -230,9 +230,9 @@ class SshTransportManager(
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.AuthenticatingSsh)
         val proxy = machine.proxyJump
         if (machine.hostname.isBlank() || !machine.isValidPort ||
-            (proxy != null && (proxy.bastionHost.isBlank() || proxy.bastionPort !in 1..65535 || proxy.bastionHost.endsWith(".invalid")))
+            (proxy != null && (proxy.bastionHost.isBlank() || proxy.bastionPort !in 1..65535))
         ) {
-            val message = "Invalid or unreachable SSH/Bastion endpoint for ${machine.displayAddress}"
+            val message = "Invalid SSH or bastion endpoint for ${machine.displayAddress}"
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "ProxyJump",

@@ -412,7 +412,7 @@ class ConnectionPathsE2ETest {
         assertTrue(hTailscale.transport.connect(tailscaleHost))
         assertEquals(ConnectionProgress.Connected, hTailscale.stateManager.connectionProgress.value["route-tailscale"])
 
-        // Path 5C (part 2): Invalid bastion host (blank or unreachable) fails cleanly to ConnectionProgress.Failed
+        // Path 5C (part 2): A blank or unreachable bastion host gives ConnectionProgress.Failed
         val hBlankBastion = Harness()
         val blankBastionHost = bastionHost.copy(
             id = "route-invalid-blank",
@@ -428,11 +428,17 @@ class ConnectionPathsE2ETest {
             hBlankBastion.stateManager.connectionProgress.value["route-invalid-blank"],
         )
 
+        // The transport has no host name rule. The simulated backend gives the network error of the bastion.
         val hUnreachableBastion = Harness()
+        val probedRoutes = mutableListOf<ResolvedSshRoute>()
+        hUnreachableBastion.backend.sshRouteProbe = { _, route ->
+            probedRoutes += route
+            route.entryHost != "dead-bastion.example.com"
+        }
         val unreachableBastionHost = bastionHost.copy(
             id = "route-invalid-unreachable",
             proxyJump = ProxyJumpConfig(
-                bastionHost = "dead-bastion.invalid",
+                bastionHost = "dead-bastion.example.com",
                 bastionPort = 2222,
                 bastionUser = "jump",
             ),
@@ -441,6 +447,10 @@ class ConnectionPathsE2ETest {
         assertEquals(
             ConnectionProgress.Failed,
             hUnreachableBastion.stateManager.connectionProgress.value["route-invalid-unreachable"],
+        )
+        assertEquals(setOf("dead-bastion.example.com"), probedRoutes.map { it.entryHost }.toSet())
+        assertIs<NeedsUserCause.Unreachable>(
+            hUnreachableBastion.stateManager.needsUser.value["route-invalid-unreachable"],
         )
     }
 
