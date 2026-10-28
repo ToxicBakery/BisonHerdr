@@ -59,6 +59,8 @@ class MainActivity : ComponentActivity(), DIAware {
         setTurnScreenOn(true)
 
         applyFakeServerIntent(intent)
+        // A uiMode or locale change makes a new activity. Keep the rationale dialog open.
+        showNotificationRationale = savedInstanceState?.getBoolean(STATE_SHOW_NOTIFICATION_RATIONALE) ?: false
 
         setContent {
             withDI(di) {
@@ -86,6 +88,11 @@ class MainActivity : ComponentActivity(), DIAware {
         if (savedInstanceState == null) {
             requestNotificationPermissionIfNeeded()
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_SHOW_NOTIFICATION_RATIONALE, showNotificationRationale)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -173,6 +180,7 @@ class MainActivity : ComponentActivity(), DIAware {
 
     companion object {
         const val EXTRA_FAKE_SERVER: String = "fake_server"
+        private const val STATE_SHOW_NOTIFICATION_RATIONALE: String = "show_notification_rationale"
 
         private val log = Arbor.tag("MainActivity")
     }
