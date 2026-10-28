@@ -37,6 +37,7 @@ import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_ROWS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.MOSH_UDP_HANDSHAKE_TIMEOUT_MS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildMoshServerBootstrapCommand
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildSshEndpointBridgeCommand
+import java.io.IOException
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -73,16 +74,17 @@ class SimulatedSshBackend(
     override suspend fun authenticate(
         machine: HostMachine,
         route: ResolvedSshRoute,
-    ): Boolean {
+    ): SshAuthResult {
         val routeReachable = sshRouteProbe?.invoke(machine, route) ?: true
         if (!routeReachable) {
+            val message = "SSH route unreachable for ${route.entryHost}:${route.entryPort}"
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "ProxyJump",
-                message = "SSH route unreachable for ${route.entryHost}:${route.entryPort}",
+                message = message,
                 isError = true,
             )
-            return false
+            return SshAuthResult.NetworkError(IOException(message))
         }
         val challenge = "ssh-userauth:${machine.id}:${route.targetHost}:${route.targetPort}".toByteArray(Charsets.UTF_8)
         return when (val auth = machine.authMethod) {
@@ -103,7 +105,11 @@ class SimulatedSshBackend(
                     message = "Authenticated ${machine.displayAddress} with AndroidKeyStore ${auth.algorithm.sshKeyType} " +
                         "(alias=${exported.keyAlias}, sigBytes=${sig.size}, viaBastion=${route.viaBastion})",
                 )
-                sig.isNotEmpty()
+                if (sig.isNotEmpty()) {
+                    SshAuthResult.Success
+                } else {
+                    SshAuthResult.Failed(IllegalStateException("Empty signature from ${exported.keyAlias}"))
+                }
             }
 
             is SshAuthMethod.Password -> {
@@ -116,14 +122,14 @@ class SimulatedSshBackend(
                         message = "Password authentication failed for ${machine.displayAddress}: invalid or blank credential",
                         isError = true,
                     )
-                    return false
+                    return SshAuthResult.AuthFailed("Invalid or blank credential")
                 }
                 sshDebugLog.record(
                     machineId = machine.id,
                     tag = "SSHAuth",
                     message = "Authenticated ${machine.displayAddress} via encrypted password credential (viaBastion=${route.viaBastion})",
                 )
-                true
+                SshAuthResult.Success
             }
 
             is SshAuthMethod.HardwareSecurityKey -> {
@@ -138,7 +144,10 @@ class SimulatedSshBackend(
                     applicationId = auth.applicationId,
                     challenge = challenge,
                 )
-                result.isSuccess
+                result.fold(
+                    onSuccess = { SshAuthResult.Success },
+                    onFailure = { SshAuthResult.Failed(it) },
+                )
             }
         }
     }

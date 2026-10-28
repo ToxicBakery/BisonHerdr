@@ -230,10 +230,14 @@ internal class RealHerdrSshClient(
     private fun optimisticEditsFor(machineId: String): ArrayDeque<OptimisticEdit> =
         optimisticEdits.computeIfAbsent(machineId) { ArrayDeque() }
 
+    /**
+     * Opens the session to [machine] and runs one check command. Returns the error when the session does
+     * not open, so that the caller can tell the kind of the failure.
+     */
     suspend fun connectAndVerify(
         machine: HostMachine,
         route: ResolvedSshRoute,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val out = executeBatchOnLane(
                 machine = machine,
@@ -246,8 +250,7 @@ internal class RealHerdrSshClient(
                 tag = "RealSSH",
                 message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
             )
-            true
-        }.getOrElse { err ->
+        }.onFailure { err ->
             val errDetail = err.message?.takeIf { it.isNotBlank() }
                 ?: err::class.simpleName
                 ?: "Unknown SSH error"
@@ -257,7 +260,6 @@ internal class RealHerdrSshClient(
                 message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
                 isError = true,
             )
-            false
         }
     }
 

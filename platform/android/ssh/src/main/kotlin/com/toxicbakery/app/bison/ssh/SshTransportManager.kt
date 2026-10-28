@@ -137,8 +137,14 @@ class SshTransportManager(
             return false
         }
         val route = proxyJumpTunnel.resolveRoute(machine)
-        val authSucceeded = backend.authenticate(machine, route)
-        if (!authSucceeded) {
+        val authResult = backend.authenticate(machine, route)
+        if (authResult != SshAuthResult.Success) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "SSHAuth",
+                message = "Login to ${machine.displayAddress} failed: ${describe(authResult)}",
+                isError = true,
+            )
             sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
             return false
         }
@@ -428,6 +434,14 @@ class SshTransportManager(
             surfaceLeaseActive[machineId] != false
         }
     }
+
+    private fun describe(result: SshAuthResult): String =
+        when (result) {
+            SshAuthResult.Success -> "Success"
+            is SshAuthResult.AuthFailed -> "AuthFailed (${result.message})"
+            is SshAuthResult.NetworkError -> "NetworkError (${result.cause.message ?: result.cause::class.simpleName})"
+            is SshAuthResult.Failed -> "Failed (${result.cause.message ?: result.cause::class.simpleName})"
+        }
 
     private suspend fun flushOfflinePrompts(machineId: String) {
         val pending = sshStateManager.flushQueuedPrompts(machineId)

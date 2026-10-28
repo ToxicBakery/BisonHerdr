@@ -15,9 +15,9 @@ import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 interface SshBackend {
 
     /**
-     * Logs in to [machine] over [route]. Returns false when the login fails.
+     * Logs in to [machine] over [route]. Returns [SshAuthResult.Success], or the kind of the failure.
      */
-    suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): Boolean
+    suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult
 
     /**
      * Selects the backbone for [machine]: Mosh UDP or the SSH endpoint bridge.

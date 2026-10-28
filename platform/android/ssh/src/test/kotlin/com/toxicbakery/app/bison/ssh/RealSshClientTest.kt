@@ -3,11 +3,12 @@ package com.toxicbakery.app.bison.ssh
 import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
+import java.net.ConnectException
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
@@ -43,7 +44,7 @@ class RealSshClientTest {
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
-        assertTrue(backend.authenticate(machine, route), debugLogDump())
+        assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
         assertEquals("password login ok", backend.client.runCommand(machine, route, "echo password login ok").trim())
     }
 
@@ -56,7 +57,7 @@ class RealSshClientTest {
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
-        assertTrue(backend.authenticate(machine, route), debugLogDump())
+        assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
         assertEquals("key login ok", backend.client.runCommand(machine, route, "echo key login ok").trim())
     }
 
@@ -69,7 +70,8 @@ class RealSshClientTest {
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
-        assertFalse(backend.authenticate(machine, route))
+        val result = assertIs<SshAuthResult.AuthFailed>(backend.authenticate(machine, route))
+        assertTrue(result.message.startsWith(AUTH_FAIL), result.message)
         assertTrue(
             debugLog.entries.value.any { it.isError && it.message.contains(AUTH_FAIL) },
             debugLogDump(),
@@ -78,6 +80,27 @@ class RealSshClientTest {
             backend.client.runCommand(machine, route, "echo not reached")
         }
         assertTrue(error.message.orEmpty().startsWith(AUTH_FAIL), error.message)
+    }
+
+    @Test
+    fun stoppedServerGivesANetworkError() = runTest {
+        val machine = machine(
+            id = "stopped-server",
+            username = TestSshServer.PASSWORD_USER,
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = TestSshServer.PASSWORD),
+        )
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+        server.stop()
+
+        val result = assertIs<SshAuthResult.NetworkError>(backend.authenticate(machine, route), debugLogDump())
+        assertIs<ConnectException>(generateSequence(result.cause) { it.cause }.last())
+    }
+
+    @Test
+    fun otherLoginErrorsAreFailed() {
+        val error = JSchException("Algorithm negotiation fail")
+
+        assertEquals(SshAuthResult.Failed(error), RealSshBackend.toAuthResult(error))
     }
 
     private fun machine(id: String, username: String, authMethod: SshAuthMethod): HostMachine =

@@ -21,7 +21,7 @@ class SelectingSshBackend(
     fun backendFor(machineId: String): SshBackend =
         if (isSimulated(machineId)) simulated else real
 
-    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): Boolean =
+    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult =
         backendFor(machine.id).authenticate(machine, route)
 
     override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone? =

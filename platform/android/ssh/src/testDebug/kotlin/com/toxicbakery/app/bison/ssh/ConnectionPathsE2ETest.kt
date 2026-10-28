@@ -333,6 +333,11 @@ class ConnectionPathsE2ETest {
         )
         assertFalse(hPwInvalid.transport.connect(invalidPwHost))
         assertEquals(ConnectionProgress.Failed, hPwInvalid.stateManager.connectionProgress.value["auth-pw-invalid"])
+        assertTrue(
+            hPwInvalid.debugLog.entries.value.any {
+                it.isError && it.tag == "SSHAuth" && it.message.contains("failed: AuthFailed")
+            },
+        )
 
         // Path 4C: HardwareSecurityKey across SkSshEd25519, SkEcdsaSha2Nistp256, PivSmartCard and all transports
         val keyTypes = listOf(
