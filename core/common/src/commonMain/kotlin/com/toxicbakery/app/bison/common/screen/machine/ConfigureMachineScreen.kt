@@ -257,6 +257,8 @@ fun ConfigureMachineScreen(
                                 onClick = {
                                     viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateTransportMode(mode))
                                 },
+                                // Mosh is not available in this version (issue #22), so the user cannot select it.
+                                enabled = mode != TransportMode.MoshOnly,
                                 label = { Text(stringResource(label)) },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = palette.accentPrimary.copy(alpha = 0.22f),

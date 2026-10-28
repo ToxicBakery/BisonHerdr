@@ -197,8 +197,8 @@ fun ConnectingMachineScreen(
                                 fontWeight = FontWeight.SemiBold,
                             )
                             val backboneBadge = when (val bb = activeBackbone) {
-                                is ActiveBackbone.MoshUdp -> "MOSH UDP :${bb.udpPort} (${bb.rttMs}ms)"
-                                is ActiveBackbone.SshEndpoint -> "SSH ENDPOINT (${bb.rttMs}ms)"
+                                is ActiveBackbone.MoshUdp -> "MOSH UDP :${bb.udpPort} (${pollTimeText(bb)})"
+                                is ActiveBackbone.SshEndpoint -> "SSH ENDPOINT (${pollTimeText(bb)})"
                                 null -> progress.name
                             }
                             Text(

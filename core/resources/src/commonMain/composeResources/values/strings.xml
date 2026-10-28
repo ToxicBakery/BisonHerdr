@@ -21,9 +21,6 @@
     <!-- Zen Canvas Floating Top HUD Islands -->
     <string name="hud_host_switcher_description">Switch Host, Workspace, or Tab</string>
     <string name="hud_host_workspace_summary">%1$s &#8226; %2$s (%3$d/%4$d)</string>
-    <string name="hud_rtt_ms">%1$d ms</string>
-    <string name="hud_local_echo_on">Local Echo: ON</string>
-    <string name="hud_local_echo_off">Local Echo: OFF</string>
     <string name="hud_agents_pill_label">Agents</string>
     <string name="hud_agents_blocked_count">%1$d Blocked</string>
     <string name="hud_agents_working_count">%1$d Working</string>
@@ -38,15 +35,12 @@
     <string name="hud_tab_create">New Tab</string>
 
     <!-- Transport & Roaming Badges -->
-    <string name="transport_badge_mosh_udp">MOSH &#8226; UDP</string>
-    <string name="transport_badge_mosh_udp_port">MOSH UDP :%1$d</string>
-    <string name="transport_badge_mosh_roamed">MOSH ROAMED</string>
     <string name="transport_badge_ssh_tcp">SSH &#8226; TCP</string>
-    <string name="transport_badge_ssh_fallback">SSH &#8226; TCP (Mosh UDP unavailable)</string>
+    <string name="transport_poll_time_ms">poll %1$d ms</string>
+    <string name="transport_poll_time_unmeasured">poll &#8211;</string>
     <string name="roaming_status_healthy">Connected</string>
     <string name="roaming_status_parked">Background Parked (0 B/s)</string>
     <string name="roaming_status_reconnecting">Reconnecting&#8230;</string>
-    <string name="roaming_zero_drop_armed">Reconnect after a network change: ready</string>
 
     <!-- Slide-Over Federated Agent Command Center -->
     <string name="agent_drawer_title">Federated Agent Command Center</string>
@@ -93,7 +87,7 @@
     <string name="machine_field_username_label">SSH Username</string>
     <string name="machine_field_transport_mode_label">Transport Backbone</string>
     <string name="machine_transport_auto_prefer_mosh">Auto (SSH Endpoint Bridge, Mosh planned)</string>
-    <string name="machine_transport_mosh_only">Mosh Only (planned, SSH Endpoint Bridge now)</string>
+    <string name="machine_transport_mosh_only">Mosh Only (not available in this version)</string>
     <string name="machine_transport_ssh_only">SSH Endpoint Bridge Only</string>
     <string name="machine_field_mosh_path_label">Custom mosh-server Path (Optional)</string>
     <string name="machine_transport_mosh_planned_hint">This version connects each machine over the SSH Endpoint Bridge. Mosh UDP is planned for a later version. The app only checks if the host has mosh-server.</string>
@@ -113,7 +107,6 @@
     <string name="machine_bastion_credentials_hint">The app also uses the password or key of this machine for the bastion.</string>
     <string name="machine_connecting_title">Connecting to %1$s</string>
     <string name="machine_connecting_step_ssh">1. Authenticating SSH &amp; verifying host key&#8230;</string>
-    <string name="machine_connecting_step_mosh">2. Select the SSH Endpoint Bridge and check for mosh-server&#8230;</string>
     <string name="machine_connecting_step_handshake">3. Herdr Endpoint Gen 1 hello over SSH&#8230;</string>
     <string name="machine_connecting_progress_title">Connection Progress</string>
     <string name="machine_connecting_log_empty">No SSH diagnostic events yet&#8230;</string>
@@ -178,7 +171,6 @@
     <string name="settings_host_theme_override_label">Per-Host Theme Override</string>
     <string name="settings_theme_default_badge">Default</string>
     <string name="settings_font_size_label">Terminal Font Size (pt)</string>
-    <string name="settings_section_mosh_roaming">Roaming &amp; Background Parking</string>
     <string name="settings_predictive_echo_label">Predictive Local Echo Underlines</string>
     <string name="settings_surface_lease_label">Zero-Bandwidth Background Parking (surface_interest)</string>
     <string name="settings_app_check_updates">Check for updates</string>
