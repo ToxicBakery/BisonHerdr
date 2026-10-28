@@ -171,7 +171,7 @@ val checkReleaseClasses = tasks.register<CheckReleaseClassesTask>("checkReleaseC
     debugClassList = listDebugClasses.flatMap { task -> task.classList }
     releaseClassList = listReleaseClasses.flatMap { task -> task.classList }
     // Each class that only the debug build has must match one of these names. Move a class to a main source set,
-    // and the check fails.
+    // and the check fails when R8 keeps the class.
     debugOnlyClasses = setOf(
         "com.toxicbakery.app.bison.activity.DemoActivity",
         "com.toxicbakery.app.bison.debug.FakeServerModuleAliasKt",

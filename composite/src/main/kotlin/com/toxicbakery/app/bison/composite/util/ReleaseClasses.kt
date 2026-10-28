@@ -4,8 +4,8 @@ import java.io.File
 import java.util.zip.ZipFile
 
 /**
- * Reads the classes of a build and the R8 mapping file of a release build, and finds the classes that only a debug
- * build can have.
+ * Reads the classes of a build and the R8 mapping file of a release build. Then it finds the classes that only a
+ * debug build can have.
  *
  * A class name has the Java form, for example `com.example.Outer$Inner`. A debug-only name is a class or a package.
  * It matches the class, its nested classes, and the classes of the package.
@@ -100,8 +100,8 @@ object ReleaseClasses {
      * - A class of the release mapping that matches a debug-only name is in [Result.shipped].
      * - A top-level class in [checkedPackage] that [debugClasses] has and [releaseClasses] does not have is debug-only
      *   code. When no debug-only name matches it, it is in [Result.undeclared]. Thus each new debug-only class must
-     *   get a name, and a later move of the class to a main source set fails the check. A class that has a twin with
-     *   the same name in the release build, for example the `DebugModuleKt` of each build type, is not debug-only.
+     *   get a name. A later move of the class to a main source set then fails the check when R8 keeps the class. A
+     *   class that has a twin with the same name in the release build, such as `DebugModuleKt`, is not debug-only.
      * - A debug-only name that matches no class of [debugClasses] is in [Result.unused].
      * - A class of [requiredClasses] that is not a class of the release mapping is in [Result.missing].
      */

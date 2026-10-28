@@ -18,9 +18,11 @@ import org.gradle.api.tasks.TaskAction
  * Checks the classes of a release build in its R8 mapping file. [ReleaseClasses.check] gives the rules.
  *
  * The mapping names each class of the dex files, and each class that R8 inlined or moved members from. The task
- * fails when the mapping has a debug-only class, when the debug build has a debug-only class that
- * [debugOnlyClasses] does not name, when a name of [debugOnlyClasses] matches no class, or when the mapping does
- * not have each class of [requiredClasses].
+ * fails in these cases:
+ * - The mapping has a debug-only class.
+ * - The debug build has a debug-only class that [debugOnlyClasses] does not name.
+ * - A name of [debugOnlyClasses] matches no class.
+ * - The mapping does not have each class of [requiredClasses].
  */
 @CacheableTask
 abstract class CheckReleaseClassesTask : DefaultTask() {

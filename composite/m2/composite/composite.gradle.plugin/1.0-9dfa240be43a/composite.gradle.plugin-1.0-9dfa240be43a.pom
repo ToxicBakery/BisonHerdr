@@ -3,14 +3,14 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>composite</groupId>
   <artifactId>composite.gradle.plugin</artifactId>
-  <version>1.0-96137524624c</version>
+  <version>1.0-9dfa240be43a</version>
   <packaging>pom</packaging>
   <name>Composite Plugin</name>
   <dependencies>
     <dependency>
       <groupId>com.toxicbakery.app.bison.composite</groupId>
       <artifactId>composite</artifactId>
-      <version>1.0-96137524624c</version>
+      <version>1.0-9dfa240be43a</version>
     </dependency>
   </dependencies>
 </project>

@@ -3,11 +3,11 @@
   <groupId>composite</groupId>
   <artifactId>composite.gradle.plugin</artifactId>
   <versioning>
-    <latest>1.0-96137524624c</latest>
-    <release>1.0-96137524624c</release>
+    <latest>1.0-9dfa240be43a</latest>
+    <release>1.0-9dfa240be43a</release>
     <versions>
-      <version>1.0-96137524624c</version>
+      <version>1.0-9dfa240be43a</version>
     </versions>
-    <lastUpdated>20261028171913</lastUpdated>
+    <lastUpdated>20261028184301</lastUpdated>
   </versioning>
 </metadata>
