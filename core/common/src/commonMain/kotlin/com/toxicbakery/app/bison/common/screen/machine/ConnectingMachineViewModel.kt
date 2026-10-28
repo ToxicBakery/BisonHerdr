@@ -251,17 +251,17 @@ class ConnectingMachineViewModel(
 
         private val ORDERED_STAGES = listOf(
             ConnectionProgress.AuthenticatingSsh to (
-                "1. Authenticating SSH2" to "Verifying host fingerprint & signing with Keystore key or password"
+                "1. SSH Login" to "Check the host key, then log in with the Keystore key or the password"
                 ),
-            // This version has no Mosh transport (issue #22), so step 2 always selects the SSH endpoint bridge.
+            // This version has no Mosh transport (issue #22), so step 2 always selects the SSH session.
             ConnectionProgress.BootstrappingMoshOrBridge to (
-                "2. Select the Transport" to "SSH endpoint bridge (herdr remote-client-bridge); check for mosh-server"
+                "2. Select the Transport" to "Use the SSH session. Mosh is not available in this version"
                 ),
             ConnectionProgress.VerifyingUdpOrHello to (
-                "3. Herdr Endpoint Hello" to "Send the Herdr Endpoint Gen 1 hello over SSH"
+                "3. Look for Mosh" to "Look for mosh-server on the host, except for an SSH-only machine"
                 ),
             ConnectionProgress.SyncingHerdrSnapshot to (
-                "4. Syncing Herdr Workspace Snapshot" to "Acquiring surface lease & initial BSP layout tree"
+                "4. Read the Herdr Workspace" to "Run herdr api snapshot, then read the visible panes with pane.read"
                 ),
         )
 

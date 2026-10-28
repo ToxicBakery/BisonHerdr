@@ -179,13 +179,7 @@ class ConnectionPathsE2ETest {
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "host-1b" }
         assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
-        assertTrue(
-            logs.any {
-                it.tag == "EndpointGen1" &&
-                    it.message.contains("herdr remote-client-bridge --idle-timeout-v1") &&
-                    it.message.contains("surfaceActive=true")
-            },
-        )
+        assertTrue(logs.any { it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG })
         assertNotNull(h.snapshotBus.snapshotFor("host-1b"))
         assertNotNull(h.surfaceBus.surfaceFor("host-1b"))
     }
@@ -255,13 +249,7 @@ class ConnectionPathsE2ETest {
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "ssh-only-3" }
         assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
-        assertTrue(
-            logs.any {
-                it.tag == "EndpointGen1" &&
-                    it.message.contains("herdr remote-client-bridge --idle-timeout-v1") &&
-                    it.message.contains("surfaceActive=true")
-            },
-        )
+        assertTrue(logs.any { it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG })
     }
 
     @Test
@@ -475,14 +463,15 @@ class ConnectionPathsE2ETest {
         assertEquals(surfaceBeforePark.bootId, surfaceWhileParked.bootId)
         assertEquals(surfaceBeforePark.panes.size, surfaceWhileParked.panes.size)
 
-        // Path 6B: setSurfaceLease(active = true) commits presentation fence and restores Healthy
+        // Path 6B: setSurfaceLease(active = true) publishes the frame with a new presentation epoch and restores
+        // Healthy. This version has no Herdr endpoint stream, so the log tells that the ready control was not sent.
         h.transport.setSurfaceLease(machineId, active = true)
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(
             h.debugLog.entries.value.any {
                 it.machineId == machineId &&
                     it.tag == "PresentationFence" &&
-                    it.message.contains("endpoint.presentation.ready.v1")
+                    it.message.startsWith("Did not send endpoint.presentation.ready.v1")
             },
         )
 

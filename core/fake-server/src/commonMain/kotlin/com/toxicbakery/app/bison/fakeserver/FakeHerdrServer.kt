@@ -49,8 +49,8 @@ import kotlinx.serialization.json.jsonPrimitive
 /**
  * Simulated multi-machine Herdr server for debug / demo builds (`DemoActivity`).
  *
- * Seeds two realistic machines (`workbox` over SSH Endpoint Gen 1 at `11ms` RTT with local predictive echo,
- * and `gpu-rig` over SSH Endpoint Gen 1 at `28ms` RTT), multiple workspaces & Git worktrees, tabs,
+ * Seeds two realistic machines on the SSH backbone (`workbox` with a simulated poll time of 11 ms, and `gpu-rig`
+ * with 28 ms), multiple workspaces & Git worktrees, tabs,
  * a 3-pane BSP split terminal layout with TrueColor cells matching the Zen Canvas specification,
  * and federated coding agents (`Claude Code` in `Blocked` state, `Codex CLI` in `Working` state,
  * and `Gemini CLI` in `Done` state).
@@ -376,14 +376,14 @@ class FakeHerdrServer(
             ),
         )
 
-        // This version has no Mosh transport (issue #22), so each machine uses the SSH endpoint bridge.
+        // This version has no Mosh transport (issue #22), so each machine uses the SSH session.
         val workboxBackbone = ActiveBackbone.SshEndpoint(
             rttMs = 11,
             fallbackReason = MoshSessionEngine.MOSH_SERVER_FOUND,
         )
         val gpuRigBackbone = ActiveBackbone.SshEndpoint(
             rttMs = 28,
-            fallbackReason = "SSH Endpoint Gen 1 (surface_delta)",
+            fallbackReason = null,
         )
 
         machineStates[WORKBOX_ID] = SimulatedMachineState(
@@ -429,13 +429,13 @@ class FakeHerdrServer(
         )
         sshDebugLog.record(
             machineId = WORKBOX_ID,
-            tag = "ENDPOINT",
-            message = "Endpoint Generation 1 connected (shell.snapshot.v1 + surface_delta, 11ms RTT, local echo ON)",
+            tag = "Demo",
+            message = "Simulated SSH session of the demo host (simulated poll time 11 ms)",
         )
         sshDebugLog.record(
             machineId = GPU_RIG_ID,
-            tag = "ENDPOINT",
-            message = "Endpoint Generation 1 connected (shell.snapshot.v1 + surface_delta, 28ms RTT)",
+            tag = "Demo",
+            message = "Simulated SSH session of the demo host (simulated poll time 28 ms)",
         )
     }
 
@@ -476,14 +476,14 @@ class FakeHerdrServer(
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "SurfaceLease",
-                message = "client_shell.surface.set(active=true) -> resumed 120Hz surface stream (<20ms)",
+                message = "Surface lease on: the demo host shows new frames again",
             )
         } else {
             sshStateManager.setRoamingStatus(machineId, RoamingStatus.SurfaceParked)
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "SurfaceLease",
-                message = "client_shell.surface.set(active=false) -> parked surface stream (0 B/s idle lease)",
+                message = "Surface lease off: the demo host shows no new frames",
             )
         }
         return true
@@ -1154,7 +1154,7 @@ class FakeHerdrServer(
         // Render Left Pane (or Zoomed Pane)
         val leftLines = buildList {
             add(StyledLine("╭─ Claude Code · Pane #1 (${if (focusedPaneId == "w1:p1") "Focused" else "Ready"}) ─ [$wsTitle:$wsBranch] ─╮", accentGold, bold = true))
-            add(StyledLine("│ Host: ${state.machine.name} (SSH Endpoint Gen 1) · Local Echo: ON · 11ms RTT │", dimText))
+            add(StyledLine("│ Host: ${state.machine.name} (simulated SSH session) · poll 11 ms │", dimText))
             add(StyledLine("╰────────────────────────────────────────────────────────────────────╯", accentGold))
             add(StyledLine("", warmText))
             add(StyledLine("● Inspecting platform/android/di/SshModule.kt", greenOk))
@@ -1180,12 +1180,12 @@ class FakeHerdrServer(
         if (!isZoomed) {
             // Render Top-Right Pane (Pane #2: SSH Endpoint Diagnostics)
             val topRightLines = listOf(
-                StyledLine("╭─ SSH Endpoint · Pane #2 ─────────────────────────╮", mauvePurple, bold = true),
-                StyledLine("$ herdr remote-client-bridge --idle-timeout-v1", warmText),
-                StyledLine("Endpoint Gen 1 hello (surface_active: true)", accentGold, bold = true),
-                StyledLine("✓ Reconnect after a network change: ready (11ms)", greenOk),
-                StyledLine("✓ Sideband: shell.snapshot.v1 + surface_delta Ready", greenOk),
-                StyledLine("✓ Background Lease: client_shell.surface.set Ready", dimText),
+                StyledLine("╭─ SSH Session · Pane #2 ──────────────────────────╮", mauvePurple, bold = true),
+                StyledLine("$ herdr api snapshot", warmText),
+                StyledLine("herdr remote-api-bridge: pane.read (visible panes)", accentGold, bold = true),
+                StyledLine("✓ Reconnect after a network change: ready", greenOk),
+                StyledLine("✓ Poll: snapshot + visible panes while the lease is on", greenOk),
+                StyledLine("✓ Background lease: the poll stops in the background", dimText),
             )
             writeLinesIntoRect(cells, totalCols, totalRows, topRightRect, topRightLines)
 

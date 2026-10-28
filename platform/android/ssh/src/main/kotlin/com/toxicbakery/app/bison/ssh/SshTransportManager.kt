@@ -7,8 +7,6 @@ import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
-import com.toxicbakery.app.bison.protocol.ClientSurfaceSize
-import com.toxicbakery.app.bison.protocol.EndpointClientHello
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
@@ -34,20 +32,22 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Android SSH2 + Herdr Endpoint Generation 1 transport coordinator.
+ * Android SSH transport coordinator for Herdr hosts.
  *
- * Implements the 4-phase Connection Lifecycle State Machine (`Part IV.1 & IV.2` of `01-core-app-design.md`):
+ * Runs the connect steps of a machine (`Part IV.2` of `01-core-app-design.md` gives the target design):
  * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
  *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
  * 2. `BootstrappingMoshOrBridge`: The backend selects the backbone ([SshBackend.negotiateBackbone]). This version
- *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]
- *    (`herdr remote-client-bridge --idle-timeout-v1` with `surface_active: true`). When the host has
- *    `mosh-server`, the backbone tells it in [ActiveBackbone.SshEndpoint.fallbackReason].
- * 3. `VerifyingUdpOrHello`: The Herdr Endpoint Gen 1 hello over the SSH session.
- * 4. Persistent Control Sideband (`herdr remote-client-bridge`) + multiplexed SSH2 `herdr remote-api-bridge` exec
- *    channels for `events.subscribe`, `pane.layout`, `agent.read` (`source: "visible"`), and `agent.prompt`.
- * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]
- *    and [onNetworkLost]).
+ *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]: the SSH session of
+ *    the machine.
+ * 3. `VerifyingUdpOrHello`: The backend looks for `mosh-server` on the host, except for an SSH-only machine. When
+ *    the host has it, the backbone tells it in [ActiveBackbone.SshEndpoint.fallbackReason]. No Herdr hello occurs.
+ * 4. `SyncingHerdrSnapshot`: The backend reads the Herdr snapshot and the visible panes, and starts its poll. The
+ *    real backend runs `herdr api snapshot` and `herdr remote-api-bridge` requests (`pane.read`, `agent.prompt`,
+ *    and others) on persistent `sh` channels of the SSH session. This version does not run
+ *    `herdr remote-client-bridge`.
+ * 5. Background parking ([setSurfaceLease]) and the session checks after a network change ([onNetworkAvailable]
+ *    and [onNetworkLost]). The surface lease only pauses the pane reads of the poll.
  *
  * The code for a Mosh backbone ([ActiveBackbone.MoshUdp] and [moshUdpEngine]) stays for issue #22, but the
  * backends never select it, and [MoshUdpEngine] starts no session.
@@ -354,12 +354,14 @@ class SshTransportManager(
     }
 
     /**
-     * Toggles the zero-bandwidth surface lease (`onStop()` -> `active = false`, `onStart()` -> `active = true`).
+     * Turns the surface lease of [machineId] on or off (`onStart()` -> `active = true`, `onStop()` -> `active = false`).
      *
      * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
-     * - Sends `client_shell.surface.set { active }` over the Herdr control stream.
-     * - When resuming (`active == true`), arms `endpoint.presentation.sync.v1` and replies with
-     *   `endpoint.presentation.ready.v1` as soon as the fresh [PaneSurfaceFrame] is committed.
+     * - While the lease is off, the poll of the backend reads no panes. Thus the SSH session stays open with no
+     *   terminal traffic. This version does not send `client_shell.surface.set` to the Herdr server.
+     * - When the lease comes on (`active == true`), the manager publishes the last [PaneSurfaceFrame] again with a
+     *   new presentation epoch, and the next poll reads the new state. The app does not send
+     *   `endpoint.presentation.ready.v1` in this version.
      */
     suspend fun setSurfaceLease(machineId: String, active: Boolean) {
         surfaceLeaseActive[machineId] = active
@@ -368,7 +370,8 @@ class SshTransportManager(
         sshDebugLog.record(
             machineId = machineId,
             tag = "SurfaceLease",
-            message = "Dispatched ${leaseRequest.method} { active: $active }",
+            message = "Surface lease ${if (active) "on: the poll reads the panes" else "off: the poll reads no panes"}. " +
+                "The app does not send ${leaseRequest.method} in this version.",
         )
 
         if (!active) {
@@ -390,7 +393,7 @@ class SshTransportManager(
                 sshDebugLog.record(
                     machineId = machineId,
                     tag = "PresentationFence",
-                    message = "Sent ${readyControl.kind} ${readyControl.dataJson}",
+                    message = "Did not send ${readyControl.kind} ${readyControl.dataJson}: this version has no Herdr endpoint stream",
                 )
             }
             sshStateManager.setRoamingStatus(machineId, RoamingStatus.Healthy)
@@ -398,14 +401,16 @@ class SshTransportManager(
     }
 
     /**
-     * Routes a Herdr RPC over either `herdr remote-api-bridge` (`herdr.sock`) or
-     * `ClientMessage::ClientShellEndpointRequest` (`herdr-client.sock`):
+     * Sends a Herdr RPC to the backend of [machineId], and writes it to the debug log with its lane in the target
+     * design. The real backend of this version sends each request as a `herdr remote-api-bridge` line, whatever the
+     * lane. The simulated backend gives the lane back. The lanes of the target design are `herdr remote-api-bridge`
+     * (`herdr.sock`) and `ClientMessage::ClientShellEndpointRequest` (`herdr-client.sock`):
      * - In Mosh UDP mode (not in this version, issue #22), focus/navigation RPCs (`workspace.focus`, `tab.focus`,
      *   `pane.focus`, `agent.focus`)
      *   are always dispatched over `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode])
      *   so `focus_all_shell_clients_on_default_target()` switches the Mosh `herdr` view.
      * - Non-`client_shell` methods (`agent.read`, `pane.read`, `agent.prompt`, `pane.send_input`, `pane.layout`)
-     *   or requests sent while `surface_active == false` also use multiplexed SSH2 `herdr remote-api-bridge` channels.
+     *   or requests sent while the surface lease is off also use the `herdr remote-api-bridge` lane.
      */
     suspend fun sendEndpointCommand(
         machineId: String,
@@ -424,7 +429,7 @@ class SshTransportManager(
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
-            message = "[$transportLane] $wireLine",
+            message = rpcLogMessage(transportLane, wireLine),
         )
         val machine = activeMachines[machineId]
         val response = machine?.let {
@@ -520,8 +525,9 @@ class SshTransportManager(
     }
 
     /**
-     * Resizes the remote terminal viewport (`ClientSurfaceSize(cols, rows)`) on the Herdr Endpoint control stream,
-     * and on the Mosh engine when it has a session. This version has no Mosh session (issue #22).
+     * Sets the viewport size of [machineId] in the backend, and in the Mosh engine when it has a session. The real
+     * backend draws the frame again for the new size from the last pane reads. It does not resize a terminal on the
+     * host. This version has no Mosh session (issue #22).
      */
     suspend fun resizeShell(
         machineId: String,
@@ -537,7 +543,7 @@ class SshTransportManager(
         sshDebugLog.record(
             machineId = machineId,
             tag = "Resize",
-            message = "Resized shell to ${cols}x$rows (cell=${cellWidthPx}x${cellHeightPx}px)",
+            message = "Set the viewport to ${cols}x$rows (cell=${cellWidthPx}x${cellHeightPx}px)",
         )
     }
 
@@ -656,8 +662,8 @@ class SshTransportManager(
         if (surfaceLeaseActive[machineId] == false) RoamingStatus.SurfaceParked else RoamingStatus.Healthy
 
     /**
-     * Restores [machineId] after the reconnect loop opened a new session. It sends `client_shell.surface.set
-     * { active: true }` again when the surface lease is on, reads the surface again, and sends the queued prompts.
+     * Restores [machineId] after the reconnect loop opened a new session. It turns the surface lease on again when
+     * the lease is on, reads the surface again, and sends the queued prompts.
      */
     private suspend fun restoreAfterReconnect(machineId: String) {
         val machine = activeMachines[machineId] ?: return
@@ -688,16 +694,11 @@ class SshTransportManager(
         backbone: ActiveBackbone,
     ) {
         val machineId = machine.id
-        val isMosh = backbone is ActiveBackbone.MoshUdp
-        val sidebandHello = EndpointClientHello(
-            surfaceSize = ClientSurfaceSize(cols = DEFAULT_COLS, rows = DEFAULT_ROWS),
-            surfaceActive = !isMosh,
-        )
         sshDebugLog.record(
             machineId = machineId,
-            tag = "ControlSideband",
-            message = "Started ${buildSshEndpointBridgeCommand()} (surface_active=${sidebandHello.surfaceActive}) + " +
-                "multiplexed ${buildSshApiBridgeCommand()} events.subscribe stream",
+            tag = "Surface",
+            message = "The backend reads the Herdr snapshot and the visible panes, and then polls them while the " +
+                "surface lease is on. The real backend runs herdr api snapshot and ${buildSshApiBridgeCommand()}.",
         )
         backend.openSurface(machine, route, backbone) {
             surfaceLeaseActive[machineId] != false
@@ -822,7 +823,10 @@ class SshTransportManager(
 
     companion object {
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
+        /** The `herdr remote-api-bridge` lane. The real backend sends each request on it in this version. */
         internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
+
+        /** The `herdr remote-client-bridge` lane of the target design. No code uses this bridge in this version. */
         internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
@@ -864,6 +868,13 @@ class SshTransportManager(
                 "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
         }
 
+        /** Returns the debug log text of an RPC with [wireLine] and the [lane] that the target design gives it. */
+        internal fun rpcLogMessage(lane: String, wireLine: String): String = "$wireLine (lane in the target design: $lane)"
+
+        /**
+         * Builds the command of the Herdr Endpoint Generation 1 bridge of the target design. No code runs this
+         * command in this version: the real backend uses `herdr api snapshot` and [buildSshApiBridgeCommand].
+         */
         fun buildSshEndpointBridgeCommand(idleTimeoutV1: Boolean = true): String =
             if (idleTimeoutV1) {
                 "herdr remote-client-bridge --idle-timeout-v1"

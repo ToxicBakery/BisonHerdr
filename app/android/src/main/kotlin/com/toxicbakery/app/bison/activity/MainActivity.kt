@@ -120,7 +120,7 @@ class MainActivity : FragmentActivity(), DIAware {
         // The service is the only collector of the request queue, so start it before the requests.
         // The service can stop itself while this activity is stopped.
         startSessionService()
-        // Resume active terminal surface leases (<50ms Endpoint resync)
+        // Turn the surface leases on again, so that the poll reads the panes again.
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(

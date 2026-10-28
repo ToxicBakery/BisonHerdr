@@ -416,7 +416,7 @@ class SshTransportManagerTest {
         assertEquals(listOf("refreshSurface lan-box", "sendEndpointCommand lan-box"), backend.calls)
         assertTrue(stateManager.queuedPromptsForMachine(lanBox.id).isEmpty())
         assertTrue(
-            debugLog.entries.value.any { it.message == "Dispatched client_shell.surface.set { active: true }" },
+            debugLog.entries.value.any { it.message.startsWith("Surface lease on: the poll reads the panes.") },
             debugLogDump(),
         )
     }

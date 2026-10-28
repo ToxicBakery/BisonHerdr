@@ -14,10 +14,8 @@ import com.toxicbakery.app.bison.protocol.ClientShellPane
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.protocol.ClientShellTab
 import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
-import com.toxicbakery.app.bison.protocol.ClientSurfaceSize
 import com.toxicbakery.app.bison.protocol.CursorShape
 import com.toxicbakery.app.bison.protocol.CursorState
-import com.toxicbakery.app.bison.protocol.EndpointClientHello
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
@@ -28,7 +26,6 @@ import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_COLS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_ROWS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.HARDWARE_KEY_NOT_SUPPORTED
-import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildSshEndpointBridgeCommand
 import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -150,15 +147,10 @@ class SimulatedSshBackend(
         val reason = MoshSessionEngine.fallbackReasonFor(machine.transportMode, hasMoshServer)
         reason?.let { sshDebugLog.record(machineId = machineId, tag = "Transport", message = it) }
 
-        // SSH Endpoint Generation 1 (`herdr remote-client-bridge --idle-timeout-v1`)
-        val hello = EndpointClientHello(
-            surfaceSize = ClientSurfaceSize(cols = DEFAULT_COLS, rows = DEFAULT_ROWS),
-            surfaceActive = true,
-        )
         sshDebugLog.record(
             machineId = machineId,
-            tag = "EndpointGen1",
-            message = "Negotiated ${buildSshEndpointBridgeCommand()} (hello.generation=${hello.generation}, surfaceActive=${hello.surfaceActive})",
+            tag = SIMULATED_HOST_LOG_TAG,
+            message = "Simulated the SSH session of ${machine.displayAddress}. The simulated host runs no Herdr command.",
         )
         return ActiveBackbone.SshEndpoint(
             rttMs = SIMULATED_RTT_MS,
@@ -290,7 +282,7 @@ class SimulatedSshBackend(
                         paneId = "w1:p1",
                         rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
                         focused = true,
-                        title = "${machine.name} · SSH Endpoint Gen 1",
+                        title = "${machine.name} · Simulated SSH Session",
                         agentStatus = AgentStatus.Working,
                     ),
                     PaneSurfacePane(
@@ -309,7 +301,7 @@ class SimulatedSshBackend(
         semanticNotificationBus.updateAgentSnippet(
             machineId = machineId,
             paneId = "w1:p1",
-            snippet = "Connected to ${machine.displayAddress} via SSH Endpoint Gen 1",
+            snippet = "Connected to ${machine.displayAddress} over a simulated SSH session",
         )
         semanticNotificationBus.tryPublishNotification(
             machineId = machineId,
@@ -317,7 +309,7 @@ class SimulatedSshBackend(
                 bootId = "boot-$machineId",
                 sequence = 1u,
                 title = "Connected to ${machine.name}",
-                body = "SSH Endpoint Gen 1 active",
+                body = "Simulated SSH session",
                 paneId = "w1:p1",
                 agentName = "claude",
                 agentStatus = AgentStatus.Working,
@@ -360,7 +352,10 @@ class SimulatedSshBackend(
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
-            message = "[${SshTransportManager.API_BRIDGE_LANE}] ${HerdrRpcBuilder.toNdjsonLine(request).trim()}",
+            message = SshTransportManager.rpcLogMessage(
+                lane = SshTransportManager.API_BRIDGE_LANE,
+                wireLine = HerdrRpcBuilder.toNdjsonLine(request).trim(),
+            ),
         )
     }
 
@@ -443,6 +438,9 @@ class SimulatedSshBackend(
     internal companion object {
         /** The round trip time of the backbone of a simulated host. */
         const val SIMULATED_RTT_MS: Int = 24
+
+        /** The debug log tag of the entry that [negotiateBackbone] writes. Only this backend writes it. */
+        const val SIMULATED_HOST_LOG_TAG: String = "SimulatedHost"
 
         private val BLANK_CELL = CellData()
     }

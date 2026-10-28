@@ -22,7 +22,7 @@ data class SshLogEntry(
 )
 
 /**
- * Bounded ring buffer of structured SSH and Endpoint Gen 1 diagnostic log entries.
+ * Bounded ring buffer of structured SSH and Herdr diagnostic log entries.
  */
 class SshDebugLog(
     private val maxEntries: Int = DEFAULT_MAX_ENTRIES,

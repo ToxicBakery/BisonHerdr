@@ -68,6 +68,7 @@ import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_auth_password
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
 import com.toxicbakery.app.bison.resources.machine_bastion_host_name_hint
 import com.toxicbakery.app.bison.resources.machine_field_mosh_ports_label
@@ -310,7 +311,7 @@ fun ConfigureMachineScreen(
                         state.authChoices.forEach { type ->
                             val label = when (type) {
                                 ConfigureMachineViewModel.AuthType.KeystoreKey -> "Android Keystore Key"
-                                ConfigureMachineViewModel.AuthType.Password -> "Password / Passphrase"
+                                ConfigureMachineViewModel.AuthType.Password -> stringResource(Res.string.machine_auth_password)
                                 // The choices do not contain this method (issue #23), so it has no chip.
                                 ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> return@forEach
                             }
