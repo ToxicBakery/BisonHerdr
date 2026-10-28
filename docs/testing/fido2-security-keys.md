@@ -147,7 +147,7 @@ that yubikit, slf4j, and JSch load at run time.
 | Step | Action | Expected result |
 | --- | --- | --- |
 | F1 | Look at "SSH Authentication Strategy". | The screen shows "Hardware security key: Not supported in this version". It does not show "Enroll key". |
-| F2 | Open "Add Herdr Host". | The choices are only "Android Keystore Key" and "Password / Passphrase". |
+| F2 | Open "Add Herdr Host". | The choices are only "Android Keystore Key" and "Password / Keyboard-Interactive". |
 | F3 | Go to the machine list. | The card of the machine shows "Not supported in this version". "Connect Host" is not available. |
 | F4 | Connect the YubiKey to the USB-C port. | The app does not ask for the USB permission. |
 | F5 | Hold the YubiKey against the NFC area while the app is open. | The app does not take the tag. Android handles the tag as before, for example it opens the Yubico OTP link. |
