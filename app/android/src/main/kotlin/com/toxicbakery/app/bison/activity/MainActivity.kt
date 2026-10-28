@@ -36,6 +36,7 @@ class MainActivity : ComponentActivity(), DIAware {
     private val debugServer: DebugServer by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
+    private val startedActivityCounter: StartedActivityCounter by instance()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -45,7 +46,6 @@ class MainActivity : ComponentActivity(), DIAware {
         setTurnScreenOn(true)
 
         applyFakeServerIntent(intent)
-        window.decorView.post { startSessionService() }
 
         setContent {
             withDI(di) {
@@ -70,6 +70,10 @@ class MainActivity : ComponentActivity(), DIAware {
 
     override fun onStart() {
         super.onStart()
+        startedActivityCounter.onActivityStarted()
+        // The service is the only collector of the request queue, so start it before the requests.
+        // The service can stop itself while this activity is stopped.
+        startSessionService()
         // Resume active terminal surface leases (<50ms Endpoint resync / <20ms Mosh UDP SSP wakeup)
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
@@ -85,6 +89,7 @@ class MainActivity : ComponentActivity(), DIAware {
 
     override fun onStop() {
         super.onStop()
+        startedActivityCounter.onActivityStopped()
         // Park active terminal surfaces at 0 bytes/sec while keeping control stream & Mosh session alive
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {

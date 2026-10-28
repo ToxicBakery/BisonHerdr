@@ -15,6 +15,7 @@ import android.net.Network
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.toxicbakery.app.bison.activity.MainActivity
+import com.toxicbakery.app.bison.activity.StartedActivityCounter
 import com.toxicbakery.app.bison.debug.DebugServer
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.protocol.AgentStatus
@@ -34,11 +35,13 @@ import com.toxicbakery.logging.Arbor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import org.kodein.di.DI
@@ -50,6 +53,9 @@ import org.kodein.di.instance
  * Persistent foreground service keeping SSH/Mosh sessions alive across activity backgrounding,
  * supervising `ConnectivityManager.NetworkCallback` fast-roaming, collecting [SshRequestManager.bus],
  * and posting actionable notifications for `Blocked` and `Done` coding agents.
+ *
+ * The service stops itself when [ServiceStopPolicy] finds no connected machine and no started
+ * activity for 30 s. [MainActivity] starts the service again in `onStart`.
  */
 class BisonSessionService : Service(), DIAware {
 
@@ -62,10 +68,17 @@ class BisonSessionService : Service(), DIAware {
     private val sshTransportManager: SshTransportManager by instance()
     private val endpointSnapshotBus: EndpointSnapshotBus by instance()
     private val semanticNotificationBus: SemanticNotificationBus by instance()
+    private val startedActivityCounter: StartedActivityCounter by instance()
     private val json: Json by instance()
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val stopPolicy = ServiceStopPolicy()
     private var networkCallbackRegistered = false
+
+    // Only the main thread reads and writes these fields.
+    private var stopPolicyJob: Job? = null
+    private var lastStartId = 0
+    private var lastActiveAgentCount = 0
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -96,11 +109,6 @@ class BisonSessionService : Service(), DIAware {
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannels()
-        promoteToForeground(
-            connectedCount = sshStateManager.connectedMachines.value.size,
-            transportSummary = resolveTransportSummary(sshStateManager.activeTransportBackbone.value),
-            activeAgentCount = 0,
-        )
         registerNetworkCallback()
         collectSshRequests()
         observeSessionStatusForForegroundNotification()
@@ -108,8 +116,18 @@ class BisonSessionService : Service(), DIAware {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
+        // Each startForegroundService call needs a startForeground call. This is also true for a
+        // start that arrives after stopIdleService removed the foreground state.
+        promoteToForeground(
+            connectedCount = sshStateManager.connectedMachines.value.size,
+            transportSummary = resolveTransportSummary(sshStateManager.activeTransportBackbone.value),
+            activeAgentCount = lastActiveAgentCount,
+        )
         handleNotificationActionIntent(intent)
-        return START_STICKY
+        armStopPolicy()
+        // A restart with no session has no work, so the system must not restart the service.
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -117,7 +135,36 @@ class BisonSessionService : Service(), DIAware {
     override fun onDestroy() {
         unregisterNetworkCallback()
         serviceScope.cancel()
+        // An update after stopForeground can post the session notification again as a normal
+        // notification. The updates run on the main thread, so no update comes after this line.
+        (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)
+            ?.cancel(FOREGROUND_NOTIFICATION_ID)
         super.onDestroy()
+    }
+
+    /**
+     * Starts a new idle timer. Each start command starts a new timer, so a stop attempt that a new
+     * start cancelled does not leave the service without a timer.
+     */
+    private fun armStopPolicy() {
+        stopPolicyJob?.cancel()
+        stopPolicyJob = serviceScope.launch(Dispatchers.Main) {
+            stopPolicy.awaitIdleTimeout(
+                connectedMachines = sshStateManager.connectedMachines,
+                anyActivityStarted = startedActivityCounter.anyStarted,
+            )
+            stopIdleService()
+        }
+    }
+
+    private fun stopIdleService() {
+        log.d { "No machine is connected and no activity is started; BisonSessionService stops itself" }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        // stopSelfResult does not stop the service when a newer start command exists. That start
+        // command calls startForeground again and starts a new idle timer.
+        if (!stopSelfResult(lastStartId)) {
+            log.d { "A newer start command exists; BisonSessionService continues" }
+        }
     }
 
     private fun collectSshRequests() {
@@ -224,7 +271,9 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun observeSessionStatusForForegroundNotification() {
-        serviceScope.launch {
+        // Collect on the main thread, the same thread as stopIdleService and onDestroy. A background
+        // thread calculates the counts.
+        serviceScope.launch(Dispatchers.Main) {
             combine(
                 sshStateManager.connectedMachines,
                 sshStateManager.activeTransportBackbone,
@@ -236,9 +285,13 @@ class BisonSessionService : Service(), DIAware {
                     }
                 }
                 Triple(connected.size, resolveTransportSummary(backbones), activeAgents)
-            }.distinctUntilChanged().collect { (connectedCount, transportSummary, activeAgents) ->
-                updateForegroundNotification(connectedCount, transportSummary, activeAgents)
             }
+                .distinctUntilChanged()
+                .flowOn(Dispatchers.Default)
+                .collect { (connectedCount, transportSummary, activeAgents) ->
+                    lastActiveAgentCount = activeAgents
+                    updateForegroundNotification(connectedCount, transportSummary, activeAgents)
+                }
         }
     }
 
