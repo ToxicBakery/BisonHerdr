@@ -28,6 +28,7 @@ import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.service_notification_action_disconnect_all
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
@@ -70,6 +71,7 @@ class BisonSessionService : Service(), DIAware {
     override val di: DI by closestDI()
 
     private val debugServer: DebugServer by instance()
+    private val localNetworkAccess: LocalNetworkAccess by instance()
     private val machineStore: MachineStore by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
@@ -225,6 +227,7 @@ class BisonSessionService : Service(), DIAware {
                     is SshRequest.ResizeShell -> fastInteractiveQueue.trySend(request)
                     else -> {
                         sshStateManager.cancelUserAuthBeforeQueue(request)
+                        localNetworkAccess.cancelRequestBeforeQueue(request)
                         controlQueue.trySend(request)
                     }
                 }
@@ -401,9 +404,10 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun disconnectAllMachines() {
-        // A connect that waits for a user authentication or for keyboard-interactive answers holds the control
-        // queue. End the wait first.
+        // A connect that waits for a user authentication, for keyboard-interactive answers, or for the local network
+        // permission holds the control queue. End the wait first.
         sshStateManager.cancelAllUserAuth()
+        localNetworkAccess.cancelAll()
         val machineIds = sshStateManager.connectedMachines.value
         log.d { "Disconnect All: send Disconnect for ${machineIds.size} machines" }
         serviceScope.launch {

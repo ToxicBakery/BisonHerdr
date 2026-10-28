@@ -201,6 +201,7 @@ class SshPlatformTest {
         val inputLaneGate = CompletableDeferred<Unit>()
 
         val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,

@@ -408,6 +408,7 @@ class KeyboardInteractiveTest {
     }
 
     private fun backend(timeout: Duration) = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = stateManager,
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

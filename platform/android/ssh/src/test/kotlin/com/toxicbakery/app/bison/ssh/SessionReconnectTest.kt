@@ -328,6 +328,7 @@ class SessionReconnectTest {
     /** Makes the client, the backend, and the transport. The reconnect loops run in the background scope. */
     private fun TestScope.startTransport(): SshTransportManager {
         val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
             endpointSnapshotBus = EndpointSnapshotBus(),
             paneSurfaceBus = surfaceBus,

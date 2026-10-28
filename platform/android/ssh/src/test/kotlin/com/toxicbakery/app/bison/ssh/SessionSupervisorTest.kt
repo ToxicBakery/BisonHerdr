@@ -91,6 +91,7 @@ class SessionSupervisorTest {
             SshAuthResult.HostKeyChanged(known = key, presented = key.copy(fingerprint = "SHA256:b")),
             SshAuthResult.KeyMissing("work_key"),
             SshAuthResult.Failed(IllegalStateException("Algorithm negotiation fail")),
+            SshAuthResult.LocalNetworkBlocked("devbox:22"),
         )
 
         results.forEach { result ->
@@ -178,6 +179,29 @@ class SessionSupervisorTest {
 
         assertEquals(listOf(10.minutes.inWholeMilliseconds), attempts.times)
         assertEquals(SessionSupervisor.State.Live, supervisor.state.value)
+    }
+
+    @Test
+    fun aBlockedLocalNetworkAfterANetworkChangeNeedsTheUserAndTheNextChangeDoesNothing() = runTest {
+        val blocked = SshAuthResult.LocalNetworkBlocked("192.168.1.42:22")
+        val attempts = ScriptedAttempts(this, listOf(blocked, SshAuthResult.Success))
+        val supervisor = supervisor(attempts)
+        // The device moves to a Wi-Fi network in the background. The host is now on the local network.
+        supervisor.networkLost(IOException("The device lost its network"))
+        supervisor.reconnectNow()
+        runCurrent()
+
+        assertEquals(SessionSupervisor.State.NeedsUser(blocked), supervisor.state.value)
+        assertEquals(listOf("reconnecting", "needs user $blocked"), events.log)
+
+        // The next network changes start no attempt. Only a connect from the user makes a new supervisor.
+        supervisor.networkLost()
+        supervisor.reconnectNow()
+        advanceTimeBy(10.minutes)
+        runCurrent()
+
+        assertEquals(1, attempts.times.size)
+        assertEquals(SessionSupervisor.State.NeedsUser(blocked), supervisor.state.value)
     }
 
     @Test

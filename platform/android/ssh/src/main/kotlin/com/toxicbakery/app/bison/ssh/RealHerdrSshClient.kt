@@ -41,7 +41,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.ArrayDeque
 import java.util.Properties
@@ -119,6 +118,11 @@ import kotlinx.serialization.json.put
  * [reconnectScope] with the delays from [reconnectDelays]. It sends its events to [sessionEvents]. A command that
  * finds a closed session waits only for the attempt that runs now, and then fails.
  *
+ * Each socket gets its address from [localNetworkGuard]. When Android 17 stops the connection to the host because the
+ * app does not have the local network permission, the guard throws a [LocalNetworkPermissionException]. It throws it
+ * before the socket opens, or after a connect timeout to a private address. The reconnect loop then stops for the
+ * user.
+ *
  * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
  * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
  * second. A connect, a disconnect, and a reconnect of the supervisor start a new average.
@@ -159,6 +163,8 @@ internal class RealHerdrSshClient(
      * [frameLocks]). A test gives a function that stops a step at this point.
      */
     private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
+    /** Gives the address of each socket, and finds the connections that the local network protection stops. */
+    internal val localNetworkGuard: LocalNetworkGuard,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -237,14 +243,25 @@ internal class RealHerdrSshClient(
         }
     }
 
-    private object LowLatencySocketFactory : SocketFactory {
-        override fun createSocket(host: String, port: Int): Socket =
-            Socket().apply {
-                tcpNoDelay = true
-                keepAlive = true
-                runCatching { trafficClass = IPTOS_LOWDELAY }
-                connect(InetSocketAddress(host, port), SOCKET_CONNECT_TIMEOUT_MS)
+    /**
+     * Opens the sockets of the sessions. [localNetworkGuard] gives the address before the socket opens, and the error
+     * of a failed connect.
+     */
+    private class LowLatencySocketFactory(private val localNetworkGuard: LocalNetworkGuard) : SocketFactory {
+        override fun createSocket(host: String, port: Int): Socket {
+            val address = localNetworkGuard.socketAddressFor(host, port)
+            val socket = Socket()
+            try {
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                runCatching { socket.trafficClass = IPTOS_LOWDELAY }
+                socket.connect(address, SOCKET_CONNECT_TIMEOUT_MS)
+            } catch (error: IOException) {
+                runCatching { socket.close() }
+                throw localNetworkGuard.connectFailure(address, KnownHost.formatHostPort(host, port), error)
             }
+            return socket
+        }
 
         override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
 
@@ -252,6 +269,7 @@ internal class RealHerdrSshClient(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
+    private val socketFactory = LowLatencySocketFactory(localNetworkGuard)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val knownHostsRepository = KnownHostsRepository(knownHostsStore)
 
@@ -2203,7 +2221,7 @@ internal class RealHerdrSshClient(
             host = route.entryHost,
             port = route.entryPort,
         )
-        bastion.setSocketFactory(LowLatencySocketFactory)
+        bastion.setSocketFactory(socketFactory)
         try {
             knownHostsRepository.connect(bastion, SOCKET_CONNECT_TIMEOUT_MS)
         } catch (error: JSchException) {
@@ -2229,7 +2247,7 @@ internal class RealHerdrSshClient(
             port = route.targetPort,
         )
         if (bastion == null) {
-            session.setSocketFactory(LowLatencySocketFactory)
+            session.setSocketFactory(socketFactory)
             knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
         } else {
             val proxy = BastionChannelProxy(bastion, route.bastionAddress)

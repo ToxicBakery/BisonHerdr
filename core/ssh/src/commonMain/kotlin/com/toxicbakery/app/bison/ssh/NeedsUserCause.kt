@@ -60,6 +60,17 @@ sealed interface NeedsUserCause {
      */
     data class Unreachable(val detail: String) : NeedsUserCause
 
+    /**
+     * The app does not have the local network permission (`ACCESS_LOCAL_NETWORK`), and [hostPort] is on the local
+     * network. [hostPort] is the bastion or the target. A connect from the app asks for the permission. The user can
+     * also allow it in the app settings.
+     *
+     * When [timedOut] is false, the app did not open the socket, because Android stops a connection to [hostPort].
+     * When [timedOut] is true, [hostPort] has a private address, and the connect did not complete in its time limit.
+     * Android can stop such a connection, so the app does not try again.
+     */
+    data class LocalNetworkPermission(val hostPort: String, val timedOut: Boolean = false) : NeedsUserCause
+
     /** A different failure. [detail] is the error text. */
     data class Other(val detail: String) : NeedsUserCause
 }
