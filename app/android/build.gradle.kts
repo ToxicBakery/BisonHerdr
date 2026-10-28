@@ -79,6 +79,9 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = true
+            // The resource shrink removes each resource that no kept code and no manifest refers
+            // to. Give a resource that the app loads by name (getIdentifier) a tools:keep rule.
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -89,6 +92,7 @@ android {
         create("benchmark") {
             isDebuggable = false
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -101,6 +105,17 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+    }
+
+    packaging {
+        jniLibs {
+            // androidx.graphics:graphics-path (from Compose UI) ships this library without a
+            // symbol table, so `llvm-strip --strip-unneeded` gives the same bytes. Without this
+            // line, AGP strips it with its default NDK 28.2.13676358. On 2026-10-28, the CI runner
+            // image has NDK 27.3, 29.0 and 30.0, but not 28.2. Thus AGP writes "Unable to strip"
+            // for each APK. Do not add a library with symbols here.
+            keepDebugSymbols += "**/libandroidx.graphics.path.so"
+        }
     }
 
     lint {
