@@ -11,6 +11,9 @@ import kotlinx.coroutines.CancellationException
  * Earlier versions wrote the password into [SshAuthMethod.Password.encryptedPasswordRef]. For each such machine,
  * [migrate] puts the password into [secretStore] and writes a [SecretRef] value in its place. The machine store
  * calls [migrate] each time that it loads `machines.json`, so a failed move tries again on the next load.
+ *
+ * Each value that is not empty and is not a valid [SecretRef] value is a plain-text password. A password can start
+ * with [SecretRef.PREFIX], so only [SecretRef.parse] tells a reference.
  */
 class PasswordSecretMigration(
     private val secretStore: SecretStore,
@@ -26,7 +29,7 @@ class PasswordSecretMigration(
     suspend fun migrate(machine: HostMachine): HostMachine {
         val auth = machine.authMethod as? SshAuthMethod.Password ?: return machine
         val plainText = auth.encryptedPasswordRef
-        if (plainText.isEmpty() || SecretRef.hasPrefix(plainText)) return machine
+        if (plainText.isEmpty() || SecretRef.parse(plainText) != null) return machine
         val ref = SecretRef.newPasswordRef()
         val secret = plainText.encodeToByteArray()
         return try {

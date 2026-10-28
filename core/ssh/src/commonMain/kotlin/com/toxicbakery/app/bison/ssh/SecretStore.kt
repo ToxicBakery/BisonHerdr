@@ -40,7 +40,8 @@ interface SecretStore {
  * The form of a secret reference in [com.toxicbakery.app.bison.model.SshAuthMethod.Password.encryptedPasswordRef].
  *
  * The stored value is [PREFIX] and then the reference of the [SecretStore], for example `secret:password-0a1b`.
- * A value that does not start with [PREFIX] is a plain-text password from an earlier version.
+ * A value that [parse] does not accept is a plain-text password from an earlier version. The load migration
+ * moves it into the [SecretStore].
  */
 object SecretRef {
 
@@ -53,7 +54,7 @@ object SecretRef {
     private const val PASSWORD_REF_PREFIX = "password-"
     private const val RANDOM_BYTES = 16
 
-    /** Returns true when [value] starts with [PREFIX]. Such a value never holds a password. */
+    /** Returns true when [value] starts with [PREFIX]. Use [parse] to get a valid reference. */
     fun hasPrefix(value: String): Boolean = value.startsWith(PREFIX)
 
     /** Returns the reference in [value], or null when [value] has no [PREFIX] or the reference is not valid. */

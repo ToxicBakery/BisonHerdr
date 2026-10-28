@@ -85,6 +85,18 @@ class SecretStoreTest {
     }
 
     @Test
+    fun migrationMovesAPlainTextPasswordThatStartsWithThePrefix() = runTest {
+        val store = InMemorySecretStore()
+        val oldPassword = "secret: not a reference"
+
+        val migrated = PasswordSecretMigration(store).migrate(passwordMachine(oldPassword))
+
+        val ref = assertNotNull(SecretRef.parse((migrated.authMethod as SshAuthMethod.Password).encryptedPasswordRef))
+        assertContentEquals(oldPassword.encodeToByteArray(), store.get(ref))
+        assertFalse(oldPassword in migrated.toString(), "The machine still holds the password")
+    }
+
+    @Test
     fun migrationKeepsReferencesEmptyValuesAndKeyMachines() = runTest {
         val store = InMemorySecretStore()
         val migration = PasswordSecretMigration(store)
