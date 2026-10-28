@@ -49,6 +49,14 @@ class SshStateManager {
     /** The open host key decisions, by machine id. See [HostKeyPrompt]. */
     val hostKeyPrompts: StateFlow<Map<String, HostKeyPrompt>> = _hostKeyPrompts.asStateFlow()
 
+    private val _needsUser = MutableStateFlow<Map<String, NeedsUserCause>>(emptyMap())
+
+    /**
+     * The machines whose connection stopped until the user does an action, with the cause, by machine id.
+     * See [NeedsUserCause].
+     */
+    val needsUser: StateFlow<Map<String, NeedsUserCause>> = _needsUser.asStateFlow()
+
     private val _queuedPrompts = MutableStateFlow<Map<String, List<QueuedPrompt>>>(emptyMap())
     val queuedPrompts: StateFlow<Map<String, List<QueuedPrompt>>> = _queuedPrompts.asStateFlow()
 
@@ -63,6 +71,7 @@ class SshStateManager {
         _activeTransportBackbone.update { it + (machineId to backbone) }
         _connectionProgress.update { it + (machineId to ConnectionProgress.Connected) }
         _roamingState.update { it + (machineId to RoamingStatus.Healthy) }
+        _needsUser.update { it - machineId }
     }
 
     fun onMachineConnected(machineId: String, backbone: ActiveBackbone) {
@@ -120,6 +129,16 @@ class SshStateManager {
     /** Removes the open host key prompt of [machineId]. */
     fun clearHostKeyPrompt(machineId: String) {
         _hostKeyPrompts.update { it - machineId }
+    }
+
+    /** Puts [cause] in [needsUser] for [machineId]. It replaces the cause that the machine has. */
+    fun setNeedsUser(machineId: String, cause: NeedsUserCause) {
+        _needsUser.update { it + (machineId to cause) }
+    }
+
+    /** Removes the cause of [machineId] from [needsUser]. */
+    fun clearNeedsUser(machineId: String) {
+        _needsUser.update { it - machineId }
     }
 
     fun enqueuePrompt(prompt: QueuedPrompt) {
