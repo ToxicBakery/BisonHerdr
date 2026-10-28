@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -37,8 +38,9 @@ import kotlinx.serialization.json.putJsonObject
  * Android SSH transport coordinator for Herdr hosts.
  *
  * Runs the connect steps of a machine (`Part IV.2` of `01-core-app-design.md` gives the target design):
- * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
- *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
+ * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager], `Password`, or a FIDO2 security key, optionally via
+ *    [ProxyJumpTunnel]). A machine with an [SshAuthMethod] that [featureFlags] does not support fails before this
+ *    phase (issue #23).
  * 2. `BootstrappingMoshOrBridge`: The backend selects the backbone ([SshBackend.negotiateBackbone]). This version
  *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]: the SSH session of
  *    the machine.
@@ -74,6 +76,8 @@ class SshTransportManager(
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
     private val timeSource: TimeSource = TimeSource.Monotonic,
     private val promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** Decides which [SshAuthMethod] values the manager connects. See [SshAuthMethod.isSupported]. */
+    private val featureFlags: FeatureFlags = FeatureFlags(),
 ) {
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
@@ -214,7 +218,7 @@ class SshTransportManager(
         // A connect from the user removes the cause of an earlier stop.
         sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.clearNeedsUser(machineId)
-        if (!machine.authMethod.isSupported) {
+        if (!machine.authMethod.isSupported(featureFlags)) {
             // The backend does not get the machine, so the app makes no network connection.
             sshDebugLog.record(
                 machineId = machineId,
@@ -779,9 +783,12 @@ class SshTransportManager(
     private fun causeOf(error: Throwable): NeedsUserCause {
         val chain = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
         val userInput = chain.filterIsInstance<UserInputException>().firstOrNull()
+        val hardwareKey = chain.filterIsInstance<HardwareKeyException>().firstOrNull()
         return when {
             userInput != null -> causeOf(userInput.result)
             chain.any { it is MissingSecretException } -> NeedsUserCause.PasswordMissing
+            // A security key error with an IOException cause is not a network error.
+            hardwareKey != null -> NeedsUserCause.Other(detailOf(hardwareKey))
             chain.any { it is IOException } -> NeedsUserCause.Unreachable(detailOf(error))
             else -> NeedsUserCause.Other(detailOf(error))
         }
@@ -853,8 +860,9 @@ class SshTransportManager(
         private const val MAX_CAUSE_DEPTH = 16
 
         /**
-         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey]. This version does not
-         * support that method. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey] when the build does not support
+         * it: [FeatureFlags.hardwareSecurityKeys] is false, or the key type is not FIDO2. Issue #23
+         * (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
          */
         internal const val HARDWARE_KEY_NOT_SUPPORTED: String =
             "This version does not support hardware security keys (issue #23)"

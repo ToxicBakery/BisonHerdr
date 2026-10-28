@@ -162,8 +162,20 @@ class SshStateManager {
         _hardwareKeyTouchPrompt.value = prompt
     }
 
+    /**
+     * Removes the open touch prompt. The UI calls it when the user closes the touch sheet. The [HardwareKeySigner]
+     * call that put the prompt then stops with [HardwareKeyException.Reason.Cancelled].
+     */
     fun dismissHardwareKeyTouchPrompt() {
         _hardwareKeyTouchPrompt.value = null
+    }
+
+    /**
+     * Removes [prompt] when it is the open touch prompt. A different prompt stays. Two prompts are the same only
+     * when they are the same instance.
+     */
+    fun dismissHardwareKeyTouchPrompt(prompt: SshRequest.PromptHardwareKeyTouch) {
+        _hardwareKeyTouchPrompt.update { current -> if (current === prompt) null else current }
     }
 
     /** Puts [prompt] in [hostKeyPrompts]. It replaces the open prompt of the same machine. */
@@ -253,6 +265,8 @@ class SshStateManager {
      * each keyboard-interactive prompt gets [KeyboardInteractiveOutcome.Cancelled]. The wait of [requestUserAuth] and
      * [requestKeyboardInteractive] then ends at once. A disconnect calls it before its request goes into a queue,
      * because the connect that waits for the prompt can hold that queue.
+     *
+     * It also removes the touch prompt of [machineId], so that the [HardwareKeySigner] call of the connect stops.
      */
     fun cancelUserAuth(machineId: String) {
         _userAuthPrompts.value
@@ -261,12 +275,17 @@ class SshStateManager {
         _keyboardInteractivePrompts.value
             .filter { it.machineId == machineId }
             .forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
+        _hardwareKeyTouchPrompt.update { current -> if (current?.machineId == machineId) null else current }
     }
 
-    /** Cancels all open prompts: the user authentication prompts and the keyboard-interactive prompts. */
+    /**
+     * Cancels all open prompts: the user authentication prompts, the keyboard-interactive prompts, and the touch
+     * prompt.
+     */
     fun cancelAllUserAuth() {
         _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
         _keyboardInteractivePrompts.value.forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
+        _hardwareKeyTouchPrompt.value = null
     }
 
     /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */

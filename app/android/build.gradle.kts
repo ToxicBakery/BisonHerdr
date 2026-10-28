@@ -15,6 +15,11 @@ plugins {
     alias(libs.plugins.composeCompiler)
 }
 
+// The feature flag of FIDO2 hardware security keys. See FeatureFlags.hardwareSecurityKeys.
+val hardwareSecurityKeys: Boolean = providers.gradleProperty("bison.hardwareSecurityKeys")
+    .map(String::toBoolean)
+    .getOrElse(false)
+
 android {
     namespace = "com.toxicbakery.app.bison"
     compileSdk {
@@ -31,6 +36,10 @@ android {
         versionName = project.version.toString()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // FIDO2 hardware security keys (issue #23). Off in each build type until the manual test in
+        // docs/testing/fido2-security-keys.md passes. Add -Pbison.hardwareSecurityKeys=true to a build to test it.
+        buildConfigField("boolean", "HARDWARE_SECURITY_KEYS", hardwareSecurityKeys.toString())
     }
 
     buildFeatures {
@@ -143,6 +152,8 @@ dependencies {
     implementation(libs.kotlinx.datetime)
     implementation(libs.kotlinx.io)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.yubikit.android)
+    implementation(libs.yubikit.core)
 
     debugImplementation(libs.compose.ui.tooling)
 

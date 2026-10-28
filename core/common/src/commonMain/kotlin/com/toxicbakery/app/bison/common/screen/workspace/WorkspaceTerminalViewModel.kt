@@ -24,7 +24,6 @@ import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.ssh.PaneSurfaceBus
 import com.toxicbakery.app.bison.ssh.QueuedPrompt
-import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
@@ -184,9 +183,6 @@ class WorkspaceTerminalViewModel(
             hostOverrideThemeId = machine?.themeOverrideId,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, BisonThemes.GruvboxDark)
-
-    val hardwareKeyTouchPrompt: StateFlow<SshRequest.PromptHardwareKeyTouch?> =
-        sshStateManager.hardwareKeyTouchPrompt
 
     init {
         // The active machine needs a host key decision or a different action from the user. Show the connecting
@@ -724,9 +720,5 @@ class WorkspaceTerminalViewModel(
                 prompt = prompt,
             )
         }
-    }
-
-    fun dismissHardwareKeyTouchSheet() {
-        sshStateManager.dismissHardwareKeyTouchPrompt()
     }
 }

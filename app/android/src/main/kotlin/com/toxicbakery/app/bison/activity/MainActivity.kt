@@ -26,9 +26,11 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.toxicbakery.app.bison.AppTheme
 import com.toxicbakery.app.bison.common.App
 import com.toxicbakery.app.bison.debug.DebugServer
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.service.BisonSessionService
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
+import com.toxicbakery.app.bison.ssh.SecurityKeyHub
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
@@ -47,7 +49,9 @@ class MainActivity : FragmentActivity(), DIAware {
     override val di: DI by closestDI()
 
     private val debugServer: DebugServer by instance()
+    private val featureFlags: FeatureFlags by instance()
     private val localNetworkAccess: LocalNetworkAccess by instance()
+    private val securityKeyHub: SecurityKeyHub by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
     private val startedActivityCounter: StartedActivityCounter by instance()
@@ -113,6 +117,17 @@ class MainActivity : FragmentActivity(), DIAware {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 localNetworkAccess.hostRequests { request -> askForLocalNetwork(request.hostPort) }
+            }
+        }
+
+        // Find FIDO2 security keys over USB and NFC only while this activity is in the foreground, because the NFC
+        // reader needs it. The hub starts the discovery only while a security key call runs (issue #23).
+        if (featureFlags.hardwareSecurityKeys) {
+            val discovery = YubiKeyDiscovery(activity = this, hub = securityKeyHub)
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    securityKeyHub.hostDiscovery(discovery)
+                }
             }
         }
     }

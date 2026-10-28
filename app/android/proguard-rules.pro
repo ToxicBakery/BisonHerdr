@@ -2,6 +2,8 @@
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+# This rule also keeps the classes that JSch loads by name: AndroidJschSignatureEd25519, AndroidJschXdh, and
+# SecurityKeySignaturePlaceholder (the sk-* names of FIDO2 security keys, issue #23).
 -keep class com.toxicbakery.app.bison.ssh.** { *; }
 -keep class com.toxicbakery.app.bison.protocol.** { *; }
 -keep class com.toxicbakery.app.bison.model.** { *; }

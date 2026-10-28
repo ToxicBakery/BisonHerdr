@@ -78,11 +78,15 @@ enum class TransportMode {
 sealed interface SshAuthMethod {
 
     /**
-     * True when this version of the app can log in with this method. This version cannot log in with
-     * [HardwareSecurityKey]. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+     * Returns true when this build can log in with this method. A [HardwareSecurityKey] needs
+     * [FeatureFlags.hardwareSecurityKeys] and a FIDO2 key type ([HardwareKeyType.isFido2]). All other methods are
+     * always supported. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
      */
-    val isSupported: Boolean
-        get() = this !is HardwareSecurityKey
+    fun isSupported(featureFlags: FeatureFlags): Boolean =
+        when (this) {
+            is HardwareSecurityKey -> featureFlags.hardwareSecurityKeys && keyType.isFido2
+            is KeystoreKey, is Password -> true
+        }
 
     @Serializable
     @SerialName("keystore_key")
@@ -100,20 +104,44 @@ sealed interface SshAuthMethod {
     ) : SshAuthMethod
 
     /**
-     * A FIDO2 or PIV hardware security key.
+     * A FIDO2 hardware security key with an OpenSSH `sk` credential, for example a YubiKey 5.
      *
-     * This version does not support this method, and [isSupported] is false. The configure screen does
-     * not offer it, and the transport does not connect a machine that uses it. The model stays, so that
-     * an old `machines.json` file still loads. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23)
-     * adds FIDO2 security keys.
+     * The "Enroll key" action of the configure screen makes the credential on the key and fills [credentialId],
+     * [publicKey], and [residentKey]. These values are public data, so `machines.json` keeps them. The private key
+     * stays on the security key. A file from an earlier version has no such fields. Such a machine loads with the
+     * default values and is not [isEnrolled].
+     *
+     * The app uses this method only when [FeatureFlags.hardwareSecurityKeys] is true. See [isSupported].
+     * Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 security keys.
      */
     @Serializable
     @SerialName("hardware_security_key")
     data class HardwareSecurityKey(
         val keyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
         val transport: HardwareKeyTransport = HardwareKeyTransport.UsbAndNfc,
-        val applicationId: String = "ssh:",
-    ) : SshAuthMethod
+        /** The OpenSSH application string, and the FIDO2 relying party ID. OpenSSH uses `ssh:` by default. */
+        val applicationId: String = DEFAULT_APPLICATION_ID,
+        /** The FIDO2 credential ID from `makeCredential`, in standard Base64. Null until the key is enrolled. */
+        val credentialId: String? = null,
+        /**
+         * The public key of the credential, in standard Base64. It is the 32-byte Ed25519 key for
+         * [HardwareKeyType.SkSshEd25519], and the 65-byte uncompressed P-256 point for
+         * [HardwareKeyType.SkEcdsaSha2Nistp256]. Null until the key is enrolled.
+         */
+        val publicKey: String? = null,
+        /** True when the credential is a discoverable (resident) credential on the key. */
+        val residentKey: Boolean = false,
+    ) : SshAuthMethod {
+
+        /** True when the machine has a credential ID and a public key from an enrollment. */
+        val isEnrolled: Boolean
+            get() = !credentialId.isNullOrEmpty() && !publicKey.isNullOrEmpty()
+
+        companion object {
+            /** The default OpenSSH application string of a security key credential. */
+            const val DEFAULT_APPLICATION_ID: String = "ssh:"
+        }
+    }
 }
 
 /**
@@ -131,13 +159,21 @@ enum class KeyAlgorithm(
 }
 
 /**
- * Supported hardware security key types (OpenSSH FIDO2 `sk-*` and PIV smartcard).
+ * Hardware security key types: the OpenSSH FIDO2 `sk-*` types and the PIV smart card.
+ *
+ * The app supports only the FIDO2 types ([isFido2]). [PivSmartCard] stays, so that an old `machines.json` file
+ * still loads.
  */
 @Serializable
 enum class HardwareKeyType(val opensshKeyType: String) {
     SkSshEd25519("sk-ssh-ed25519@openssh.com"),
     SkEcdsaSha2Nistp256("sk-ecdsa-sha2-nistp256@openssh.com"),
     PivSmartCard("ssh-rsa"),
+    ;
+
+    /** True for an OpenSSH FIDO2 `sk-*` type. The app can enroll and use only these types. */
+    val isFido2: Boolean
+        get() = this != PivSmartCard
 }
 
 /**

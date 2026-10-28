@@ -3,9 +3,12 @@ package com.toxicbakery.app.bison.ssh
 import com.jcraft.jsch.Identity
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
+import com.jcraft.jsch.Signature
 import com.jcraft.jsch.SignatureEdDSA
 import com.jcraft.jsch.XDH
+import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.KeyAlgorithm
+import com.toxicbakery.app.bison.model.SshAuthMethod
 import java.nio.ByteBuffer
 import java.security.InvalidKeyException
 import java.security.KeyFactory
@@ -13,6 +16,10 @@ import java.security.KeyPairGenerator
 import java.security.NoSuchAlgorithmException
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.KeyAgreement
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.runBlocking
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
@@ -46,6 +53,34 @@ internal object JschAndroidCrypto {
         session.setConfig("ssh-ed25519-cert-v01@openssh.com", ED25519_CLASS_NAME)
         session.setConfig("xdh", XDH_CLASS_NAME)
     }
+
+    /** The OpenSSH `sk` public key algorithms that [HardwareKeyJschIdentity] uses. */
+    val SECURITY_KEY_ALGORITHMS: List<String> = HardwareKeyType.entries.filter { it.isFido2 }.map { it.opensshKeyType }
+
+    private val SECURITY_KEY_PLACEHOLDER_CLASS_NAME: String = SecurityKeySignaturePlaceholder::class.java.name
+
+    /**
+     * Lets [session] log in with a [HardwareKeyJschIdentity]. JSch 2.28.x has no `sk` support:
+     *
+     * - `UserAuthPublicKey` uses an identity only when its algorithm is in `PubkeyAcceptedAlgorithms`, so this
+     *   function adds [SECURITY_KEY_ALGORITHMS] to the list of the session.
+     * - `Session.checkSignatures` marks an algorithm with no `Signature` class as not available, so this function
+     *   registers [SecurityKeySignaturePlaceholder] for each `sk` name. The identity makes the signature, so JSch
+     *   never signs or verifies with the placeholder.
+     *
+     * Only a login with a security key calls this function. The other sessions keep the JSch defaults.
+     */
+    fun enableSecurityKeyAlgorithms(session: Session) {
+        for (name in SECURITY_KEY_ALGORITHMS) {
+            JSch.setConfig(name, SECURITY_KEY_PLACEHOLDER_CLASS_NAME)
+            session.setConfig(name, SECURITY_KEY_PLACEHOLDER_CLASS_NAME)
+        }
+        val accepted = session.getConfig(PUBKEY_ACCEPTED_ALGORITHMS).orEmpty().split(',').filter { it.isNotBlank() }
+        val added = SECURITY_KEY_ALGORITHMS.filter { it !in accepted }
+        session.setConfig(PUBKEY_ACCEPTED_ALGORITHMS, (accepted + added).joinToString(","))
+    }
+
+    private const val PUBKEY_ACCEPTED_ALGORITHMS = "PubkeyAcceptedAlgorithms"
 }
 
 /**
@@ -218,5 +253,82 @@ internal class AndroidKeystoreJschIdentity(
 
     override fun clear() {
         // Hardware-backed AndroidKeyStore private keys remain in secure storage
+    }
+}
+
+/**
+ * A placeholder JSch [Signature] for the OpenSSH `sk` algorithms. [JschAndroidCrypto.enableSecurityKeyAlgorithms]
+ * registers it, so that `Session.checkSignatures` marks the `sk` names as available. [HardwareKeyJschIdentity]
+ * makes the signature of the login, and the client never verifies an `sk` signature. Thus only [init] works.
+ */
+class SecurityKeySignaturePlaceholder : Signature {
+    override fun init() {
+        // Nothing to prepare. The check of JSch only makes an instance and calls this function.
+    }
+
+    override fun update(H: ByteArray): Unit = throw UnsupportedOperationException(NOT_USED)
+
+    override fun verify(sig: ByteArray): Boolean = throw UnsupportedOperationException(NOT_USED)
+
+    override fun sign(): ByteArray = throw UnsupportedOperationException(NOT_USED)
+
+    private companion object {
+        const val NOT_USED =
+            "The security key identity signs the login. JSch does not sign or verify with this class."
+    }
+}
+
+/**
+ * Bridges a FIDO2 security key ([HardwareKeySigner]) into JSch's [Identity] interface for `publickey` authentication
+ * with an OpenSSH `sk` key of [key].
+ *
+ * [getPublicKeyBlob] gives the `sk` public key blob from the enrolled values of [key] ([SecurityKeyPublicKeys]).
+ * [getSignature] blocks the JSch thread while [signer] waits for the key and for the touch of the user. JSch sends
+ * the returned `PROTOCOL.u2f` blob in the packet with no change. JSch asks the server first if it accepts the key,
+ * so the user touches the key only for a key that the server knows.
+ *
+ * A [HardwareKeyException] from [signer] goes through `Session.connect`, because it is a [RuntimeException]. The wait
+ * is a child of [callerJob], so a cancel of the login stops it with a [kotlinx.coroutines.CancellationException].
+ */
+internal class HardwareKeyJschIdentity(
+    private val machineId: String,
+    private val key: SshAuthMethod.HardwareSecurityKey,
+    private val signer: HardwareKeySigner,
+    private val callerJob: Job?,
+) : Identity {
+
+    override fun setPassphrase(passphrase: ByteArray?): Boolean = true
+
+    override fun getPublicKeyBlob(): ByteArray = SecurityKeyPublicKeys.blob(key)
+
+    override fun getSignature(data: ByteArray?): ByteArray? =
+        getSignature(data, null)
+
+    override fun getSignature(data: ByteArray?, alg: String?): ByteArray? {
+        if (data == null) return null
+        // An error of the child must not fail the caller job, so the child returns it as a value.
+        val result = runBlocking(callerJob ?: EmptyCoroutineContext) {
+            try {
+                Result.success(signer.sign(machineId, key, data))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+        }
+        return result.getOrThrow()
+    }
+
+    @Deprecated("Deprecated in JSch Identity")
+    override fun decrypt(): Boolean = true
+
+    override fun getAlgName(): String = key.keyType.opensshKeyType
+
+    override fun getName(): String = "security-key:${key.keyType.opensshKeyType}"
+
+    override fun isEncrypted(): Boolean = false
+
+    override fun clear() {
+        // The private key stays on the security key.
     }
 }
