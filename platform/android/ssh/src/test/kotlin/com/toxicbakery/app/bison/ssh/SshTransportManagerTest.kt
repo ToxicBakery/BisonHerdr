@@ -101,6 +101,7 @@ class SshTransportManagerTest {
     fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLine() = runTest {
         // Each command batch fails, as on a broken SSH channel.
         val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
             endpointSnapshotBus = EndpointSnapshotBus(),
             paneSurfaceBus = PaneSurfaceBus(),
