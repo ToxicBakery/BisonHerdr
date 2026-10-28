@@ -1,6 +1,8 @@
 package com.toxicbakery.app.bison.service
 
+import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.IDLE_TIMEOUT
+import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.isConnectStep
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -26,6 +28,7 @@ import kotlinx.coroutines.test.runTest
 class ServiceStopPolicyTest {
 
     private val connectedMachines = MutableStateFlow<Set<String>>(emptySet())
+    private val connectionProgress = MutableStateFlow<Map<String, ConnectionProgress>>(emptyMap())
     private val anyActivityStarted = MutableStateFlow(false)
     private val policy = ServiceStopPolicy()
 
@@ -114,10 +117,65 @@ class ServiceStopPolicyTest {
         assertStopsAfter(stop, IDLE_TIMEOUT)
     }
 
+    @Test
+    fun doesNotStopWhileAConnectionIsInProgress() = runTest {
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.AuthenticatingSsh)
+        val stop = startPolicy()
+
+        // The user leaves the app during a slow connect. A stop now cancels the connect.
+        advanceAndRun(10.minutes)
+        assertFalse(stop.isCompleted)
+
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.Failed)
+        runCurrent()
+        assertStopsAfter(stop, IDLE_TIMEOUT)
+    }
+
+    @Test
+    fun aConnectStepBeforeTheEndOfTheTimeoutStartsANewTimeout() = runTest {
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.Idle)
+        val stop = startPolicy()
+
+        advanceAndRun(20.seconds)
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.SyncingHerdrSnapshot)
+        advanceAndRun(5.seconds)
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.Idle)
+        runCurrent()
+
+        assertStopsAfter(stop, IDLE_TIMEOUT)
+        assertEquals(55.seconds.inWholeMilliseconds, currentTime)
+    }
+
+    @Test
+    fun onlyTheMiddleStepsOfAConnectAreConnectSteps() {
+        val connectSteps = ConnectionProgress.entries.filter { step -> step.isConnectStep() }
+        assertEquals(
+            listOf(
+                ConnectionProgress.AuthenticatingSsh,
+                ConnectionProgress.BootstrappingMoshOrBridge,
+                ConnectionProgress.VerifyingUdpOrHello,
+                ConnectionProgress.SyncingHerdrSnapshot,
+            ),
+            connectSteps,
+        )
+    }
+
+    @Test
+    fun eachConnectStepKeepsTheServiceBusy() = runTest {
+        ConnectionProgress.entries.filter { step -> step.isConnectStep() }.forEach { step ->
+            connectionProgress.value = mapOf("workbox" to step, "gpu-rig" to ConnectionProgress.Failed)
+            val stop = startPolicy()
+            advanceAndRun(10.minutes)
+            assertFalse(stop.isCompleted, "$step did not keep the service busy")
+            stop.cancel()
+        }
+    }
+
     private fun TestScope.startPolicy(): Job {
         val job = launch {
             policy.awaitIdleTimeout(
                 connectedMachines = connectedMachines,
+                connectionProgress = connectionProgress,
                 anyActivityStarted = anyActivityStarted,
             )
         }

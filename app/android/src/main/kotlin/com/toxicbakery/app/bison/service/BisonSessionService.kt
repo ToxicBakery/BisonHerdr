@@ -59,8 +59,8 @@ import org.kodein.di.instance
  * supervising `ConnectivityManager.NetworkCallback` fast-roaming, collecting [SshRequestManager.bus],
  * and posting actionable notifications for `Blocked` and `Done` coding agents.
  *
- * The service stops itself when [ServiceStopPolicy] finds no connected machine and no started
- * activity for 30 s. [MainActivity] starts the service again in `onStart`.
+ * The service stops itself when [ServiceStopPolicy] finds no connected machine, no connection in
+ * progress, and no started activity for 30 s. [MainActivity] starts the service again in `onStart`.
  */
 class BisonSessionService : Service(), DIAware {
 
@@ -157,6 +157,7 @@ class BisonSessionService : Service(), DIAware {
         stopPolicyJob = serviceScope.launch(Dispatchers.Main) {
             stopPolicy.awaitIdleTimeout(
                 connectedMachines = sshStateManager.connectedMachines,
+                connectionProgress = sshStateManager.connectionProgress,
                 anyActivityStarted = startedActivityCounter.anyStarted,
             )
             stopIdleService()
@@ -164,7 +165,7 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun stopIdleService() {
-        log.d { "No machine is connected and no activity is started; BisonSessionService stops itself" }
+        log.d { "The service is idle for the full timeout; BisonSessionService stops itself" }
         stopForeground(STOP_FOREGROUND_REMOVE)
         // stopSelfResult does not stop the service when a newer start command exists. That start
         // command calls startForeground again and starts a new idle timer.
