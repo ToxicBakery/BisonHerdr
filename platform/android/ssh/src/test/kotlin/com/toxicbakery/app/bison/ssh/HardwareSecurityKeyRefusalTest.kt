@@ -3,6 +3,8 @@ package com.toxicbakery.app.bison.ssh
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
@@ -61,6 +63,7 @@ class HardwareSecurityKeyRefusalTest {
                 paneSurfaceBus = PaneSurfaceBus(),
                 semanticNotificationBus = SemanticNotificationBus(),
                 keystoreKeyManager = AndroidKeystoreKeyManager(),
+                knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
             )
             val machine = hardwareKeyMachine(port = listener.localPort)
 
