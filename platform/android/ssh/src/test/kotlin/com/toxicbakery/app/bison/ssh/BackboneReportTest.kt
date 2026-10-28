@@ -60,6 +60,7 @@ class BackboneReportTest {
     private val route = ProxyJumpTunnel().resolveRoute(machine)
 
     private fun client() = RealHerdrSshClient(
+        localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = SshDebugLog(),
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = PaneSurfaceBus(),
@@ -361,6 +362,7 @@ class BackboneReportTest {
         debugLog: SshDebugLog,
         states: SshStateManager = SshStateManager(),
     ) = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = states,
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

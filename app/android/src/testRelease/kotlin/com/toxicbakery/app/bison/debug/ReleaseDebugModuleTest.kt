@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.debug
 import com.toxicbakery.app.bison.appModule
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialValidator
+import com.toxicbakery.app.bison.ssh.LocalNetworkGuard
 import com.toxicbakery.app.bison.ssh.RealSshBackend
 import com.toxicbakery.app.bison.ssh.SshBackend
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
@@ -26,6 +27,10 @@ class ReleaseDebugModuleTest {
     private val di = DI {
         import(appModule)
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) { InMemoryStoreIOProvider() }
+        // The Application also binds the local network guard with its Context.
+        bindSingleton<LocalNetworkGuard> {
+            LocalNetworkGuard(hasPermission = { true }, localPrefixes = { emptyList() })
+        }
     }
 
     @Test
