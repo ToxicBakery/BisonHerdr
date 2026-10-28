@@ -45,8 +45,8 @@ class ProxyJumpTunnel(
      * bastion user gives the user of [machine].
      *
      * The target host is the host name that the user typed, with no change. Through a bastion, the bastion resolves
-     * the name in the `direct-tcpip` request. Thus a bastion on a tailnet resolves a MagicDNS short name, for example
-     * `devbox`, with its own DNS search domain. The known hosts also use this name.
+     * the name in the `direct-tcpip` request. Thus a bastion that uses Tailscale MagicDNS resolves a short name, for
+     * example `devbox`, with its own DNS search domain. The known hosts also use this name.
      */
     fun resolveRoute(machine: HostMachine): ResolvedSshRoute {
         val proxy = machine.proxyJump

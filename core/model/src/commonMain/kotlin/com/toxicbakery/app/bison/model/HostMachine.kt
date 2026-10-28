@@ -153,7 +153,7 @@ enum class HardwareKeyTransport {
 /**
  * Multi-hop SSH bastion (`ProxyJump` / `direct-tcpip`) configuration.
  *
- * The bastion resolves the host name of the target machine. A bastion on a tailnet thus resolves a Tailscale
+ * The bastion resolves the host name of the target machine. Thus a bastion that uses Tailscale MagicDNS resolves a
  * MagicDNS short name with no added option. An earlier version had a `tailscaleMagicDns` field that added `.ts.net`
  * to a short name. A real MagicDNS name is `<machine>.<tailnet>.ts.net`, so that name never resolved. The store
  * JSON (`appJson`) ignores unknown keys, so an old `machines.json` with the field still loads. The next save

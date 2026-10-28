@@ -136,7 +136,7 @@ class MainActivity : FragmentActivity(), DIAware {
     override fun onStop() {
         super.onStop()
         startedActivityCounter.onActivityStopped()
-        // Park active terminal surfaces at 0 bytes/sec while keeping the control stream alive
+        // Turn the surface leases off, so that the poll reads no panes. The SSH sessions stay open.
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(
