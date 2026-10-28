@@ -258,10 +258,11 @@ fun MachineFederationScreen(
                         backbone = backbone,
                         snapshot = snapshot,
                         onPrimaryAction = {
-                            if (isConnected) {
-                                onOpenWorkspaceTerminal(machine.id)
-                            } else {
-                                onConnectMachine(machine.id)
+                            when {
+                                isConnected -> onOpenWorkspaceTerminal(machine.id)
+                                machine.authMethod.isSupported -> onConnectMachine(machine.id)
+                                // This version cannot connect with the method. The editor tells why (issue #23).
+                                else -> onConfigureMachine(machine.id)
                             }
                         },
                         onEdit = { onConfigureMachine(machine.id) },
@@ -301,6 +302,7 @@ private fun HostMachineCard(
     val runningAgentsCount = snapshot?.agents?.count {
         it.agentStatus == AgentStatus.Working
     } ?: 0
+    val isAuthSupported = machine.authMethod.isSupported
 
     Surface(
         color = palette.bgSurface,
@@ -374,6 +376,12 @@ private fun HostMachineCard(
                     color = if (isConnected) palette.accentSuccess else palette.accentInfo,
                 )
 
+                if (!isAuthSupported) {
+                    TelemetryBadge(
+                        text = ConfigureMachineViewModel.UNSUPPORTED_AUTH_LABEL,
+                        color = palette.accentError,
+                    )
+                }
                 if (snapshot != null) {
                     TelemetryBadge(
                         text = "${snapshot.workspaces.size} WS • ${snapshot.panes.size} Panes",
@@ -399,6 +407,7 @@ private fun HostMachineCard(
             ) {
                 Button(
                     onClick = onPrimaryAction,
+                    enabled = isConnected || isAuthSupported,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (isConnected) palette.accentSuccess else palette.accentPrimary,
                         contentColor = palette.bgDeep,
