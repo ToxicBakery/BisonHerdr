@@ -374,6 +374,9 @@ internal class RealHerdrSshClient(
 
     /** The machines whose last poll got no snapshot. See [recordMissingSnapshot]. */
     private val machinesWithoutSnapshot: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** For each machine and pane, the size of the erase at the end of the pane text. See [recordPaneInput]. */
+    private val paneEraseSizes = ConcurrentHashMap<String, ConcurrentHashMap<String, Int>>()
     private val revisionCounter = AtomicLong(10L)
     private val inputSequence = AtomicLong(0L)
     private val lastInputConfirmedSeq = ConcurrentHashMap<String, Long>()
@@ -626,6 +629,7 @@ internal class RealHerdrSshClient(
         }
         lastInputConfirmedSeq.remove(machineId)
         machinesWithoutSnapshot.remove(machineId)
+        paneEraseSizes.remove(machineId)
         inputWorkers.remove(machineId)?.close()
         pollWorkers.remove(machineId)?.close()
         closeSessions(machineId)
@@ -1102,6 +1106,9 @@ internal class RealHerdrSshClient(
                 ?.takeIf { it.isNotBlank() }
                 ?: sel.focusedPaneId
                 ?: endpointSnapshotBus.snapshotFor(machine.id)?.focusedPaneId
+            if (!targetPaneId.isNullOrBlank()) {
+                recordPaneInput(machine.id, targetPaneId, requestInputs(paramsObj))
+            }
             val ndjsonLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
             return@withContext runCatching {
                 val cmds = buildList {
@@ -1247,6 +1254,7 @@ internal class RealHerdrSshClient(
         if (event is ClientPaneInputEvent.Mouse) {
             return true
         }
+        recordPaneInput(machine.id, targetPaneId, eventInputs(event))
 
         // Herdr keeps the scroll position when input arrives. Go back to the bottom, like a terminal,
         // so that the user sees the prompt and the echo.
@@ -1584,6 +1592,79 @@ internal class RealHerdrSshClient(
         }
 
         is ClientPaneInputEvent.Mouse -> null
+    }
+
+    /** The kinds of input that change the size of the erase at the end of a pane text. See [recordPaneInput]. */
+    private enum class PaneInput {
+        /** An input that is not an erase, for example a character or Enter. */
+        Other,
+
+        /** An erase of one character, for example Backspace. */
+        EraseChar,
+
+        /** An erase of a word or of a line, for example Ctrl-W or Ctrl-U. */
+        EraseMore,
+    }
+
+    /**
+     * Records the [inputs] to [paneId] of [machineId], and keeps the size of the erase at the end of the pane text.
+     *
+     * A shell in cooked mode erases a character with `\b \b`. Thus the pane text has a written space for each erased
+     * character, and the cursor is before these spaces. The size is the number of characters that the erase inputs
+     * after the last other input erased. After an erase of a word or of a line, the size is [ERASE_SIZE_UNKNOWN].
+     * [renderAnsiIntoRect] uses the size for the cursor. The size stays until the next input to the pane, because each
+     * poll builds the frame again from the same pane text.
+     */
+    private fun recordPaneInput(machineId: String, paneId: String, inputs: List<PaneInput>) {
+        if (inputs.isEmpty()) return
+        val sizes = paneEraseSizes.computeIfAbsent(machineId) { ConcurrentHashMap() }
+        sizes.compute(paneId) { _, oldSize ->
+            inputs.fold(oldSize ?: 0) { size, input ->
+                when (input) {
+                    PaneInput.Other -> 0
+                    PaneInput.EraseChar -> if (size == ERASE_SIZE_UNKNOWN) size else size + 1
+                    PaneInput.EraseMore -> ERASE_SIZE_UNKNOWN
+                }
+            }.takeIf { it != 0 }
+        }
+    }
+
+    /** Returns the inputs of [event]. A mouse event has none. */
+    private fun eventInputs(event: ClientPaneInputEvent): List<PaneInput> =
+        when (event) {
+            is ClientPaneInputEvent.Key -> listOf(
+                when {
+                    event.event.code != ClientKeyCode.Backspace -> PaneInput.Other
+                    event.event.ctrl || event.event.alt -> PaneInput.EraseMore
+                    else -> PaneInput.EraseChar
+                },
+            )
+            is ClientPaneInputEvent.TextCommit -> textInputs(event.text)
+            is ClientPaneInputEvent.Paste -> textInputs(event.text)
+            is ClientPaneInputEvent.Mouse -> emptyList()
+        }
+
+    /** Returns the inputs of the characters of [text]. BS and DEL erase a character. Ctrl-U and Ctrl-W erase more. */
+    private fun textInputs(text: String): List<PaneInput> =
+        text.map { char ->
+            when (char) {
+                '\b', '\u007f' -> PaneInput.EraseChar
+                '\u0015', '\u0017' -> PaneInput.EraseMore
+                else -> PaneInput.Other
+            }
+        }
+
+    /** Returns the inputs of a pane input request with [params]: the characters of `text`, and then the `keys`. */
+    private fun requestInputs(params: JsonObject): List<PaneInput> {
+        val text = (params["text"] as? JsonPrimitive)?.content.orEmpty()
+        val keys = (params["keys"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty()
+        return textInputs(text) + keys.map { key ->
+            when (key.lowercase().replace(" ", "")) {
+                "backspace", "ctrl+h" -> PaneInput.EraseChar
+                "ctrl+backspace", "alt+backspace", "ctrl+u", "ctrl+w" -> PaneInput.EraseMore
+                else -> PaneInput.Other
+            }
+        }
     }
 
     private fun isControlInterruptEvent(event: ClientPaneInputEvent): Boolean =
@@ -2979,6 +3060,7 @@ internal class RealHerdrSshClient(
         val grid = Array(totalCols * totalRows) { BLANK_CELL }
 
         var focusedCursor: CursorState? = null
+        val eraseSizes = paneEraseSizes[machineId]
         val surfacePanes = layoutPanes.map { lp ->
             val paneMeta = snapshot.panes.firstOrNull { it.paneId == lp.paneId }
             val agentMeta = snapshot.agents.firstOrNull { it.paneId == lp.paneId }
@@ -2991,6 +3073,7 @@ internal class RealHerdrSshClient(
                 grid = grid,
                 gridCols = totalCols,
                 gridRows = totalRows,
+                eraseSize = eraseSizes?.get(lp.paneId) ?: 0,
             )
             if (isFocused) {
                 focusedCursor = CursorState(
@@ -3047,8 +3130,29 @@ internal class RealHerdrSshClient(
 
     /**
      * Parses ANSI SGR and cursor escape sequences in [ansiText], wraps lines cleanly to [rect.width]
-     * (clamping horizontal box-drawing divider lines to 1 row), and populates [grid] inside [rect],
-     * returning the final `(col, row)` cursor coordinates.
+     * (clamping horizontal box-drawing divider lines to 1 row), and populates [grid] inside [rect].
+     *
+     * Returns a guess of the cursor as `(col, row)`. The `pane.read` answer of Herdr has no cursor field
+     * (`PaneReadResult` in `src/api/schema/panes.rs` of Herdr 0.9.5). The guess is the end of the last row with text,
+     * with the blanks after the text: written spaces, for example the space of the prompt `$ `, and blanks with a
+     * style. The erase of a shell in cooked mode also writes a space for each erased character. Thus the guess moves
+     * back by [eraseSize], the number of characters that the last inputs to the pane erased, but not before the last
+     * text. After an erase of a word or of a line, [eraseSize] is [ERASE_SIZE_UNKNOWN], and the guess is just after
+     * the last text. See [recordPaneInput].
+     *
+     * The guess is wrong in these cases:
+     * - A program erases text with spaces by itself, a different client erases text, or an erase has no effect, for
+     *   example Backspace at the start of the input.
+     * - Ctrl-W or Ctrl-U erases text after a space, for example after the prompt `$ `. The guess is then before that
+     *   space.
+     * - The next input to the pane clears the erase size at once. A poll before Herdr applies that input can put the
+     *   guess after the spaces of the erase.
+     * - Blanks with a style come after the text, but the cursor is not after them.
+     * - A full-screen program puts the cursor at a different position.
+     * - The cursor is not at the end of the text, for example after the Left key.
+     * - The cursor is on an empty line below the text.
+     *
+     * The Mosh path (issue #22) gets the true cursor from its terminal emulator.
      */
     private fun renderAnsiIntoRect(
         ansiText: String,
@@ -3056,6 +3160,7 @@ internal class RealHerdrSshClient(
         grid: Array<CellData>,
         gridCols: Int,
         gridRows: Int,
+        eraseSize: Int,
     ): Pair<Int, Int> {
         val startX = rect.x.toInt().coerceIn(0, max(0, gridCols - 1))
         val startY = rect.y.toInt().coerceIn(0, max(0, gridRows - 1))
@@ -3287,14 +3392,16 @@ internal class RealHerdrSshClient(
                 }
             }
         }
-        // The cursor is after the last text of the last row with text. When the host wrote blanks after that text, for
-        // example after the prompt "$ ", the cursor is after these blanks too. Herdr gives no cursor position.
-        val blanksAfterText = visibleTrimmedBlanks.getOrElse(lastRowIndex) { 0 }
-        val cursorCol = if (blanksAfterText > 0) {
-            startX + visibleRows[lastRowIndex].size + blanksAfterText
+        // The cursor is after the last text of the last row with text, and after the blanks at the end of that row:
+        // the blanks with a style in the row, and the written blanks that the trim removed. An erase moves it back.
+        // See the KDoc for the limits of this guess.
+        val afterText = lastCol + 1
+        val afterBlanks = if (lastRowIndex >= 0) {
+            startX + visibleRows[lastRowIndex].size + visibleTrimmedBlanks[lastRowIndex]
         } else {
-            lastCol + 1
+            afterText
         }
+        val cursorCol = if (eraseSize == ERASE_SIZE_UNKNOWN) afterText else max(afterText, afterBlanks - eraseSize)
         return min(endX - 1, cursorCol) to lastRow
     }
 
@@ -3428,6 +3535,9 @@ internal class RealHerdrSshClient(
 
         /** The number of bytes of standard error that each persistent worker keeps. See [StderrTail]. */
         private const val WORKER_STDERR_TAIL_BYTES = 4 * 1024
+
+        /** The erase size after an erase of a word or of a line. See [recordPaneInput]. */
+        private const val ERASE_SIZE_UNKNOWN = -1
 
         /** The maximum length of a cause from the host in the debug log. See [recordMissingSnapshot]. */
         private const val MAX_LOGGED_CAUSE_LENGTH = 512
