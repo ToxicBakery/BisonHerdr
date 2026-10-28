@@ -25,8 +25,9 @@ import com.yubico.yubikit.core.util.Result as YubiResult
 
 /**
  * A software FIDO2 authenticator for JVM tests. It answers the CTAP2 commands `getInfo`, `makeCredential`, and
- * `getAssertion` with real Ed25519 and P-256 keys, behind a [FidoConnection] that speaks the CTAPHID frames of a USB
- * key. Thus a test runs the real yubikit `Ctap2Session` and the real wire format of [YubiKeyFido2Signer].
+ * `getAssertion` with real Ed25519 and P-256 keys, behind a [FidoConnection] that sends and receives the CTAPHID
+ * frames of a USB key. Thus a test runs the real yubikit `Ctap2Session` and the real wire format of
+ * [YubiKeyFido2Signer].
  *
  * [touch] decides what the key does when a command needs the touch of the user.
  */

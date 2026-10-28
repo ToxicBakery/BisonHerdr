@@ -7,11 +7,12 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
+import com.yubico.yubikit.core.Transport
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -22,13 +23,15 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.runTest
 
 /**
  * Tests the login with a FIDO2 security key against a real SSH server ([TestSshServer], Apache MINA SSHD). The key
  * is a software FIDO2 key behind a fake CTAPHID connection ([FakeSecurityKey]), so the test runs the real yubikit
  * `Ctap2Session`, [YubiKeyFido2Signer], [HardwareKeyJschIdentity], and JSch. The server parses the `authorized_keys`
  * line of the enrollment and verifies the `sk` signature with its own code.
+ *
+ * The tests use [runBlocking], not `runTest`. The key comes from a host on a real thread, so each time limit of the
+ * signer must use real time. With virtual time, a late host thread lets the time limit pass at once.
  */
 class HardwareKeyLoginTest {
 
@@ -63,17 +66,17 @@ class HardwareKeyLoginTest {
     }
 
     @Test
-    fun anEnrolledEd25519KeyLogsInAndRunsACommand() = runTest {
+    fun anEnrolledEd25519KeyLogsInAndRunsACommand() = runBlocking<Unit> {
         loginWithAnEnrolledKey(HardwareKeyType.SkSshEd25519)
     }
 
     @Test
-    fun anEnrolledP256KeyLogsInAndRunsACommand() = runTest {
+    fun anEnrolledP256KeyLogsInAndRunsACommand() = runBlocking<Unit> {
         loginWithAnEnrolledKey(HardwareKeyType.SkEcdsaSha2Nistp256)
     }
 
     @Test
-    fun aKeyThatTheServerDoesNotKnowNeedsNoTouch() = runTest {
+    fun aKeyThatTheServerDoesNotKnowNeedsNoTouch() = runBlocking<Unit> {
         startHost()
         val enrolled = signer.enroll("unknown-key", HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
         val machine = machine("unknown-key", enrolled)
@@ -86,7 +89,7 @@ class HardwareKeyLoginTest {
     }
 
     @Test
-    fun withNoActivityTheLoginFailsAndTheReconnectLoopCanStop() = runTest {
+    fun withNoActivityTheLoginFailsAndTheReconnectLoopCanStop() = runBlocking<Unit> {
         val host = startHost()
         val enrolled = signer.enroll("no-ui", HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
         server.authorizeKey(SecurityKeyPublicKeys.authorizedKeyLine(enrolled))
@@ -102,7 +105,7 @@ class HardwareKeyLoginTest {
     }
 
     @Test
-    fun aMachineWithNoEnrolledKeyFailsBeforeTheConnection() = runTest {
+    fun aMachineWithNoEnrolledKeyFailsBeforeTheConnection() = runBlocking<Unit> {
         val machine = machine("not-enrolled", SshAuthMethod.HardwareSecurityKey())
 
         val result = backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine))
@@ -113,7 +116,8 @@ class HardwareKeyLoginTest {
     }
 
     @Test
-    fun theSessionAcceptsTheSkAlgorithmsAndThePlaceholderLoads() {
+    fun onlyTheSecurityKeySessionAcceptsTheSkAlgorithms() {
+        val globalDefaults = JSch.getConfig("PubkeyAcceptedAlgorithms")
         val session = JSch().getSession("user", TestSshServer.HOST, server.port)
         val defaults = session.getConfig("PubkeyAcceptedAlgorithms")
 
@@ -122,20 +126,23 @@ class HardwareKeyLoginTest {
 
         val accepted = session.getConfig("PubkeyAcceptedAlgorithms").split(',')
         assertEquals(defaults.split(',') + JschAndroidCrypto.SECURITY_KEY_ALGORITHMS, accepted)
-        for (name in JschAndroidCrypto.SECURITY_KEY_ALGORITHMS) {
-            // The same check as Session.checkSignatures.
-            val signature = Class.forName(JSch.getConfig(name)).asSubclass(com.jcraft.jsch.Signature::class.java)
-                .getDeclaredConstructor()
-                .newInstance()
-            signature.init()
-            assertFailsWith<UnsupportedOperationException> { signature.sign() }
-        }
         assertEquals(
             listOf("sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"),
             JschAndroidCrypto.SECURITY_KEY_ALGORITHMS,
         )
+        // The global configuration and the other sessions keep the JSch defaults.
+        assertEquals(globalDefaults, JSch.getConfig("PubkeyAcceptedAlgorithms"))
+        val otherSession = JSch().getSession("user", TestSshServer.HOST, server.port)
+        assertEquals(defaults, otherSession.getConfig("PubkeyAcceptedAlgorithms"))
+        for (name in JschAndroidCrypto.SECURITY_KEY_ALGORITHMS) {
+            assertNull(JSch.getConfig(name), "JSch has a global class for $name")
+        }
     }
 
+    /**
+     * Enrolls a key of [keyType] and logs in [LOGIN_COUNT] times. Each login gets a new signature, so that some P-256
+     * signatures have an `r` or an `s` with the high bit set.
+     */
     private suspend fun loginWithAnEnrolledKey(keyType: HardwareKeyType) {
         startHost()
         val enrolled = signer.enroll(keyType.name, keyType, HardwareKeyTransport.UsbAndNfc, "ssh:")
@@ -143,15 +150,20 @@ class HardwareKeyLoginTest {
         val machine = machine("security-key-${keyType.name}", enrolled)
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
-        assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
-        assertEquals("sk login ok", backend.client.runCommand(machine, route, "echo sk login ok").trim())
-        assertTrue(key.commands.count { it == CTAP_GET_ASSERTION } == 1, "Expected one touch: ${key.commands}")
+        repeat(LOGIN_COUNT) { index ->
+            assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), "login $index\n${debugLogDump()}")
+            assertEquals("sk login ok", backend.client.runCommand(machine, route, "echo sk login ok").trim())
+            backend.disconnect(machine.id)
+        }
+        assertEquals(LOGIN_COUNT, key.commands.count { it == CTAP_GET_ASSERTION }, "Expected one touch for each login")
         assertTrue(debugLogDump().contains("The security key signed"), debugLogDump())
     }
 
-    /** Starts a host of [hub] that gives the USB key of [key], as the activity does in the foreground. */
+    /** Starts a host of [hub] that gives the USB key of [key], as the visible activity does. */
     private fun startHost(): Job {
         val discovery = object : SecurityKeyDiscovery {
+            override val transport: Transport = Transport.USB
+
             override fun start() = hub.onUsbDevice(key.device())
 
             override fun stop() = Unit
@@ -167,5 +179,6 @@ class HardwareKeyLoginTest {
 
     private companion object {
         const val CTAP_GET_ASSERTION = 0x02
+        const val LOGIN_COUNT = 8
     }
 }

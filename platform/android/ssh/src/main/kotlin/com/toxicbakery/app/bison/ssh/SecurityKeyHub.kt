@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.HardwareKeyTransport
+import com.yubico.yubikit.core.Transport
 import com.yubico.yubikit.core.YubiKeyDevice
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,26 +15,29 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 
 /**
- * Starts and stops the USB and NFC discovery of security keys. The activity supplies the implementation with
- * `YubiKitManager`, because the NFC discovery needs an activity in the foreground. The discovery gives each key that
- * it finds to [SecurityKeyHub].
+ * Starts and stops the discovery of security keys on one connection: USB or NFC. The activity supplies the
+ * implementations with `YubiKitManager`, because the discovery needs an activity. The discovery gives each key that it
+ * finds to [SecurityKeyHub].
  */
 interface SecurityKeyDiscovery {
-    /** Starts the USB and NFC discovery. */
+    /** The connection of the keys that this discovery finds: [Transport.USB] or [Transport.NFC]. */
+    val transport: Transport
+
+    /** Starts the discovery. */
     fun start()
 
-    /** Stops the USB and NFC discovery. */
+    /** Stops the discovery. */
     fun stop()
 }
 
 /**
  * Keeps the security keys that the discovery of an activity finds, and gives a key to a [YubiKeyFido2Signer] call.
  *
- * - An activity runs [hostDiscovery] while it is in the foreground. [hasHost] is true only then. Without a host,
- *   the app cannot find a key or ask for a touch, so a signer call stops at once.
- * - The host starts the discovery only while a signer call runs ([withDiscovery]). Thus the app does not take the
- *   NFC reader and does not ask for the USB permission when no call needs a key.
- * - A USB key stays available until the discovery tells that it closed, or until the discovery stops. An NFC tap
+ * - An activity runs [hostDiscovery] for each [SecurityKeyDiscovery] while it is visible. [hasHost] is true only then.
+ *   Without a host, the app cannot find a key or ask for a touch, so a signer call stops at once.
+ * - A host starts its discovery only while a signer call runs ([withDiscovery]). Thus the app does not take the NFC
+ *   reader and does not ask for the USB permission when no call needs a key.
+ * - A USB key stays available until the discovery tells that it closed, or until the USB discovery stops. An NFC tap
  *   gives the key to the next [awaitDevice] call only.
  */
 class SecurityKeyHub {
@@ -42,14 +46,13 @@ class SecurityKeyHub {
     private val usbDevice = MutableStateFlow<YubiKeyDevice?>(null)
     private val nfcDevices = Channel<YubiKeyDevice>(Channel.CONFLATED)
 
-    /** True while one or more activities run [hostDiscovery]. */
+    /** True while one or more callers run [hostDiscovery]. */
     val hasHost: Boolean
         get() = hostCount.value > 0
 
     /**
-     * Runs [discovery] while a signer call needs a key, until the caller cancels this function. An activity calls
-     * this function while it is in the foreground. When the function stops, it stops the discovery and forgets the
-     * keys that the discovery found.
+     * Runs [discovery] while a signer call needs a key, until the caller cancels this function. When the discovery
+     * stops, the hub forgets the keys of its [SecurityKeyDiscovery.transport]. The keys of the other connection stay.
      */
     suspend fun hostDiscovery(discovery: SecurityKeyDiscovery) {
         hostCount.update { it + 1 }
@@ -62,13 +65,13 @@ class SecurityKeyHub {
                 } else if (!active && started) {
                     discovery.stop()
                     started = false
-                    forgetDevices()
+                    forgetDevices(discovery.transport)
                 }
             }
         } finally {
             if (started) {
                 discovery.stop()
-                forgetDevices()
+                forgetDevices(discovery.transport)
             }
             hostCount.update { it - 1 }
         }
@@ -114,9 +117,11 @@ class SecurityKeyHub {
         return merge(*sources.toTypedArray()).first()
     }
 
-    private fun forgetDevices() {
-        usbDevice.value = null
-        forgetNfcTap()
+    private fun forgetDevices(transport: Transport) {
+        when (transport) {
+            Transport.USB -> usbDevice.value = null
+            Transport.NFC -> forgetNfcTap()
+        }
     }
 
     /** Removes the NFC tap that the channel keeps. The channel keeps one tap at most. */

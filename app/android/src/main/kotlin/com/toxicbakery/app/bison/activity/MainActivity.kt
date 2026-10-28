@@ -36,6 +36,7 @@ import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.hasLocalNetworkPermission
 import com.toxicbakery.logging.Arbor
+import com.yubico.yubikit.android.YubiKitManager
 import kotlinx.coroutines.launch
 import org.kodein.di.DI
 import org.kodein.di.DIAware
@@ -120,13 +121,25 @@ class MainActivity : FragmentActivity(), DIAware {
             }
         }
 
-        // Find FIDO2 security keys over USB and NFC only while this activity is in the foreground, because the NFC
-        // reader needs it. The hub starts the discovery only while a security key call runs (issue #23).
+        // Find FIDO2 security keys only while this activity is visible (issue #23). The hub starts each discovery
+        // only while a security key call runs. The USB permission dialog pauses this activity, so the USB discovery
+        // runs while the activity is started. The NFC reader mode needs a resumed activity.
         if (featureFlags.hardwareSecurityKeys) {
-            val discovery = YubiKeyDiscovery(activity = this, hub = securityKeyHub)
+            val yubiKitManager = YubiKitManager(applicationContext)
+            val usbDiscovery = YubiKeyUsbDiscovery(yubiKitManager = yubiKitManager, hub = securityKeyHub)
+            val nfcDiscovery = YubiKeyNfcDiscovery(
+                activity = this,
+                yubiKitManager = yubiKitManager,
+                hub = securityKeyHub,
+            )
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    securityKeyHub.hostDiscovery(usbDiscovery)
+                }
+            }
             lifecycleScope.launch {
                 repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                    securityKeyHub.hostDiscovery(discovery)
+                    securityKeyHub.hostDiscovery(nfcDiscovery)
                 }
             }
         }

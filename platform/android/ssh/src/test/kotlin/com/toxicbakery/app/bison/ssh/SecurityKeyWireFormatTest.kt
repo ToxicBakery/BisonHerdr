@@ -195,6 +195,23 @@ class SecurityKeyWireFormatTest {
     }
 
     @Test
+    fun extensionDataAndAMissingTouchAreRefused() {
+        val signature = ByteArray(SecurityKeyWireFormat.ED25519_SIGNATURE_LENGTH)
+        val cases = mapOf(
+            // The ED flag and one byte of CBOR extension data: an empty map (0xa0).
+            "extension data" to authenticatorData("ssh:", flags = ED_AND_UP, counter = 1) + byteArrayOf(0xa0.toByte()),
+            "the ED flag with no data" to authenticatorData("ssh:", flags = ED_AND_UP, counter = 1),
+            "no user presence" to authenticatorData("ssh:", flags = 0x04, counter = 1),
+        )
+        for ((name, data) in cases) {
+            val error = assertFailsWith<HardwareKeyException>(name) {
+                SecurityKeyWireFormat.signatureBlob(HardwareKeyType.SkSshEd25519, "ssh:", data, signature)
+            }
+            assertEquals(HardwareKeyException.Reason.Failed, error.reason, name)
+        }
+    }
+
+    @Test
     fun coseKeysGiveTheRawPublicKeys() {
         val x = ByteArray(32) { 0x0a }
         val y = ByteArray(32) { 0x0b }
@@ -249,7 +266,7 @@ class SecurityKeyWireFormatTest {
     }
 
     private fun authenticatorData(application: String, flags: Byte, counter: Int): ByteArray =
-        ByteBuffer.allocate(SecurityKeyWireFormat.MIN_AUTHENTICATOR_DATA_LENGTH)
+        ByteBuffer.allocate(SecurityKeyWireFormat.AUTHENTICATOR_DATA_LENGTH)
             .put(SecurityKeyWireFormat.sha256(application.toByteArray()))
             .put(flags)
             .putInt(counter)
@@ -276,5 +293,6 @@ class SecurityKeyWireFormatTest {
 
     private companion object {
         const val SIGNATURE_COUNT = 32
+        const val ED_AND_UP: Byte = 0x81.toByte()
     }
 }

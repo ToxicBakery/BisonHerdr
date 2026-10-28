@@ -138,6 +138,64 @@ class YubiKeyFido2SignerTest {
     }
 
     @Test
+    fun aDisconnectStopsACallThatWaitsForItsTurn() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        key.touch = FakeSecurityKey.Touch.UntilCancel
+        val first = async { runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1)) } }
+        key.waitingForTouch.await()
+
+        // A login of a second machine waits for its turn. The user then disconnects the second machine.
+        val second = async { runCatching { signer.sign(OTHER_MACHINE_ID, enrolled, byteArrayOf(2)) } }
+        runCurrent()
+        stateManager.cancelUserAuth(OTHER_MACHINE_ID)
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, second.await())
+        // The first call still waits for its touch, and the second machine never got a prompt.
+        assertEquals(MACHINE_ID, stateManager.hardwareKeyTouchPrompt.value?.machineId)
+        assertFalse(first.isCompleted)
+
+        stateManager.cancelUserAuth(MACHINE_ID)
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, first.await())
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+        assertEquals(1, key.commands.count { it == CTAP_GET_ASSERTION }, "Only the first call got to the key")
+
+        // The lock is free again: a new call works.
+        key.touch = FakeSecurityKey.Touch.Immediate
+        signer.sign(OTHER_MACHINE_ID, enrolled, byteArrayOf(3))
+    }
+
+    @Test
+    fun theUsbKeyStaysWhenOnlyTheNfcHostStops() = runTest {
+        val usbHost = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            hub.hostDiscovery(discovery.apply { device = key.device(Transport.USB) })
+        }
+        val nfcDiscovery = object : SecurityKeyDiscovery {
+            override val transport: Transport = Transport.NFC
+
+            override fun start() = Unit
+
+            override fun stop() = Unit
+        }
+        // The activity pauses, for example for the USB permission dialog. The NFC host stops, the USB host stays.
+        val nfcHost = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { hub.hostDiscovery(nfcDiscovery) }
+
+        val found = hub.withDiscovery {
+            runCurrent()
+            nfcHost.cancel()
+            runCurrent()
+            assertTrue(hub.hasHost)
+            assertEquals(Transport.USB, hub.awaitDevice(HardwareKeyTransport.UsbAndNfc).transport)
+            "found"
+        }
+
+        assertEquals("found", found)
+        usbHost.cancel()
+        runCurrent()
+        assertFalse(hub.hasHost)
+    }
+
+    @Test
     fun noTouchGivesNotTouched() = runTest {
         hostWithUsbKey()
         val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
@@ -356,8 +414,10 @@ class YubiKeyFido2SignerTest {
         }
     }
 
-    /** A [SecurityKeyDiscovery] of [hub] that records its calls and gives [device] at each start. */
+    /** A USB [SecurityKeyDiscovery] of [hub] that records its calls and gives [device] at each start. */
     private class RecordingDiscovery(private val hub: SecurityKeyHub) : SecurityKeyDiscovery {
+        override val transport: Transport = Transport.USB
+
         val events = mutableListOf<String>()
 
         @Volatile
@@ -375,6 +435,7 @@ class YubiKeyFido2SignerTest {
 
     private companion object {
         const val MACHINE_ID = "yubikey-box"
+        const val OTHER_MACHINE_ID = "second-box"
         const val SIGNATURE_COUNT = 24
         const val CTAP_GET_ASSERTION = 0x02
         val KEY_WAIT_TIMEOUT = 5.seconds

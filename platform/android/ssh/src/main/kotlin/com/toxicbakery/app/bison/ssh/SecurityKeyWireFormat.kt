@@ -22,8 +22,17 @@ internal object SecurityKeyWireFormat {
     /** The COSE algorithm ES256 (ECDSA with P-256 and SHA-256). */
     const val COSE_ALG_ES256: Int = -7
 
-    /** The length of the authenticator data with no attested credential and no extensions. */
-    const val MIN_AUTHENTICATOR_DATA_LENGTH: Int = 37
+    /**
+     * The length of the authenticator data of an assertion with no extensions: the 32-byte RP ID hash, the flags,
+     * and the 4-byte counter.
+     */
+    const val AUTHENTICATOR_DATA_LENGTH: Int = 37
+
+    /** The user presence (UP) flag of the authenticator data. */
+    const val FLAG_USER_PRESENT: Int = 0x01
+
+    /** The extension data (ED) flag of the authenticator data. */
+    const val FLAG_EXTENSION_DATA: Int = 0x80
 
     /** The length of a raw Ed25519 signature. */
     const val ED25519_SIGNATURE_LENGTH: Int = 64
@@ -89,8 +98,13 @@ internal object SecurityKeyWireFormat {
 
     /**
      * Returns the OpenSSH signature blob for the assertion of a security key. [authenticatorData] gives the flags
-     * and the counter. Throws a [HardwareKeyException] when the authenticator data is too short, or when the key
-     * signed for a different application than [applicationId].
+     * and the counter. Throws a [HardwareKeyException] with [HardwareKeyException.Reason.Failed] in these cases:
+     *
+     * - The authenticator data does not have exactly [AUTHENTICATOR_DATA_LENGTH] bytes, or it has the extension data
+     *   flag. The signer asks for no extension, and an `sk-*` signature has no place for extension data. The server
+     *   would refuse such a signature with a general error.
+     * - The key signed for a different application than [applicationId].
+     * - The user presence flag is not set. The server would refuse the signature, because each `sk` key needs a touch.
      */
     fun signatureBlob(
         keyType: HardwareKeyType,
@@ -98,10 +112,10 @@ internal object SecurityKeyWireFormat {
         authenticatorData: ByteArray,
         signature: ByteArray,
     ): ByteArray {
-        if (authenticatorData.size < MIN_AUTHENTICATOR_DATA_LENGTH) {
+        if (authenticatorData.size != AUTHENTICATOR_DATA_LENGTH) {
             throw HardwareKeyException(
                 HardwareKeyException.Reason.Failed,
-                "The authenticator data has ${authenticatorData.size} bytes",
+                "The authenticator data has ${authenticatorData.size} bytes, not $AUTHENTICATOR_DATA_LENGTH",
             )
         }
         val buffer = ByteBuffer.wrap(authenticatorData)
@@ -113,6 +127,12 @@ internal object SecurityKeyWireFormat {
             )
         }
         val flags = buffer.get()
+        if (flags.toInt() and FLAG_EXTENSION_DATA != 0) {
+            throw HardwareKeyException(HardwareKeyException.Reason.Failed, "The key sent extension data")
+        }
+        if (flags.toInt() and FLAG_USER_PRESENT == 0) {
+            throw HardwareKeyException(HardwareKeyException.Reason.Failed, "The key did not confirm the touch")
+        }
         val counter = buffer.getInt()
         return buildOpenSshSkSignatureBlob(keyType, signature, flags, counter)
     }

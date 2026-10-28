@@ -3,7 +3,6 @@ package com.toxicbakery.app.bison.ssh
 import com.jcraft.jsch.Identity
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
-import com.jcraft.jsch.Signature
 import com.jcraft.jsch.SignatureEdDSA
 import com.jcraft.jsch.XDH
 import com.toxicbakery.app.bison.model.HardwareKeyType
@@ -57,24 +56,15 @@ internal object JschAndroidCrypto {
     /** The OpenSSH `sk` public key algorithms that [HardwareKeyJschIdentity] uses. */
     val SECURITY_KEY_ALGORITHMS: List<String> = HardwareKeyType.entries.filter { it.isFido2 }.map { it.opensshKeyType }
 
-    private val SECURITY_KEY_PLACEHOLDER_CLASS_NAME: String = SecurityKeySignaturePlaceholder::class.java.name
-
     /**
-     * Lets [session] log in with a [HardwareKeyJschIdentity]. JSch 2.28.x has no `sk` support:
+     * Lets [session] log in with a [HardwareKeyJschIdentity]. `UserAuthPublicKey` of JSch uses an identity only
+     * when its algorithm is in `PubkeyAcceptedAlgorithms`, so this function adds [SECURITY_KEY_ALGORITHMS] to the
+     * list of [session]. It changes only [session], not the global configuration of JSch.
      *
-     * - `UserAuthPublicKey` uses an identity only when its algorithm is in `PubkeyAcceptedAlgorithms`, so this
-     *   function adds [SECURITY_KEY_ALGORITHMS] to the list of the session.
-     * - `Session.checkSignatures` marks an algorithm with no `Signature` class as not available, so this function
-     *   registers [SecurityKeySignaturePlaceholder] for each `sk` name. The identity makes the signature, so JSch
-     *   never signs or verifies with the placeholder.
-     *
-     * Only a login with a security key calls this function. The other sessions keep the JSch defaults.
+     * JSch 2.28.x needs no `Signature` class for the `sk` names. `Session.checkSignatures` checks only the names in
+     * `CheckSignatures` (by default `ssh-ed25519,ssh-ed448`), and the identity makes the signature.
      */
     fun enableSecurityKeyAlgorithms(session: Session) {
-        for (name in SECURITY_KEY_ALGORITHMS) {
-            JSch.setConfig(name, SECURITY_KEY_PLACEHOLDER_CLASS_NAME)
-            session.setConfig(name, SECURITY_KEY_PLACEHOLDER_CLASS_NAME)
-        }
         val accepted = session.getConfig(PUBKEY_ACCEPTED_ALGORITHMS).orEmpty().split(',').filter { it.isNotBlank() }
         val added = SECURITY_KEY_ALGORITHMS.filter { it !in accepted }
         session.setConfig(PUBKEY_ACCEPTED_ALGORITHMS, (accepted + added).joinToString(","))
@@ -257,30 +247,8 @@ internal class AndroidKeystoreJschIdentity(
 }
 
 /**
- * A placeholder JSch [Signature] for the OpenSSH `sk` algorithms. [JschAndroidCrypto.enableSecurityKeyAlgorithms]
- * registers it, so that `Session.checkSignatures` marks the `sk` names as available. [HardwareKeyJschIdentity]
- * makes the signature of the login, and the client never verifies an `sk` signature. Thus only [init] works.
- */
-class SecurityKeySignaturePlaceholder : Signature {
-    override fun init() {
-        // Nothing to prepare. The check of JSch only makes an instance and calls this function.
-    }
-
-    override fun update(H: ByteArray): Unit = throw UnsupportedOperationException(NOT_USED)
-
-    override fun verify(sig: ByteArray): Boolean = throw UnsupportedOperationException(NOT_USED)
-
-    override fun sign(): ByteArray = throw UnsupportedOperationException(NOT_USED)
-
-    private companion object {
-        const val NOT_USED =
-            "The security key identity signs the login. JSch does not sign or verify with this class."
-    }
-}
-
-/**
- * Bridges a FIDO2 security key ([HardwareKeySigner]) into JSch's [Identity] interface for `publickey` authentication
- * with an OpenSSH `sk` key of [key].
+ * The JSch [Identity] of a FIDO2 security key: it gives the public key of [key] and the signatures of [signer] to
+ * JSch for `publickey` authentication with an OpenSSH `sk` key.
  *
  * [getPublicKeyBlob] gives the `sk` public key blob from the enrolled values of [key] ([SecurityKeyPublicKeys]).
  * [getSignature] blocks the JSch thread while [signer] waits for the key and for the touch of the user. JSch sends

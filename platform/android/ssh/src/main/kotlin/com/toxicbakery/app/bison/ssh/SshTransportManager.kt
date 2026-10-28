@@ -172,7 +172,13 @@ class SshTransportManager(
             )
 
             is SshRequest.TriggerNetworkRoam -> onNetworkAvailable(request.machineId)
-            is SshRequest.PromptHardwareKeyTouch -> sshStateManager.setHardwareKeyTouchPrompt(request)
+            // Only a HardwareKeySigner call puts a touch prompt, because only the call can stop when the user closes
+            // the prompt. A prompt from a request has no owner, so the manager ignores it.
+            is SshRequest.PromptHardwareKeyTouch -> sshDebugLog.record(
+                machineId = request.machineId,
+                tag = "FIDO2",
+                message = "Ignored a touch prompt request with no security key call",
+            )
         }
     }
 

@@ -18,25 +18,30 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * The [HardwareKeySigner] for a YubiKey or a different FIDO2 security key over USB-C and NFC, with
- * [yubikit-android](https://github.com/Yubico/yubikit-android) `Ctap2Session`.
+ * The [HardwareKeySigner] for a YubiKey over USB-C and NFC, with
+ * [yubikit-android](https://github.com/Yubico/yubikit-android) `Ctap2Session`. The USB discovery of the app accepts
+ * only YubiKeys. Other FIDO2 keys can work over NFC, but nobody tested them.
  *
  * - [enroll] runs `makeCredential` for the relying party `ssh:` (or the application of the machine). The credential
- *   is not discoverable, so the key does not need a PIN for it.
+ *   is not discoverable. The app sends no PIN. A key with a FIDO2 PIN can refuse the request with
+ *   `CTAP2_ERR_PIN_REQUIRED` ([HardwareKeyException.Reason.PinRequired]), for example a YubiKey 5 with firmware
+ *   before 5.7.
  * - [sign] runs `getAssertions(application, SHA256(data), allowList = [credentialId])`. The authenticator data gives
- *   the flags and the counter of the OpenSSH signature blob ([SecurityKeyWireFormat]).
+ *   the flags and the counter of the OpenSSH signature blob ([SecurityKeyWireFormat]). A login needs only the touch,
+ *   not the PIN.
  *
- * Each call runs one at a time. It needs an activity in the foreground ([SecurityKeyHub.hasHost]). It puts a
+ * Calls run one at a time. A call waits for its turn, and [SshStateManager.cancelUserAuth] for its machine (for
+ * example a disconnect) stops the wait. A call needs a visible activity ([SecurityKeyHub.hasHost]). It puts a
  * [SshRequest.PromptHardwareKeyTouch] in [SshStateManager], waits for a key from [SecurityKeyHub] for [keyWaitTimeout]
  * at most, and then waits for the touch. The key has its own time limit for the touch. When the user closes the
  * touch sheet, the call cancels the request on the key and stops with [HardwareKeyException.Reason.Cancelled].
@@ -152,7 +157,50 @@ class YubiKeyFido2Signer(
         transport: HardwareKeyTransport,
         message: String,
         operation: (Ctap2Session, CommandState) -> T,
-    ): T = operationLock.withLock {
+    ): T {
+        val owner = Any()
+        try {
+            lockOrCancel(machineId, owner)
+        } catch (error: HardwareKeyException) {
+            throw recorded(machineId, error)
+        }
+        try {
+            return runWithLock(machineId, keyType, transport, message, operation)
+        } finally {
+            operationLock.unlock(owner)
+        }
+    }
+
+    /**
+     * Waits for the turn of a call for [machineId], and takes [operationLock] for [owner]. A cancel of [machineId] in
+     * [SshStateManager.hardwareKeyCancels] during the wait stops the call with [HardwareKeyException.Reason.Cancelled].
+     * Thus a call for a machine that the user disconnected does not show a prompt later.
+     */
+    private suspend fun lockOrCancel(machineId: String, owner: Any) {
+        try {
+            coroutineScope {
+                // The collector starts at once, so that it gets each cancel during the wait.
+                val cancelWatch = launch(start = CoroutineStart.UNDISPATCHED) {
+                    sshStateManager.hardwareKeyCancels.first { it == null || it == machineId }
+                    throw HardwareKeyException(HardwareKeyException.Reason.Cancelled)
+                }
+                operationLock.lock(owner)
+                cancelWatch.cancel()
+            }
+        } catch (error: Throwable) {
+            if (operationLock.holdsLock(owner)) operationLock.unlock(owner)
+            throw error
+        }
+    }
+
+    /** The part of [runWithKey] that runs while the call has [operationLock]. */
+    private suspend fun <T> runWithLock(
+        machineId: String,
+        keyType: HardwareKeyType,
+        transport: HardwareKeyTransport,
+        message: String,
+        operation: (Ctap2Session, CommandState) -> T,
+    ): T {
         if (!hub.hasHost) throw recorded(machineId, HardwareKeyException(HardwareKeyException.Reason.NoUi))
         val prompt = SshRequest.PromptHardwareKeyTouch(
             machineId = machineId,
@@ -161,7 +209,7 @@ class YubiKeyFido2Signer(
         )
         val commandState = CommandState()
         sshStateManager.setHardwareKeyTouchPrompt(prompt)
-        try {
+        return try {
             hub.withDiscovery {
                 coroutineScope {
                     // The user closed the touch sheet, or a disconnect removed the prompt.
