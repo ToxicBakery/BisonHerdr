@@ -15,6 +15,10 @@ check.
 Over USB, the app accepts only YubiKeys (the Yubico vendor ID). Over NFC, other FIDO2
 keys can work, but nobody tested them.
 
+A login waits up to 60 seconds for a key, and then up to 40 seconds for the touch: 100
+seconds in total. This is less than 120 seconds, the default `LoginGraceTime` of an
+OpenSSH server, so the server does not close the connection during the wait.
+
 ## Equipment
 
 - An Android tablet or phone with Android 12 (API 31) or later, NFC, and a USB-C port
@@ -68,7 +72,7 @@ keys can work, but nobody tested them.
 | A5 | Allow the USB permission. | The touch sheet shows "Touch the security key, or hold it against the device, to enroll it for this machine." The key flashes. |
 | A6 | Touch the key. | The touch sheet closes. The screen shows an `sk-ssh-ed25519@openssh.com AAAA... bison-tablet-security-key` line and "Copy public key". |
 | A7 | Tap "Copy public key". Add the line to `~/.ssh/authorized_keys` of the user on the server. | The button shows "Copied". |
-| A8 | Tap "Save & Connect". | The connecting screen opens. The touch sheet shows "Touch the security key, or hold it against the device, to log in to this machine." |
+| A8 | Tap "Save & Connect". | The connecting screen opens. The touch sheet shows "Machine: " with the name of the machine, and "Touch the security key, or hold it against the device, to log in to this machine." |
 | A9 | Touch the key. | The touch sheet closes. The terminal of the host opens. |
 | A10 | On the server, read the log of `sshd`, for example with `journalctl -u ssh`. | The log has `Accepted publickey for <user> ... ED25519-SK`. |
 | A11 | Go back to the machine list. Disconnect, and then connect again from the card. | The touch sheet shows again. One touch connects the host. |
@@ -101,7 +105,7 @@ Use the machine of card A for each step.
 | Step | Action | Expected result |
 | --- | --- | --- |
 | D1 | Tap "Connect Host". When the touch sheet shows, tap "Cancel". | The touch sheet closes at once. The error on the connecting screen contains "The security key request was cancelled." The app does not stop. |
-| D2 | Tap "Connect Host". Do not touch the key for 40 seconds. | The error on the connecting screen contains "The user did not touch the security key before the time limit." |
+| D2 | Tap "Connect Host". Do not touch the key, and wait up to 40 seconds. | The error on the connecting screen contains "The user did not touch the security key before the time limit." |
 | D3 | Remove the key. Tap "Connect Host" and wait 60 seconds. | The error on the connecting screen contains "No security key came before the time limit". |
 | D4 | Connect the second YubiKey. Tap "Connect Host" and touch the second key. | The error on the connecting screen contains "This security key does not have the credential of this machine". |
 | D5 | Remove the line of the key from `authorized_keys`. Tap "Connect Host". | The touch sheet does not show, because the server refuses the key before the app asks for a signature. The login fails, or the server asks for a password. If the server asks for a password, tap "Cancel". |
@@ -110,7 +114,7 @@ Use the machine of card A for each step.
 | D8 | In the editor, select the other key type. | The public key line goes away. "Save & Connect" is not available until you enroll the key again. Select the first key type again, or enroll again. |
 | D9 | Remove the YubiKey from the USB-C port, and connect it again. Android then forgets the USB permission. Tap "Connect Host". When Android asks for the USB permission, deny it. | The permission dialog closes and does not show again during this request. The touch sheet stays. Tap "Cancel" on the touch sheet. The error contains "The security key request was cancelled." |
 | D10 | Tap "Connect Host" again. Allow the USB permission and touch the key. | The terminal opens. |
-| D11 | In the editor, turn on the ProxyJump bastion with the second SSH server. Tap "Save & Connect". | The touch sheet shows two times: first for the bastion, then for the host. Touch the key each time. The terminal opens. |
+| D11 | In the editor, turn on the ProxyJump bastion with the second SSH server. Tap "Save & Connect". | The touch sheet shows two times. The first sheet says "This touch logs in to the ProxyJump bastion <host:port> of this machine." The second sheet does not have that line. Touch the key each time. The terminal opens. |
 | D12 | Remove the key from the USB-C port. Select "NFC" in the editor, and tap "Save & Connect". | The touch sheet shows two times. Hold the key against the NFC area each time, until the sheet closes. The terminal opens. |
 | D13 | Select "USB-C and NFC", and turn off the ProxyJump bastion. Disconnect. Tap "Connect Host", and then tap "Cancel" on the connecting screen at once, before the touch sheet shows. | The connect stops. The touch sheet does not show later for this machine, and the key does not flash. If the touch sheet shows before you can tap "Cancel", the network is too fast for this step. Tap "Cancel" on the sheet, and do the step again with a host that is farther away. |
 
