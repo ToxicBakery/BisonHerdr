@@ -8,6 +8,7 @@ import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.InMemorySecretStore
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
@@ -86,6 +87,7 @@ class ConfigureMachineAuthTypeTest {
                 machineId = hardwareKeyMachine.id,
                 machineStore = machineStore,
                 machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, requestManager, EndpointSnapshotBus()),
+                secretStore = InMemorySecretStore(),
             )
 
             viewModel.onEvent(ConfigureMachineViewModel.Event.SaveAndConnect)
@@ -115,6 +117,7 @@ class ConfigureMachineAuthTypeTest {
                 machineId = hardwareKeyMachine.id,
                 machineStore = machineStore,
                 machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, SshRequestManager(), EndpointSnapshotBus()),
+                secretStore = InMemorySecretStore(),
             )
 
             viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateName("GPU Rig 2"))
@@ -146,6 +149,7 @@ class ConfigureMachineAuthTypeTest {
                 machineId = machine.id,
                 machineStore = machineStore,
                 machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, SshRequestManager(), EndpointSnapshotBus()),
+                secretStore = InMemorySecretStore(),
             )
             assertEquals(customKey, viewModel.state.value.hardwareKey)
 

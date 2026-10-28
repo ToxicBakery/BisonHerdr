@@ -49,13 +49,22 @@ class StoreIOProviderJvm(
     override fun moveCorruptAside(fileName: String) {
         val source = resolve(fileName)
         if (!source.exists()) return
-        val backup = resolve("$fileName.corrupt.${System.currentTimeMillis()}")
+        val backup = resolve("$fileName${StoreIOProvider.CORRUPT_COPY_INFIX}${System.currentTimeMillis()}")
         moveFile(source, backup)
     }
 
     override fun delete(fileName: String) {
         runCatching { Files.deleteIfExists(resolve(fileName).toPath()) }
             .onFailure { error -> log.w(error) { "Failed to delete $fileName" } }
+    }
+
+    override fun deleteCorruptCopies(fileName: String) {
+        val target = resolve(fileName)
+        val prefix = "${target.name}${StoreIOProvider.CORRUPT_COPY_INFIX}"
+        target.parentFile?.listFiles { file -> file.name.startsWith(prefix) }?.forEach { file ->
+            runCatching { Files.deleteIfExists(file.toPath()) }
+                .onFailure { error -> log.w(error) { "Failed to delete ${file.name}" } }
+        }
     }
 
     override fun move(from: String, to: String) {

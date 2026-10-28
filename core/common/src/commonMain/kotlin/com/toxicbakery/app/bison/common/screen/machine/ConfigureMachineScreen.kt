@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -32,6 +33,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedSecureTextField
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -48,6 +50,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.toxicbakery.app.bison.common.navigation.NavigationController
 import com.toxicbakery.app.bison.common.platform.plainTextClipEntry
+import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel.StoredPassword
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
@@ -390,14 +394,39 @@ fun ConfigureMachineScreen(
                         }
 
                         ConfigureMachineViewModel.AuthType.Password -> {
-                            OutlinedTextField(
-                                value = state.passwordRef,
-                                onValueChange = {
-                                    viewModel.onEvent(ConfigureMachineViewModel.Event.UpdatePasswordRef(it))
+                            // The field never shows the stored password. An empty field keeps it. The field state
+                            // uses remember and not rememberSaveable, so the saved instance state has no password.
+                            val passwordField = remember { TextFieldState(state.passwordRef) }
+                            LaunchedEffect(passwordField) {
+                                snapshotFlow { passwordField.text.toString() }.collect { password ->
+                                    viewModel.onEvent(ConfigureMachineViewModel.Event.UpdatePasswordRef(password))
+                                }
+                            }
+                            OutlinedSecureTextField(
+                                state = passwordField,
+                                label = { Text("Password") },
+                                placeholder = if (state.storedPassword == StoredPassword.Stored) {
+                                    { Text("Stored password") }
+                                } else {
+                                    null
                                 },
-                                label = { Text("Credential Vault Reference / Password") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
+                                supportingText = when (state.storedPassword) {
+                                    StoredPassword.None -> null
+                                    StoredPassword.Stored -> {
+                                        { Text(ConfigureMachineViewModel.STORED_PASSWORD_HINT) }
+                                    }
+                                    StoredPassword.Missing -> {
+                                        {
+                                            Text(
+                                                text = ConfigureMachineViewModel.MISSING_PASSWORD_HINT,
+                                                color = MaterialTheme.colorScheme.error,
+                                            )
+                                        }
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("passwordField"),
                             )
                         }
                     }

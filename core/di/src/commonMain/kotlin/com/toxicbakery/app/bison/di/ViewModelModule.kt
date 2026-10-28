@@ -35,6 +35,7 @@ val viewModelModule = DI.Module("viewModelModule") {
             machineId = machineId,
             machineStore = instance(),
             machineViewModelDelegate = instance(),
+            secretStore = instance(),
             // The platform layer binds the real key support. Other hosts use all key types.
             keystoreKeySupport = instanceOrNull<KeystoreKeySupport>() ?: KeystoreKeySupport.AllAlgorithms,
             sshPublicKeyProvider = instanceOrNull<SshPublicKeyProvider>(),

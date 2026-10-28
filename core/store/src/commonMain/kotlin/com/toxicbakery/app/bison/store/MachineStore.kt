@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.store
 
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.logging.Arbor
+import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -24,20 +25,32 @@ import kotlinx.serialization.json.Json
  * - Guards disk persistence behind [initialLoad] ([awaitLoaded]) and a coroutine [Mutex].
  * - Writes atomically via [StoreIOProvider.writeAtomic] and quarantines corrupt JSON files via
  *   [StoreIOProvider.moveCorruptAside] so user data is never silently clobbered.
+ * - Gives the loaded machines to [loadMigration] before it publishes them. When the migration changes a machine,
+ *   the store writes `machines.json` again. The app uses it to move plain-text passwords into the secret store.
+ * - Keeps a device marker ([DEVICE_MARKER_FILE_NAME]) in [noBackupStoreIOProvider]. A backup does not copy the
+ *   marker. When the marker is absent at load, the store does the first-start steps: it removes the corrupt copies
+ *   of `machines.json`, because a copy from an earlier version can hold a plain-text password. When
+ *   `machines.json` also exists, it sets [restoredFromBackup].
  */
 class MachineStore(
     private val storeIOProvider: StoreIOProvider,
     private val json: Json = appJson,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + storeIoDispatcher),
+    private val noBackupStoreIOProvider: StoreIOProvider? = null,
+    private val loadMigration: (suspend (List<HostMachine>) -> List<HostMachine>)? = null,
 ) {
     constructor(
         storeIOProvider: StoreIOProvider,
         json: Json = appJson,
         dispatcher: CoroutineDispatcher,
+        noBackupStoreIOProvider: StoreIOProvider? = null,
+        loadMigration: (suspend (List<HostMachine>) -> List<HostMachine>)? = null,
     ) : this(
         storeIOProvider = storeIOProvider,
         json = json,
         scope = CoroutineScope(SupervisorJob() + dispatcher),
+        noBackupStoreIOProvider = noBackupStoreIOProvider,
+        loadMigration = loadMigration,
     )
 
     private val mutex = Mutex()
@@ -49,6 +62,15 @@ class MachineStore(
 
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
+
+    private val _restoredFromBackup = MutableStateFlow(false)
+
+    /**
+     * True when this load found `machines.json` but no device marker. This occurs after a restore from a backup
+     * or a transfer from a different device, and also on the first start after an update from an earlier version.
+     * A backup does not copy passwords or device keys, so some machines can need a password or a key again.
+     */
+    val restoredFromBackup: StateFlow<Boolean> = _restoredFromBackup.asStateFlow()
 
     init {
         scope.launch {
@@ -166,12 +188,17 @@ class MachineStore(
                         null
                     }
                     if (loaded != null) {
+                        val migrated = migrate(loaded)
                         _knownMachines.update { current ->
                             val currentIds = current.mapTo(mutableSetOf()) { it.id }
-                            current + loaded.filter { it.id !in currentIds }
+                            current + migrated.filter { it.id !in currentIds }
+                        }
+                        if (migrated != loaded) {
+                            writeMigratedMachinesLocked()
                         }
                     }
                 }
+                runFirstStartSteps(machinesFileExists = rawText != null)
             }
         } finally {
             _isLoaded.value = true
@@ -182,14 +209,62 @@ class MachineStore(
     private suspend fun persistMachines() {
         withContext(scope.coroutineContext) {
             mutex.withLock {
-                if (writesBlocked) {
-                    log.e { "Skipping $MACHINES_FILE_NAME write because corrupt file could not be moved aside." }
-                    return@withLock
-                }
-                val snapshot = _knownMachines.value
-                val encoded = json.encodeToString(snapshot)
-                storeIOProvider.writeAtomic(MACHINES_FILE_NAME, encoded)
+                writeMachinesLocked()
             }
+        }
+    }
+
+    /** Writes the current machines to `machines.json`. Call it while [mutex] is held. */
+    private fun writeMachinesLocked() {
+        if (writesBlocked) {
+            log.e { "Skipping $MACHINES_FILE_NAME write because corrupt file could not be moved aside." }
+            return
+        }
+        val snapshot = _knownMachines.value
+        val encoded = json.encodeToString(snapshot)
+        storeIOProvider.writeAtomic(MACHINES_FILE_NAME, encoded)
+    }
+
+    /** Writes the machines that [loadMigration] changed. A failed write does not stop the load. */
+    private fun writeMigratedMachinesLocked() {
+        try {
+            writeMachinesLocked()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.e(e) { "Could not write the migrated $MACHINES_FILE_NAME. The next load tries again." }
+        }
+    }
+
+    /** Returns [loaded] after [loadMigration]. When the migration fails, it returns [loaded] with no change. */
+    private suspend fun migrate(loaded: List<HostMachine>): List<HostMachine> {
+        val migration = loadMigration ?: return loaded
+        return try {
+            migration(loaded)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.e(e) { "The load migration of $MACHINES_FILE_NAME failed. The next load tries again." }
+            loaded
+        }
+    }
+
+    /**
+     * Does the first-start steps when [noBackupStoreIOProvider] has no device marker, and then writes the marker.
+     * Call it while [mutex] is held.
+     */
+    private fun runFirstStartSteps(machinesFileExists: Boolean) {
+        val markerStore = noBackupStoreIOProvider ?: return
+        if (markerStore.exists(DEVICE_MARKER_FILE_NAME)) return
+        // An earlier version can have put a plain-text password into a corrupt copy.
+        storeIOProvider.deleteCorruptCopies(MACHINES_FILE_NAME)
+        _restoredFromBackup.value = machinesFileExists
+        try {
+            markerStore.writeAtomic(DEVICE_MARKER_FILE_NAME, newDeviceId())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.e(e) { "Could not write $DEVICE_MARKER_FILE_NAME. The next load does the first-start steps again." }
         }
     }
 
@@ -206,9 +281,19 @@ class MachineStore(
 
     companion object {
         const val MACHINES_FILE_NAME: String = "machines.json"
+
+        /** The device marker. It is in a directory that backups do not copy. See [restoredFromBackup]. */
+        const val DEVICE_MARKER_FILE_NAME: String = "device.id"
+        private const val DEVICE_ID_BYTES = 16
         const val MIN_FONT_SIZE_SP: Float = 8f
         const val MAX_FONT_SIZE_SP: Float = 32f
 
         private val log = Arbor.tag("MachineStore")
+
+        /** Returns a new random identifier for the device marker. */
+        private fun newDeviceId(): String =
+            Random.nextBytes(DEVICE_ID_BYTES).joinToString("") { byte ->
+                (byte.toInt() and 0xff).toString(16).padStart(2, '0')
+            }
     }
 }

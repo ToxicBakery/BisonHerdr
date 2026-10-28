@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.ClientShellAgent
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.InMemorySecretStore
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
@@ -94,6 +95,7 @@ class ViewModelsAndDelegatesTest {
                 machineId = "",
                 machineStore = machineStore,
                 machineViewModelDelegate = delegate,
+                secretStore = InMemorySecretStore(),
             )
 
             viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateName("Studio Devbox"))

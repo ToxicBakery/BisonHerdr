@@ -29,6 +29,12 @@ interface StoreIOProvider {
      */
     fun moveCorruptAside(fileName: String)
 
+    /**
+     * Removes each copy that [moveCorruptAside] made for [fileName] (`$fileName.corrupt.<timestamp>`).
+     * Best-effort and never throws.
+     */
+    fun deleteCorruptCopies(fileName: String)
+
     /** Returns `true` if [fileName] exists in the store. */
     fun exists(fileName: String): Boolean = readText(fileName) != null
 
@@ -61,6 +67,11 @@ interface StoreIOProvider {
     }
 
     fun pathFor(storeName: String): String = storeName
+
+    companion object {
+        /** The text between the file name and the timestamp in the name of a corrupt copy. */
+        const val CORRUPT_COPY_INFIX: String = ".corrupt."
+    }
 }
 
 /**
@@ -90,12 +101,16 @@ class InMemoryStoreIOProvider(
     override fun moveCorruptAside(fileName: String) {
         val current = entries.remove(fileName) ?: return
         val timestamp = Clock.System.now().toEpochMilliseconds()
-        val corruptName = "$fileName.corrupt.$timestamp"
+        val corruptName = "$fileName${StoreIOProvider.CORRUPT_COPY_INFIX}$timestamp"
         entries[corruptName] = current
     }
 
     override fun delete(fileName: String) {
         entries.remove(fileName)
+    }
+
+    override fun deleteCorruptCopies(fileName: String) {
+        entries.keys.removeAll { name -> name.startsWith("$fileName${StoreIOProvider.CORRUPT_COPY_INFIX}") }
     }
 
     override fun move(from: String, to: String) {
@@ -106,3 +121,17 @@ class InMemoryStoreIOProvider(
 }
 
 typealias FakeStoreIOProvider = InMemoryStoreIOProvider
+
+/**
+ * The Kodein tags of the [StoreIOProvider] bindings that are not the default binding.
+ */
+object StoreIOProviderTags {
+    /**
+     * A directory that backups do not copy, for example `Context.getNoBackupFilesDir` on Android.
+     * The [MachineStore] keeps its device marker there.
+     */
+    const val NO_BACKUP: String = "storeIOProvider.noBackup"
+
+    /** The directory of the encrypted secrets. Backups do not copy it. */
+    const val SECRETS: String = "storeIOProvider.secrets"
+}

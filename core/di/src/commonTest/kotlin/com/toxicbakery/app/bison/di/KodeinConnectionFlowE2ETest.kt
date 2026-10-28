@@ -17,7 +17,9 @@ import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.InMemorySecretStore
 import com.toxicbakery.app.bison.ssh.PaneSurfaceBus
+import com.toxicbakery.app.bison.ssh.SecretStore
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshDebugLog
 import com.toxicbakery.app.bison.ssh.SshRequest
@@ -66,6 +68,8 @@ class KodeinConnectionFlowE2ETest {
                 import(coreDiModule)
                 bindSingleton<DebugServer> { NoDebugServer }
                 bindSingleton<StoreIOProvider>(overrides = true) { InMemoryStoreIOProvider() }
+                // The platform layer binds the device secret store.
+                bindSingleton<SecretStore> { InMemorySecretStore() }
             }
 
             val direct = di.direct
@@ -110,6 +114,7 @@ class KodeinConnectionFlowE2ETest {
                 import(coreDiModule)
                 import(fakeServerModule)
                 bindProvider<StoreIOProvider>(overrides = true) { inMemoryIo }
+                bindSingleton<SecretStore> { InMemorySecretStore() }
                 bindSingleton(overrides = true) {
                     MachineStore(
                         storeIOProvider = instance(),
