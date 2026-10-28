@@ -7,6 +7,7 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.ssh.HostKeyPrompt
+import com.toxicbakery.app.bison.ssh.NeedsUserCause
 import com.toxicbakery.app.bison.ssh.SshDebugLog
 import com.toxicbakery.app.bison.ssh.SshLogEntry
 import com.toxicbakery.app.bison.ssh.SshStateManager
@@ -32,6 +33,7 @@ class ConnectingMachineViewModel(
     initialState = State(
         machineId = machineId,
         hostKeyPrompt = sshStateManager.hostKeyPrompts.value[machineId],
+        needsUser = sshStateManager.needsUser.value[machineId],
     ),
 ), MachineViewModelDelegate by machineViewModelDelegate {
 
@@ -56,6 +58,8 @@ class ConnectingMachineViewModel(
         val hasDispatchedConnect: Boolean = false,
         /** The host key decision that the connection waits for, or null. */
         val hostKeyPrompt: HostKeyPrompt? = null,
+        /** The cause that stopped the connection until the user does an action, or null. */
+        val needsUser: NeedsUserCause? = null,
     )
 
     sealed interface Event {
@@ -127,6 +131,12 @@ class ConnectingMachineViewModel(
                 .collect { prompt -> updateState { it.copy(hostKeyPrompt = prompt) } }
         }
         viewModelScope.launch {
+            sshStateManager.needsUser
+                .map { causes -> causes[machineId] }
+                .distinctUntilChanged()
+                .collect { cause -> updateState { it.copy(needsUser = cause) } }
+        }
+        viewModelScope.launch {
             progress.collect { currentProgress ->
                 if (currentProgress == ConnectionProgress.Connected) {
                     sendAction(Action.Connected(machineId))
@@ -143,6 +153,11 @@ class ConnectingMachineViewModel(
                     return
                 }
                 if (consumePendingConnect(machineId)) {
+                    updateState { it.copy(hasDispatchedConnect = true) }
+                    return
+                }
+                // The connection stopped for the user. The screen shows the cause, and the user decides.
+                if (machineId in sshStateManager.needsUser.value || machineId in sshStateManager.hostKeyPrompts.value) {
                     updateState { it.copy(hasDispatchedConnect = true) }
                     return
                 }

@@ -89,6 +89,7 @@ import com.toxicbakery.app.bison.resources.settings_app_check_updates_summary
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialState
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.NeedsUserCause
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
@@ -111,6 +112,9 @@ const val ABOUT_OPEN_RELEASE_TAG: String = "about-open-release"
 
 /** Test tag of the switch that toggles automatic daily update checks. */
 const val CHECK_FOR_UPDATES_TAG: String = "app-check-updates"
+
+/** Test tag of the text on a machine card that tells why the last connection stopped. */
+const val MACHINE_NEEDS_USER_TAG: String = "machine-needs-user"
 
 /** The badge of a machine that needs a password or a key before a login can work. */
 const val NEEDS_SIGN_IN_LABEL: String = "Needs sign-in"
@@ -164,6 +168,7 @@ fun MachineFederationScreen(
         value = credentialStatesOf(machines, credentialChecker)
     }
     val connectedMachines by sshStateManager.connectedMachines.collectAsState()
+    val needsUser by sshStateManager.needsUser.collectAsState()
     val backbones by sshStateManager.activeTransportBackbone.collectAsState()
     val snapshots by endpointSnapshotBus.snapshots.collectAsState()
     val appSettings by appSettingsStore.settings.collectAsState()
@@ -290,12 +295,18 @@ fun MachineFederationScreen(
                         backbone = backbone,
                         snapshot = snapshot,
                         credentialState = credentialState,
+                        needsUserCause = needsUser[machine.id],
                         onPrimaryAction = {
                             when {
                                 isConnected -> onOpenWorkspaceTerminal(machine.id)
                                 // The editor takes the password again, or makes the key.
                                 credentialState.needsSignIn -> onConfigureMachine(machine.id)
-                                machine.authMethod.isSupported -> onConnectMachine(machine.id)
+                                machine.authMethod.isSupported -> {
+                                    // A tap is a new connect from the user, so the connecting screen connects at
+                                    // once. An open host key decision stays, and that screen shows it first.
+                                    sshStateManager.clearNeedsUser(machine.id)
+                                    onConnectMachine(machine.id)
+                                }
                                 // This version cannot connect with the method. The editor tells why (issue #23).
                                 else -> onConfigureMachine(machine.id)
                             }
@@ -367,6 +378,7 @@ private fun HostMachineCard(
     backbone: ActiveBackbone?,
     snapshot: ClientShellSnapshot?,
     credentialState: CredentialState,
+    needsUserCause: NeedsUserCause?,
     onPrimaryAction: () -> Unit,
     onEdit: () -> Unit,
 ) {
@@ -488,6 +500,14 @@ private fun HostMachineCard(
                     text = credentialState.message,
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.accentWarning,
+                )
+            } else if (!isConnected && needsUserCause != null) {
+                // The last connection stopped, and the user must do an action before a new connect can work.
+                Text(
+                    text = needsUserText(needsUserCause),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.accentWarning,
+                    modifier = Modifier.testTag(MACHINE_NEEDS_USER_TAG),
                 )
             }
 

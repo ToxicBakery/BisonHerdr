@@ -45,6 +45,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -53,6 +54,9 @@ import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import org.kodein.di.compose.viewmodel.rememberViewModel
+
+/** Test tag of the text that tells why the connection stopped. */
+const val NEEDS_USER_TEXT_TAG: String = "needs-user-text"
 
 @Composable
 fun ConnectingMachineScreen(
@@ -203,6 +207,17 @@ fun ConnectingMachineScreen(
 
                         steps.forEach { step ->
                             BootstrapStepRow(step = step)
+                        }
+
+                        // The cause of a stopped connection, and what the user can do.
+                        val needsUser = state.needsUser
+                        if (needsUser != null && progress == ConnectionProgress.Failed) {
+                            Text(
+                                text = needsUserText(needsUser),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = palette.accentWarning,
+                                modifier = Modifier.testTag(NEEDS_USER_TEXT_TAG),
+                            )
                         }
 
                         Row(
