@@ -112,7 +112,7 @@ class MainActivity : FragmentActivity(), DIAware {
         // does not ask, and the machine waits for the user.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                localNetworkAccess.hostRequests { request -> askForLocalNetwork(request.hostPort) }
+                localNetworkAccess.hostRequests { request -> askForLocalNetwork(request.hostPort, request.timedOut) }
             }
         }
     }
@@ -193,11 +193,11 @@ class MainActivity : FragmentActivity(), DIAware {
     }
 
     /**
-     * Asks for the local network permission for a connection to [hostPort]. After a grant, the requester connects
-     * again the machines that stopped for the permission.
+     * Asks for the local network permission for a connection to [hostPort]. [timedOut] is the reason of the request.
+     * After a grant, the requester connects again the machines that stopped for the permission.
      */
-    private suspend fun askForLocalNetwork(hostPort: String): LocalNetworkOutcome {
-        val outcome = localNetworkRequester.flow.ask(hostPort)
+    private suspend fun askForLocalNetwork(hostPort: String, timedOut: Boolean): LocalNetworkOutcome {
+        val outcome = localNetworkRequester.flow.ask(hostPort, timedOut)
         log.d { "ACCESS_LOCAL_NETWORK for $hostPort: $outcome" }
         return outcome
     }

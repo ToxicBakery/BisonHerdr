@@ -189,8 +189,10 @@
     <string name="notification_permission_rationale_dismiss">Not now</string>
     <string name="local_network_permission_title">Local network permission</string>
     <string name="local_network_permission_rationale_body">BisonHerdr connects to %1$s on your local network. Android permits this connection only when the app has the Nearby devices permission. Allow the permission in the next dialog.</string>
+    <string name="local_network_permission_rationale_body_timed_out">BisonHerdr did not get a connection to %1$s. This host has a private address, and Android can stop such a connection when the app does not have the Nearby devices permission. Allow the permission in the next dialog.</string>
     <string name="local_network_permission_rationale_continue">Continue</string>
     <string name="local_network_permission_settings_body">BisonHerdr does not have the Nearby devices permission, so it cannot connect to %1$s on your local network. You can allow Nearby devices in the app settings.</string>
+    <string name="local_network_permission_settings_body_timed_out">BisonHerdr did not get a connection to %1$s. This host has a private address, and Android can stop such a connection when the app does not have the Nearby devices permission. You can allow Nearby devices in the app settings.</string>
     <string name="local_network_permission_settings_open">Open settings</string>
     <string name="local_network_permission_dismiss">Not now</string>
     <string name="agent_alert_channel_name">Coding Agent Alerts</string>
