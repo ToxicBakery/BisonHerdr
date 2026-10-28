@@ -141,6 +141,7 @@ class SshTransportManager(
         surfaceLeaseActive[machineId] = true
 
         // Phase 1: AuthenticatingSsh (optionally via ProxyJump / Tailscale)
+        sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.AuthenticatingSsh)
         val proxy = machine.proxyJump
         if (machine.hostname.isBlank() || !machine.isValidPort ||
@@ -164,6 +165,10 @@ class SshTransportManager(
                 message = "Login to ${machine.displayAddress} failed: ${describe(authResult)}",
                 isError = true,
             )
+            if (authResult is SshAuthResult.HostKeyRejected) {
+                // The UI asks the user. The connection does not wait: the user connects again after a decision.
+                sshStateManager.setHostKeyPrompt(hostKeyPromptFor(machineId, authResult))
+            }
             sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
             return false
         }
@@ -194,6 +199,7 @@ class SshTransportManager(
         surfaceDeltaAssembler.clear(machineId)
         surfaceLeaseActive.remove(machineId)
         activeMachines.remove(machineId)
+        sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.markMachineDisconnected(machineId)
         sshDebugLog.record(
             machineId = machineId,
@@ -460,6 +466,22 @@ class SshTransportManager(
             is SshAuthResult.AuthFailed -> "AuthFailed (${result.message})"
             is SshAuthResult.NetworkError -> "NetworkError (${result.cause.message ?: result.cause::class.simpleName})"
             is SshAuthResult.Failed -> "Failed (${result.cause.message ?: result.cause::class.simpleName})"
+            is SshAuthResult.HostKeyUnknown ->
+                "HostKeyUnknown (${result.presented.hostPort} ${result.presented.keyType} ${result.presented.fingerprint})"
+
+            is SshAuthResult.HostKeyChanged ->
+                "HostKeyChanged (${result.presented.hostPort} saved ${result.known.fingerprint}, " +
+                    "sent ${result.presented.fingerprint})"
+        }
+
+    private fun hostKeyPromptFor(machineId: String, result: SshAuthResult.HostKeyRejected): HostKeyPrompt =
+        when (result) {
+            is SshAuthResult.HostKeyUnknown -> HostKeyPrompt.Unknown(machineId = machineId, presented = result.presented)
+            is SshAuthResult.HostKeyChanged -> HostKeyPrompt.Changed(
+                machineId = machineId,
+                known = result.known,
+                presented = result.presented,
+            )
         }
 
     private suspend fun flushOfflinePrompts(machineId: String) {

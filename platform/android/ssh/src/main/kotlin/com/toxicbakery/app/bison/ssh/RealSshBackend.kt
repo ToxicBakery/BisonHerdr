@@ -7,12 +7,16 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 
 /**
  * The [SshBackend] that connects to a real Herdr host over JSch through [RealHerdrSshClient].
  *
  * Release builds use only this backend. Debug builds use it for all machines that the fake server did not make.
+ *
+ * Each session checks the host key against the [KnownHostsStore] before it sends credentials. [authenticate]
+ * returns [SshAuthResult.HostKeyUnknown] or [SshAuthResult.HostKeyChanged] when the check stops the session.
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -26,12 +30,14 @@ class RealSshBackend internal constructor(
         paneSurfaceBus: PaneSurfaceBus,
         semanticNotificationBus: SemanticNotificationBus,
         keystoreKeyManager: AndroidKeystoreKeyManager,
+        knownHostsStore: KnownHostsStore,
     ) : this(
         client = RealHerdrSshClient(
             sshDebugLog = sshDebugLog,
             endpointSnapshotBus = endpointSnapshotBus,
             paneSurfaceBus = paneSurfaceBus,
             semanticNotificationBus = semanticNotificationBus,
+            knownHostsStore = knownHostsStore,
             keystoreKeyManagerProvider = { keystoreKeyManager },
         ),
         sshStateManager = sshStateManager,
@@ -105,13 +111,16 @@ class RealSshBackend internal constructor(
         private const val MAX_CAUSE_DEPTH = 16
 
         /**
-         * Maps a login [error] from JSch to its [SshAuthResult] kind. A refused login is
-         * [SshAuthResult.AuthFailed]. An [IOException] at any level of the cause chain is
-         * [SshAuthResult.NetworkError]. All other errors are [SshAuthResult.Failed].
+         * Maps a login [error] from JSch to its [SshAuthResult] kind. A rejected host key is its
+         * [SshAuthResult.HostKeyRejected] kind. A refused login is [SshAuthResult.AuthFailed]. An
+         * [IOException] at any level of the cause chain is [SshAuthResult.NetworkError]. All other errors
+         * are [SshAuthResult.Failed].
          */
         fun toAuthResult(error: Throwable): SshAuthResult {
             val message = error.message.orEmpty()
             return when {
+                error is HostKeyRejectedException -> error.rejection
+
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)
 

@@ -10,7 +10,10 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.delay
@@ -70,6 +73,7 @@ class AgyCursorPlacementE2ETest {
         val debugLog = SshDebugLog()
         val stateManager = SshStateManager()
         val surfaceBus = PaneSurfaceBus()
+        val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider())
         val transport = SshTransportManager(
             backend = RealSshBackend(
                 sshStateManager = stateManager,
@@ -78,6 +82,7 @@ class AgyCursorPlacementE2ETest {
                 paneSurfaceBus = surfaceBus,
                 semanticNotificationBus = SemanticNotificationBus(),
                 keystoreKeyManager = AndroidKeystoreKeyManager(),
+                knownHostsStore = knownHostsStore,
             ),
             moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
             sshStateManager = stateManager,
@@ -98,7 +103,15 @@ class AgyCursorPlacementE2ETest {
             debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
 
         try {
-            assertTrue(transport.connect(machine), "SSH connect failed:\n${debugLogDump()}")
+            if (!transport.connect(machine)) {
+                // The harness starts a private sshd with a new host key, so the test accepts the first key.
+                val prompt = assertIs<HostKeyPrompt.Unknown>(
+                    stateManager.hostKeyPrompts.value[machine.id],
+                    "SSH connect failed:\n${debugLogDump()}",
+                )
+                knownHostsStore.put(prompt.presented)
+                assertTrue(transport.connect(machine), "SSH connect failed:\n${debugLogDump()}")
+            }
 
             val readyFrame = assertNotNull(
                 awaitFrame(surfaceBus) { frame -> frameRows(frame).any { it.contains(AGY_BANNER) } },

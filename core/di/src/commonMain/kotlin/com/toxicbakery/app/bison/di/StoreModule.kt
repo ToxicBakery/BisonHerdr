@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.di
 
 import com.toxicbakery.app.bison.store.AppSettingsStore
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import com.toxicbakery.app.bison.store.MachineStore
 import org.kodein.di.DI
 import org.kodein.di.bindSingleton
@@ -17,6 +18,12 @@ internal val storeModule = DI.Module("storeModule") {
     }
     bindSingleton {
         AppSettingsStore(
+            storeIOProvider = instance(),
+            json = instance(),
+        )
+    }
+    bindSingleton {
+        KnownHostsStore(
             storeIOProvider = instance(),
             json = instance(),
         )

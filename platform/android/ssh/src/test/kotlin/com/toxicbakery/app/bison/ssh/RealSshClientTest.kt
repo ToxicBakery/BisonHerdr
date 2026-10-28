@@ -3,6 +3,8 @@ package com.toxicbakery.app.bison.ssh
 import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.net.ConnectException
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -10,15 +12,22 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 /**
  * Tests [RealSshBackend] and [RealHerdrSshClient] against a real SSH server ([TestSshServer]).
+ *
+ * The known hosts have the host key of the server, so each login gets to the authentication step.
+ * [HostKeyCheckTest] tests the host key check.
  */
 class RealSshClientTest {
 
     private val debugLog = SshDebugLog()
     private val server = TestSshServer().start()
+    private val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply {
+        runBlocking { put(server.knownHost()) }
+    }
     private val backend = RealSshBackend(
         sshStateManager = SshStateManager(),
         sshDebugLog = debugLog,
@@ -26,6 +35,7 @@ class RealSshClientTest {
         paneSurfaceBus = PaneSurfaceBus(),
         semanticNotificationBus = SemanticNotificationBus(),
         keystoreKeyManager = server.keyManager,
+        knownHostsStore = knownHostsStore,
     )
     private val machines = mutableListOf<HostMachine>()
 

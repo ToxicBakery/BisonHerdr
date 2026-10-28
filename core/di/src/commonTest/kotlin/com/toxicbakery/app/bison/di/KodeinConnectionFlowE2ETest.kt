@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.common.screen.delegate.AgentActionDelegate
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewModel
+import com.toxicbakery.app.bison.common.screen.machine.KnownHostsViewModel
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
 import com.toxicbakery.app.bison.common.version.ReleaseFetcher
 import com.toxicbakery.app.bison.common.version.VersionWatcher
@@ -24,6 +25,7 @@ import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.store.StoreIOProvider
 import kotlin.math.abs
@@ -77,6 +79,7 @@ class KodeinConnectionFlowE2ETest {
             assertNotNull(direct.instance<SemanticNotificationBus>())
             assertNotNull(direct.instance<MachineStore>())
             assertNotNull(direct.instance<AppSettingsStore>())
+            assertNotNull(direct.instance<KnownHostsStore>())
             assertNotNull(direct.instance<MachineViewModelDelegate>())
             assertNotNull(direct.instance<AgentActionDelegate>())
             assertNotNull(direct.instance<ReleaseFetcher>())
@@ -86,10 +89,12 @@ class KodeinConnectionFlowE2ETest {
             val configureVmFactory: (String) -> ConfigureMachineViewModel = direct.factory()
             val connectingVmFactory: (String) -> ConnectingMachineViewModel = direct.factory()
             val workspaceVmFactory: (String) -> WorkspaceTerminalViewModel = direct.factory()
+            val knownHostsVmFactory: (String) -> KnownHostsViewModel = direct.factory()
 
             assertNotNull(configureVmFactory(""))
             assertNotNull(connectingVmFactory("workbox"))
             assertNotNull(workspaceVmFactory("workbox"))
+            assertNotNull(knownHostsVmFactory("workbox"))
         } finally {
             Dispatchers.resetMain()
         }

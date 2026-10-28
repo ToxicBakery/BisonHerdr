@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
+import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import java.net.InetSocketAddress
@@ -10,8 +11,10 @@ import java.security.KeyPairGenerator
 import java.security.PublicKey
 import java.security.spec.ECGenParameterSpec
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
+import org.apache.sshd.common.config.keys.PublicKeyEntry
 import org.apache.sshd.common.config.keys.PublicKeyEntryResolver
 import org.apache.sshd.common.keyprovider.KeyPairProvider
 import org.apache.sshd.server.SshServer
@@ -38,6 +41,9 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * An `exec` request runs `sh -c <command>` on the test machine. When [allowTcpForwarding] is true, the
  * server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion.
+ *
+ * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
+ * client sent no credentials, for example after a host key check stopped the connection.
  */
 internal class TestSshServer(
     val keyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(),
@@ -63,6 +69,12 @@ internal class TestSshServer(
     @Volatile
     var interactivePrompts: List<InteractivePrompt> = listOf(InteractivePrompt(prompt = "Password: ", answer = PASSWORD))
 
+    private val credentialCheckCount = AtomicInteger()
+
+    /** The number of login requests that got to an authenticator of the server, for all users and methods. */
+    val credentialChecks: Int
+        get() = credentialCheckCount.get()
+
     /** The port of the server. It is 0 until the first [start]. */
     var port: Int = 0
         private set
@@ -83,6 +95,22 @@ internal class TestSshServer(
             .resolvePublicKey(null, PublicKeyEntryResolver.FAILING)
     }
 
+    /**
+     * Returns the [KnownHost] entry for the current [hostKey] at [HOST] and [port]. The MINA SSHD key code
+     * makes the key type, the Base64 key, and the OpenSSH `SHA256:` fingerprint, so a test can compare
+     * the values of the app with a second implementation.
+     */
+    fun knownHost(): KnownHost {
+        val (keyType, publicKey) = PublicKeyEntry.toString(hostKey.public).split(' ')
+        return KnownHost(
+            host = HOST,
+            port = port,
+            keyType = keyType,
+            fingerprint = KeyUtils.getFingerPrint(hostKey.public),
+            publicKey = publicKey,
+        )
+    }
+
     /** Starts the server. Returns this server, so that a test can write `TestSshServer().start().use { }`. */
     fun start(): TestSshServer {
         check(sshd == null) { "The server runs already" }
@@ -90,8 +118,12 @@ internal class TestSshServer(
             host = HOST
             port = this@TestSshServer.port
             keyPairProvider = KeyPairProvider { listOf(this@TestSshServer.hostKey) }
-            setPasswordAuthenticator { username, password, _ -> username == PASSWORD_USER && password == PASSWORD }
+            setPasswordAuthenticator { username, password, _ ->
+                credentialCheckCount.incrementAndGet()
+                username == PASSWORD_USER && password == PASSWORD
+            }
             setPublickeyAuthenticator { username, key, _ ->
+                credentialCheckCount.incrementAndGet()
                 username == KEY_USER && authorizedKeys.any { KeyUtils.compareKeys(it, key) }
             }
             keyboardInteractiveAuthenticator = InteractiveAuthenticator()
@@ -139,6 +171,7 @@ internal class TestSshServer(
             lang: String?,
             subMethods: String?,
         ): InteractiveChallenge? {
+            credentialCheckCount.incrementAndGet()
             if (username != INTERACTIVE_USER) return null
             return InteractiveChallenge().apply {
                 interactionName = "TestSshServer"
@@ -152,7 +185,10 @@ internal class TestSshServer(
             session: ServerSession?,
             username: String?,
             responses: List<String>?,
-        ): Boolean = username == INTERACTIVE_USER && responses == interactivePrompts.map { it.answer }
+        ): Boolean {
+            credentialCheckCount.incrementAndGet()
+            return username == INTERACTIVE_USER && responses == interactivePrompts.map { it.answer }
+        }
     }
 
     companion object {

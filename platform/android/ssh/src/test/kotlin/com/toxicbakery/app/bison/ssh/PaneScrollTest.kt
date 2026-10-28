@@ -3,6 +3,8 @@ package com.toxicbakery.app.bison.ssh
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -62,6 +64,7 @@ class PaneScrollTest {
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = surfaceBus,
         semanticNotificationBus = SemanticNotificationBus(),
+        knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
         remoteBatchExecutor = { _, _, lane, commands -> fake.execute(lane, commands) },
     )
 

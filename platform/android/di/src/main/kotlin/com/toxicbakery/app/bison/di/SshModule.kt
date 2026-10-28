@@ -45,6 +45,7 @@ internal val sshModule = DI.Module("sshModule") {
             paneSurfaceBus = instance(),
             semanticNotificationBus = instance(),
             keystoreKeyManager = instance(),
+            knownHostsStore = instance(),
         )
     }
     // The debugModule of each build type binds SshBackend: release binds RealSshBackend only.
