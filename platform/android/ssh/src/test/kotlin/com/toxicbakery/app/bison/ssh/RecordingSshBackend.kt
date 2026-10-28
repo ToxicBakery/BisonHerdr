@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.time.Duration
 import kotlinx.coroutines.delay
@@ -16,7 +17,7 @@ import kotlinx.coroutines.delay
  * [sendEndpointCommand] runs [onSendEndpointCommand], so that a test can make the step throw or wait.
  * [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
  * reconnect loop. [withFrameLock] runs [onFrameLockEnd] after its block, so that a test can read the state at the
- * end of the lock.
+ * end of the lock. [surfaceGates] keeps the poll gate of each machine from [openSurface].
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
@@ -31,6 +32,12 @@ internal class RecordingSshBackend(
     /** The time that each liveness check takes. */
     @Volatile
     var livenessDelay: Duration = Duration.ZERO
+
+    /**
+     * The `isSurfaceActive` function of the last [openSurface] call of each machine. A real backend reads the
+     * snapshot and the panes in its poll only while this function returns true.
+     */
+    val surfaceGates: MutableMap<String, () -> Boolean> = ConcurrentHashMap()
 
     /** The receiver of the reconnect events, or null before [setSessionEvents]. */
     @Volatile
@@ -54,6 +61,7 @@ internal class RecordingSshBackend(
         isSurfaceActive: () -> Boolean,
     ) {
         calls += "openSurface ${machine.id}"
+        surfaceGates[machine.id] = isSurfaceActive
         onOpenSurface?.invoke()
     }
 

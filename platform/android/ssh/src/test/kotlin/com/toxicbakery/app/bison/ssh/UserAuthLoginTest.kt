@@ -344,6 +344,7 @@ class UserAuthLoginTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
         )
         val machine = machine("transport", biometricKey())
 
@@ -369,6 +370,7 @@ class UserAuthLoginTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
         )
         val machine = machine("earlier-version", server.keyAuthMethod)
 

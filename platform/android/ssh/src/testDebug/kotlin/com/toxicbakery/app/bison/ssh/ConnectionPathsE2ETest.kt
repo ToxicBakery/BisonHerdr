@@ -72,6 +72,7 @@ class ConnectionPathsE2ETest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
             promptScope = promptScope,
         )
     }

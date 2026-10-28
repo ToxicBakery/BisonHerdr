@@ -131,6 +131,7 @@ class ProxyJumpTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = PaneSurfaceBus(),
+            foregroundState = ForegroundState.ALWAYS,
         )
         val machine = passwordMachine("bastion-prompts")
 

@@ -99,6 +99,8 @@ internal val sshModule = DI.Module("sshModule") {
             paneSurfaceBus = instance(),
             proxyJumpTunnel = instance(),
             featureFlags = featureFlags(),
+            // :app:android binds ForegroundState to the counter of the started activities.
+            foregroundState = instance(),
         )
     }
 }
