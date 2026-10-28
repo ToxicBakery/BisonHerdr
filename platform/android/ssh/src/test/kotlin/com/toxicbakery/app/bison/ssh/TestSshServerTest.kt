@@ -1,9 +1,13 @@
 package com.toxicbakery.app.bison.ssh
 
+import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.File
+import java.util.concurrent.Callable
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -83,6 +87,71 @@ class TestSshServerTest {
         }
     }
 
+    @Test
+    fun theClientWorkerPutsTheHerdrDirectoriesOfTheHomeFirstOnThePath() {
+        val home = server.commandHome.absolutePath
+
+        // The server gives each command only the fixed base PATH. Thus only the export of the worker puts the home
+        // first.
+        assertEquals(TestSshServer.BASE_PATH, execWithJsch(server, "echo \"\$PATH\"").split(':'))
+        assertEquals(
+            listOf("$home/.local/bin", "$home/.cargo/bin", "/usr/local/bin") + TestSshServer.BASE_PATH,
+            runOnClientWorker("echo \"\$PATH\"").single().split(':'),
+        )
+    }
+
+    @Test
+    fun manyFirstCommandsAtTheSameTimeEachFindAnExecutableHerdr() {
+        val pool = Executors.newFixedThreadPool(CONCURRENT_COMMANDS)
+        try {
+            repeat(CONCURRENCY_ROUNDS) { round ->
+                val home = createTempDirectory("bison-test-home").toFile()
+                try {
+                    TestSshServer().start().use { fresh ->
+                        // Half of the rounds use a home of the test, which gets the stub when the test sets it.
+                        if (round % 2 == 1) fresh.homeDirectory = home
+                        val start = CountDownLatch(1)
+                        val results = (1..CONCURRENT_COMMANDS).map {
+                            pool.submit(
+                                Callable {
+                                    start.await()
+                                    execWithJsch(fresh, "\"\$HOME/.local/bin/herdr\"; echo \"exit=\$?\"")
+                                },
+                            )
+                        }
+                        start.countDown()
+                        assertEquals(List(CONCURRENT_COMMANDS) { "exit=127" }, results.map { it.get() }, "Round $round")
+                    }
+                } finally {
+                    home.deleteRecursively()
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    /**
+     * Logs in to [target] as [TestSshServer.PASSWORD_USER] with plain JSch, runs [command] in an `exec` channel, and
+     * returns its output with no spaces at the ends. This path has no client worker.
+     */
+    private fun execWithJsch(target: TestSshServer, command: String): String {
+        val session = JSch().getSession(TestSshServer.PASSWORD_USER, TestSshServer.HOST, target.port)
+        session.setPassword(TestSshServer.PASSWORD.encodeToByteArray())
+        session.setConfig("StrictHostKeyChecking", "no")
+        session.setConfig("PreferredAuthentications", "password")
+        session.connect(CONNECT_TIMEOUT_MS)
+        try {
+            val channel = session.openChannel("exec") as ChannelExec
+            channel.setCommand(command)
+            val output = channel.inputStream
+            channel.connect(CONNECT_TIMEOUT_MS)
+            return output.readBytes().decodeToString().trim()
+        } finally {
+            session.disconnect()
+        }
+    }
+
     /**
      * Logs in with [RealSshBackend], runs [command] on a worker of the client, and returns the lines of the output that
      * are not blank. The worker puts `$HOME/.local/bin`, `$HOME/.cargo/bin`, and `/usr/local/bin` before the `PATH`
@@ -134,6 +203,12 @@ class TestSshServerTest {
 
     private companion object {
         const val CONNECT_TIMEOUT_MS = 10_000
+
+        /** The commands that start at the same time on a new server. */
+        const val CONCURRENT_COMMANDS = 8
+
+        /** The number of new servers in [manyFirstCommandsAtTheSameTimeEachFindAnExecutableHerdr]. */
+        const val CONCURRENCY_ROUNDS = 10
 
         /**
          * Writes the path of `herdr`, its exit status, the number of `HERDR_` variables, `HOME`, and the Herdr

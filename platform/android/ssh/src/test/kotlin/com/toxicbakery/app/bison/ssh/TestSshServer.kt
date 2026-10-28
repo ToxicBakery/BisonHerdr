@@ -6,6 +6,8 @@ import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.net.InetSocketAddress
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -49,10 +51,10 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
  * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
- * in [binDirectory] before the programs of the test machine. Each command has its own [commandHome] and a new environment,
- * so it never gets to a real `herdr` of the test machine (see [TestHerdr]). When [allowTcpForwarding] is
- * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion. [directTcpipTargets]
- * records the `host:port` of each channel that a client asked for.
+ * in [binDirectory] before the programs of the test machine. Each command has its own [commandHome], a new
+ * environment, and the fixed [BASE_PATH], so it never gets to a real `herdr` of the test machine (see [TestHerdr]).
+ * When [allowTcpForwarding] is true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump
+ * bastion. [directTcpipTargets] records the `host:port` of each channel that a client asked for.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
  * client sent no credentials, for example after a host key check stopped the connection.
@@ -89,30 +91,66 @@ internal class TestSshServer(
     @Volatile
     var binDirectory: File? = null
 
-    /** The `HOME` of each `exec` command, or null for a temporary home of this server. See [commandHome]. */
+    /** Makes the install of a `herdr` and the change of [homeDirectory] one step. */
+    private val herdrLock = Any()
+
+    /**
+     * The `HOME` of each `exec` command, or null for a temporary home of this server. See [commandHome]. A new home
+     * gets [TestHerdr.NO_HERDR_SCRIPT] at once when it has no `herdr`.
+     */
     @Volatile
     var homeDirectory: File? = null
+        set(value) {
+            synchronized(herdrLock) {
+                field = value
+                installStubWhenNoHerdr()
+            }
+        }
 
     private val temporaryHome: File = createTempDirectory("bison-test-ssh-home").toFile()
+
+    init {
+        installStubWhenNoHerdr()
+    }
 
     /**
      * The `HOME` of each `exec` command: [homeDirectory], or a temporary directory of this server. The name is not
      * `home`, so that `TestSshServer().apply { homeDirectory = home }` in a test still finds the `home` of the test.
      *
-     * The client workers put `$HOME/.local/bin` first on the `PATH`. Before each command, the server puts
-     * [TestHerdr.NO_HERDR_SCRIPT] in that directory when it has no `herdr`. Thus no command gets to a real `herdr` of
-     * the test machine. A test that needs a Herdr installs a fake with [installHerdr].
+     * The client workers put `$HOME/.local/bin` first on the `PATH`. The server puts [TestHerdr.NO_HERDR_SCRIPT] in
+     * that directory when the server starts and when [homeDirectory] changes, if the directory has no `herdr`. Thus
+     * no command gets to a real `herdr` of the test machine. A test that needs a Herdr installs a fake with
+     * [installHerdr].
      */
     val commandHome: File
         get() = homeDirectory ?: temporaryHome
 
-    /** Writes [script] to the `herdr` of [commandHome] ([TestHerdr.HERDR_PATH]), and returns that file. */
-    fun installHerdr(script: String): File = synchronized(this) {
-        File(commandHome, TestHerdr.HERDR_PATH).apply {
-            parentFile?.mkdirs()
-            writeText(script)
-            setExecutable(true)
+    /** Puts [script] in the `herdr` of [commandHome] ([TestHerdr.HERDR_PATH]), and returns that file. */
+    fun installHerdr(script: String): File = synchronized(herdrLock) { writeHerdr(script) }
+
+    private fun installStubWhenNoHerdr() {
+        synchronized(herdrLock) {
+            if (!File(commandHome, TestHerdr.HERDR_PATH).exists()) writeHerdr(TestHerdr.NO_HERDR_SCRIPT)
         }
+    }
+
+    /**
+     * Writes [script] to a temporary file with the execute bit, and then moves that file to the `herdr` of
+     * [commandHome] in one step. Thus a command never finds a `herdr` that is not complete or not executable.
+     */
+    private fun writeHerdr(script: String): File {
+        val herdr = File(commandHome, TestHerdr.HERDR_PATH)
+        val directory = checkNotNull(herdr.parentFile).apply { mkdirs() }
+        val temporary = File.createTempFile("herdr", ".tmp", directory)
+        temporary.writeText(script)
+        temporary.setExecutable(true)
+        Files.move(
+            temporary.toPath(),
+            herdr.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+        return herdr
     }
 
     /** The keys that [KEY_USER] can log in with. */
@@ -187,6 +225,8 @@ internal class TestSshServer(
     /** Starts the server. Returns this server, so that a test can write `TestSshServer().start().use { }`. */
     fun start(): TestSshServer {
         check(sshd == null) { "The server runs already" }
+        // A start after close makes the temporary home again.
+        installStubWhenNoHerdr()
         val server = SshServer.setUpDefaultServer().apply {
             host = HOST
             port = this@TestSshServer.port
@@ -252,17 +292,14 @@ internal class TestSshServer(
 
     /**
      * Returns the process that runs [command]: `sh -c` in a new environment. The environment has [NAME_VARIABLE],
-     * [commandHome] as `HOME`, the Herdr configuration directories in [commandHome], and a `PATH` with the `herdr` of [commandHome] first,
-     * then [binDirectory], and then the `PATH` of the test machine. It has no other variable of the test machine, for
-     * example no `HERDR_SOCKET_PATH`.
+     * [commandHome] as `HOME`, the Herdr configuration directories in [commandHome], and a `PATH` of [binDirectory]
+     * and [BASE_PATH]. It has no other variable of the test machine, for example no `HERDR_SOCKET_PATH`.
      */
     private fun shellCommand(command: String): List<String> {
         val home = commandHome
         val herdr = File(home, TestHerdr.HERDR_PATH)
-        if (!herdr.exists()) installHerdr(TestHerdr.NO_HERDR_SCRIPT)
         check(herdr.canExecute()) { "The test server has no herdr at $herdr, so a real herdr can run" }
-        val path = listOfNotNull(herdr.parentFile, binDirectory).map { it.absolutePath } +
-            System.getenv("PATH").orEmpty()
+        val path = listOfNotNull(binDirectory?.absolutePath) + BASE_PATH
         return listOf(
             "env",
             "-i",
@@ -319,6 +356,12 @@ internal class TestSshServer(
         const val KEY_USER: String = "bison-key"
         const val KEY_ALIAS: String = "test_ssh_server_key"
         const val INTERACTIVE_USER: String = "bison-interactive"
+
+        /**
+         * The `PATH` of each `exec` command, after [binDirectory]. It has no directory of the test JVM, for example no
+         * `~/.local/bin`. Thus only the `export PATH` of the client workers puts `$HOME/.local/bin` first.
+         */
+        val BASE_PATH: List<String> = listOf("/usr/local/bin", "/usr/bin", "/bin")
 
         /** The environment variable that has the [name] of the server for each `exec` command. */
         const val NAME_VARIABLE: String = "BISON_TEST_SSH_SERVER"
