@@ -117,6 +117,8 @@ data class ModifierKeyState(
                     add(letter.toString())
                 }.joinToString("+")
             }
+            // Herdr removes the spaces at the ends of a chord, so "ctrl+ " has no key. Herdr calls this key "space".
+            baseKey == " " -> "space"
             else -> baseKey
         }
         if (!hasActiveModifiers) return normalizedBase

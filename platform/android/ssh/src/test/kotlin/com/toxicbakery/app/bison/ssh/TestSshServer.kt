@@ -82,6 +82,14 @@ internal class TestSshServer(
     @Volatile
     var binDirectory: File? = null
 
+    /**
+     * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The client puts
+     * `$HOME/.local/bin` first on the `PATH`, so a test that sets a home can put a fake `herdr` there. Then no
+     * command gets to a real `herdr` of the test machine.
+     */
+    @Volatile
+    var homeDirectory: File? = null
+
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
 
@@ -204,10 +212,14 @@ internal class TestSshServer(
         transportMode = transportMode,
     )
 
-    /** Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], and [binDirectory] on the `PATH`. */
+    /**
+     * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [homeDirectory] as `HOME`, and
+     * [binDirectory] on the `PATH`.
+     */
     private fun shellCommand(command: String): List<String> = buildList {
         add("env")
         add("$NAME_VARIABLE=$name")
+        homeDirectory?.let { add("HOME=${it.absolutePath}") }
         binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
         addAll(listOf("sh", "-c", command))
     }

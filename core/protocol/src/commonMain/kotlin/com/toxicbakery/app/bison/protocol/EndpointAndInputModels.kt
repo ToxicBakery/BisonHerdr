@@ -120,6 +120,9 @@ enum class ClientKeyCode {
     @SerialName("delete")
     Delete,
 
+    @SerialName("insert")
+    Insert,
+
     @SerialName("char_c")
     CharC,
 

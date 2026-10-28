@@ -350,6 +350,10 @@ fun TerminalSurfaceCanvas(
                                 onSpecialKey(ClientKeyCode.Delete)
                                 true
                             }
+                            Key.Insert -> {
+                                onSpecialKey(ClientKeyCode.Insert)
+                                true
+                            }
                             Key.Tab -> {
                                 onSpecialKey(ClientKeyCode.Tab)
                                 true

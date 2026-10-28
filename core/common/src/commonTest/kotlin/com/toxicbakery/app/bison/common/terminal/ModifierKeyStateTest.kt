@@ -40,6 +40,14 @@ class ModifierKeyStateTest {
     }
 
     @Test
+    fun theSpaceKeyGetsTheHerdrNameSpaceInAChord() {
+        val ctrl = ModifierKeyState().onSingleTap(TerminalModifierKey.Ctrl)
+        assertEquals("ctrl+space", ctrl.formatKeyChord(" "))
+        val ctrlAlt = ctrl.onSingleTap(TerminalModifierKey.Alt)
+        assertEquals("ctrl+alt+space", ctrlAlt.formatKeyChord(" "))
+    }
+
+    @Test
     fun snapSplitRatioSnapsToCanonicalStopsAndClampsBounds() {
         assertEquals(0.25f, snapSplitRatio(0.26f))
         assertEquals(0.3333f, snapSplitRatio(0.32f))

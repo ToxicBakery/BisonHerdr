@@ -165,7 +165,12 @@ internal class RealHerdrSshClient(
 
     internal sealed interface RemoteShellCommand {
         data class Exec(val command: String) : RemoteShellCommand
-        data class ApiBridgeLine(val ndjsonLine: String) : RemoteShellCommand
+
+        /**
+         * One JSON-RPC request for `herdr remote-api-bridge`. A [paneInput] line does not run after an earlier
+         * [paneInput] line of the same batch got an `invalid_key` error. See [appendBatchCommands].
+         */
+        data class ApiBridgeLine(val ndjsonLine: String, val paneInput: Boolean = false) : RemoteShellCommand
     }
 
     internal data class PendingPaneInput(
@@ -1307,20 +1312,21 @@ internal class RealHerdrSshClient(
 
             val maxSeqInBatch = batch.maxOf { it.seq }
             val targetPaneId = batch.last().paneId
-            val coalescedRpcCommands = buildCoalescedInputCommands(batch)
+            val coalescedRpcCommands = buildCoalescedInputCommands(batch) { key ->
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "Herdr has no key for $key. The client did not send it.",
+                    isError = true,
+                )
+            }
             if (coalescedRpcCommands.isEmpty()) continue
 
             val prevAnsi = cachedInputs[machine.id]?.ansiByPane?.get(targetPaneId)
             val readCommand = RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(targetPaneId))
 
             runCatching {
-                val combinedCommands = coalescedRpcCommands + readCommand
-                val rawResponse = executeBatchOnLane(
-                    machine = machine,
-                    route = route,
-                    lane = WorkerLane.Input,
-                    commands = combinedCommands,
-                )
+                val rawResponse = executePaneInputLines(machine, route, coalescedRpcCommands, readCommand)
 
                 val immediateAnsi = extractPaneAnsiFromResponse(rawResponse, targetPaneId)
 
@@ -1391,81 +1397,30 @@ internal class RealHerdrSshClient(
      * - Consecutive `TextCommit` / `Paste` events merge into a single `pane.send_text`.
      * - Consecutive `Key` events merge into a single `pane.send_keys` array.
      * - Accumulated text immediately followed by `Key` events on the same pane merges into a single `pane.send_input`.
+     *
+     * A key that Herdr cannot name (see [HerdrKeys]) goes into the text of a `pane.send_text` line as terminal bytes.
+     * `pane.send_input` can put its text in a bracketed paste, so a line with such bytes never becomes a
+     * `pane.send_input`. The lines keep the typed order. [onUnsupportedKey] gets each key that Herdr does not accept.
+     * The client does not send such a key.
      */
-    internal fun buildCoalescedInputCommands(batch: List<PendingPaneInput>): List<RemoteShellCommand.ApiBridgeLine> {
+    internal fun buildCoalescedInputCommands(
+        batch: List<PendingPaneInput>,
+        onUnsupportedKey: (ClientKeyEvent) -> Unit = {},
+    ): List<RemoteShellCommand.ApiBridgeLine> {
         if (batch.isEmpty()) return emptyList()
         val result = ArrayList<RemoteShellCommand.ApiBridgeLine>(batch.size)
 
         var currentPaneId: String? = null
         val textBuffer = StringBuilder()
+        var textHasKeyBytes = false
         val keyBuffer = ArrayList<String>(4)
 
         fun flushCurrent() {
             val paneId = currentPaneId ?: return
-            val hasText = textBuffer.isNotEmpty()
-            val hasKeys = keyBuffer.isNotEmpty()
-            if (!hasText && !hasKeys) return
-
-            val line = when {
-                hasText && hasKeys -> {
-                    val text = textBuffer.toString()
-                    val keys = keyBuffer.toList()
-                    buildJsonObject {
-                        put("id", "in_${revisionCounter.incrementAndGet()}")
-                        put("method", "pane.send_input")
-                        put(
-                            "params",
-                            buildJsonObject {
-                                put("pane_id", paneId)
-                                put("text", text)
-                                put(
-                                    "keys",
-                                    buildJsonArray {
-                                        keys.forEach { add(JsonPrimitive(it)) }
-                                    },
-                                )
-                            },
-                        )
-                    }.toString()
-                }
-
-                hasText -> {
-                    val text = textBuffer.toString()
-                    buildJsonObject {
-                        put("id", "in_${revisionCounter.incrementAndGet()}")
-                        put("method", "pane.send_text")
-                        put(
-                            "params",
-                            buildJsonObject {
-                                put("pane_id", paneId)
-                                put("text", text)
-                            },
-                        )
-                    }.toString()
-                }
-
-                else -> {
-                    val keys = keyBuffer.toList()
-                    buildJsonObject {
-                        put("id", "key_${revisionCounter.incrementAndGet()}")
-                        put("method", "pane.send_keys")
-                        put(
-                            "params",
-                            buildJsonObject {
-                                put("pane_id", paneId)
-                                put(
-                                    "keys",
-                                    buildJsonArray {
-                                        keys.forEach { add(JsonPrimitive(it)) }
-                                    },
-                                )
-                            },
-                        )
-                    }.toString()
-                }
-            }
-            result.add(RemoteShellCommand.ApiBridgeLine(line))
+            if (textBuffer.isEmpty() && keyBuffer.isEmpty()) return
+            result.add(paneInputLine(paneId, textBuffer.toString(), keyBuffer.toList()))
             textBuffer.setLength(0)
+            textHasKeyBytes = false
             keyBuffer.clear()
         }
 
@@ -1492,8 +1447,19 @@ internal class RealHerdrSshClient(
                     textBuffer.append(ev.text)
                 }
 
-                is ClientPaneInputEvent.Key -> {
-                    keyBuffer.add(mapKeyEventToHerdrKeySpec(ev.event))
+                is ClientPaneInputEvent.Key -> when (val key = HerdrKeys.encode(ev.event)) {
+                    is HerdrKeyInput.Named -> {
+                        if (textHasKeyBytes) flushCurrent()
+                        keyBuffer.add(key.spec)
+                    }
+
+                    is HerdrKeyInput.Raw -> {
+                        if (keyBuffer.isNotEmpty()) flushCurrent()
+                        textBuffer.append(key.bytes)
+                        textHasKeyBytes = true
+                    }
+
+                    null -> onUnsupportedKey(ev.event)
                 }
 
                 is ClientPaneInputEvent.Mouse -> Unit
@@ -1502,6 +1468,121 @@ internal class RealHerdrSshClient(
         flushCurrent()
         return result
     }
+
+    /**
+     * Returns the pane input line for [text] and then [keys]: `pane.send_input` for both, `pane.send_text` for text
+     * only, and `pane.send_keys` for keys only.
+     */
+    private fun paneInputLine(
+        paneId: String,
+        text: String,
+        keys: List<String>,
+    ): RemoteShellCommand.ApiBridgeLine {
+        val (idPrefix, method) = when {
+            text.isNotEmpty() && keys.isNotEmpty() -> "in" to "pane.send_input"
+            text.isNotEmpty() -> "in" to "pane.send_text"
+            else -> "key" to "pane.send_keys"
+        }
+        val line = buildJsonObject {
+            put("id", "${idPrefix}_${revisionCounter.incrementAndGet()}")
+            put("method", method)
+            put(
+                "params",
+                buildJsonObject {
+                    put("pane_id", paneId)
+                    if (text.isNotEmpty()) put("text", text)
+                    if (keys.isNotEmpty()) {
+                        put(
+                            "keys",
+                            buildJsonArray {
+                                keys.forEach { add(JsonPrimitive(it)) }
+                            },
+                        )
+                    }
+                },
+            )
+        }.toString()
+        return RemoteShellCommand.ApiBridgeLine(line, paneInput = true)
+    }
+
+    /**
+     * Runs the pane input [lines] and then [readCommand] on [WorkerLane.Input], and returns the output of the last
+     * batch.
+     *
+     * When Herdr answers `invalid_key` for a line, Herdr writes nothing of that line, and the batch script does not
+     * run the next input lines (see [appendBatchCommands]). This function then sends the text and each key of that
+     * line in separate requests, and then the lines that did not run. Then only the unknown key does not get to the
+     * pane, and the pane gets the other input in the typed order.
+     */
+    private suspend fun executePaneInputLines(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        lines: List<RemoteShellCommand.ApiBridgeLine>,
+        readCommand: RemoteShellCommand.ApiBridgeLine,
+    ): String {
+        var pending = lines
+        while (true) {
+            val output = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Input,
+                commands = pending + readCommand,
+            )
+            if (!output.contains(INVALID_KEY_ANSWER)) return output
+            val answers = answersById(output)
+            val rejectedIndex = pending.indexOfFirst { line ->
+                answers[requestId(line)]?.errorCode() == INVALID_KEY_CODE
+            }
+            if (rejectedIndex < 0) return output
+            val rejected = pending[rejectedIndex]
+            val message = answers[requestId(rejected)]
+                ?.get("error")?.jsonObject?.get("message")?.jsonPrimitive?.content
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "Herdr did not accept a key ($message). The client sends the other input again.",
+                isError = true,
+            )
+            pending = splitRejectedLine(rejected) +
+                pending.drop(rejectedIndex + 1).filter { answers[requestId(it)] == null }
+            if (pending.isEmpty()) return output
+        }
+    }
+
+    /**
+     * Returns the requests that send the text and each key of the input [line] separately. Herdr did not accept
+     * [line]. A line with one key gives no key request, because Herdr did not accept that key. A line with no key
+     * gives no request. Thus each split removes a key or a line, and [executePaneInputLines] always stops.
+     */
+    private fun splitRejectedLine(line: RemoteShellCommand.ApiBridgeLine): List<RemoteShellCommand.ApiBridgeLine> {
+        val params = runCatching {
+            json.parseToJsonElement(line.ndjsonLine).jsonObject["params"]?.jsonObject
+        }.getOrNull() ?: return emptyList()
+        val paneId = params["pane_id"]?.jsonPrimitive?.content ?: return emptyList()
+        val text = params["text"]?.jsonPrimitive?.content.orEmpty()
+        val keys = (params["keys"] as? JsonArray)?.map { it.jsonPrimitive.content }.orEmpty()
+        if (keys.isEmpty()) return emptyList()
+        return buildList {
+            if (text.isNotEmpty()) add(paneInputLine(paneId, text, emptyList()))
+            if (keys.size > 1) keys.forEach { add(paneInputLine(paneId, "", listOf(it))) }
+        }
+    }
+
+    /** Returns the `id` of the request of [line], or an empty string. */
+    private fun requestId(line: RemoteShellCommand.ApiBridgeLine): String = runCatching {
+        json.parseToJsonElement(line.ndjsonLine).jsonObject["id"]?.jsonPrimitive?.content
+    }.getOrNull().orEmpty()
+
+    /** Returns the JSON answers in [output] by their `id`. */
+    private fun answersById(output: String): Map<String, JsonObject> = output.lineSequence()
+        .map { it.trim() }
+        .filter { it.startsWith("{") && it.endsWith("}") }
+        .mapNotNull { line -> runCatching { json.parseToJsonElement(line).jsonObject }.getOrNull() }
+        .mapNotNull { answer -> answer["id"]?.jsonPrimitive?.content?.let { it to answer } }
+        .toMap()
+
+    private fun JsonObject.errorCode(): String? =
+        (this["error"] as? JsonObject)?.get("code")?.jsonPrimitive?.content
 
     private fun toOptimisticEdit(
         seq: Long,
@@ -1932,36 +2013,6 @@ internal class RealHerdrSshClient(
                     }
                 }
             }
-    }
-
-    private fun mapKeyEventToHerdrKeySpec(ev: ClientKeyEvent): String {
-        val base = when (ev.code) {
-            ClientKeyCode.Enter -> "Enter"
-            ClientKeyCode.Escape -> "Esc"
-            ClientKeyCode.Tab -> "Tab"
-            ClientKeyCode.Backspace -> "Backspace"
-            ClientKeyCode.Up -> "Up"
-            ClientKeyCode.Down -> "Down"
-            ClientKeyCode.Left -> "Left"
-            ClientKeyCode.Right -> "Right"
-            ClientKeyCode.Home -> "Home"
-            ClientKeyCode.End -> "End"
-            ClientKeyCode.PageUp -> "PageUp"
-            ClientKeyCode.PageDown -> "PageDown"
-            ClientKeyCode.Delete -> "Delete"
-            ClientKeyCode.CharC -> "c"
-            ClientKeyCode.CharB -> "b"
-            ClientKeyCode.CharD -> "d"
-            ClientKeyCode.CharZ -> "z"
-            ClientKeyCode.CharY -> "y"
-            ClientKeyCode.CharN -> "n"
-        }
-        return buildString {
-            if (ev.ctrl) append("ctrl+")
-            if (ev.alt) append("alt+")
-            if (ev.shift && base.length > 1) append("shift+")
-            append(base)
-        }
     }
 
     /**
@@ -2528,23 +2579,7 @@ internal class RealHerdrSshClient(
         val batchId = shellBatchCounter.incrementAndGet()
         val body = buildString(commands.size * 160 + 96) {
             append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
-            commands.forEachIndexed { index, cmd ->
-                when (cmd) {
-                    is RemoteShellCommand.Exec -> {
-                        append(cmd.command.trim()).append('\n')
-                    }
-                    is RemoteShellCommand.ApiBridgeLine -> {
-                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
-                        append("herdr remote-api-bridge <<'")
-                            .append(eofMarker)
-                            .append("'\n")
-                            .append(cmd.ndjsonLine.trim())
-                            .append('\n')
-                            .append(eofMarker)
-                            .append('\n')
-                    }
-                }
-            }
+            appendBatchCommands(batchId, commands)
         }
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(body)
@@ -2564,30 +2599,48 @@ internal class RealHerdrSshClient(
     ): Pair<String, String> {
         val sentinel = "__BISON_DONE_${batchId}__"
         val script = buildString(commands.size * 160 + 64) {
-            commands.forEachIndexed { index, cmd ->
-                when (cmd) {
-                    is RemoteShellCommand.Exec -> {
-                        append(cmd.command.trim())
-                        append('\n')
-                    }
-
-                    is RemoteShellCommand.ApiBridgeLine -> {
-                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
-                        append("herdr remote-api-bridge <<'")
-                        append(eofMarker)
-                        append("'\n")
-                        append(cmd.ndjsonLine.trim())
-                        append('\n')
-                        append(eofMarker)
-                        append('\n')
-                    }
-                }
-            }
+            appendBatchCommands(batchId, commands)
             append("printf '\\n")
             append(sentinel)
             append("\\n'\n")
         }
         return script to sentinel
+    }
+
+    /**
+     * Adds the POSIX shell lines of [commands] to this script.
+     *
+     * Herdr writes nothing to the pane for a request with a key that it does not know (`invalid_key`). After such
+     * an answer, the script does not run the next [RemoteShellCommand.ApiBridgeLine.paneInput] lines of the batch.
+     * Thus [executePaneInputLines] can send the rest of the input again, in the typed order.
+     */
+    private fun StringBuilder.appendBatchCommands(batchId: Long, commands: List<RemoteShellCommand>) {
+        if (commands.any { it is RemoteShellCommand.ApiBridgeLine && it.paneInput }) {
+            append(INPUT_STOP_VARIABLE).append("=\n")
+        }
+        commands.forEachIndexed { index, cmd ->
+            when (cmd) {
+                is RemoteShellCommand.Exec -> {
+                    append(cmd.command.trim())
+                    append('\n')
+                }
+
+                is RemoteShellCommand.ApiBridgeLine -> {
+                    val eofMarker = "__BISON_EOF_${batchId}_${index}__"
+                    if (cmd.paneInput) append("if [ -z \"\$$INPUT_STOP_VARIABLE\" ]; then\n")
+                    append("herdr remote-api-bridge <<'")
+                    append(eofMarker)
+                    append("'")
+                    if (cmd.paneInput) append(" | ").append(INPUT_ANSWER_FILTER)
+                    append('\n')
+                    append(cmd.ndjsonLine.trim())
+                    append('\n')
+                    append(eofMarker)
+                    append('\n')
+                    if (cmd.paneInput) append("fi\n")
+                }
+            }
+        }
     }
 
     private data class ParsedSnapshotBundle(
@@ -3271,6 +3324,26 @@ internal class RealHerdrSshClient(
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
         private const val MAX_OPTIMISTIC_EDITS = 128
         private const val PANE_SCROLL_ACCEPTED_RESPONSE = """{"id":"pane_scroll","result":{"type":"pane_scroll_queued"}}"""
+
+        /** The error code of Herdr for a key name that it does not know. */
+        private const val INVALID_KEY_CODE = "invalid_key"
+
+        /** The text of an `invalid_key` answer that the batch script looks for. */
+        private const val INVALID_KEY_ANSWER = "\"code\":\"$INVALID_KEY_CODE\""
+
+        /** The shell variable that stops the pane input lines of a batch. See [appendBatchCommands]. */
+        private const val INPUT_STOP_VARIABLE = "BISON_INPUT_STOP"
+
+        /**
+         * Writes the answer of a pane input line to the output, and sets [INPUT_STOP_VARIABLE] for an `invalid_key`
+         * answer. It reads a pipe and not a command substitution, because some old shells do not parse a
+         * here-document in a command substitution correctly.
+         */
+        private const val INPUT_ANSWER_FILTER =
+            "( BISON_STATUS=0; while IFS= read -r BISON_ANSWER || [ -n \"\$BISON_ANSWER\" ]; do " +
+                "printf '%s\\n' \"\$BISON_ANSWER\"; " +
+                "case \$BISON_ANSWER in *'$INVALID_KEY_ANSWER'*) BISON_STATUS=1 ;; esac; " +
+                "done; exit \$BISON_STATUS ) || $INPUT_STOP_VARIABLE=1"
 
         private val BLANK_CELL = CellData()
         private val RESET_SGR_STATE = SgrState(0u, 0u, 0u)
