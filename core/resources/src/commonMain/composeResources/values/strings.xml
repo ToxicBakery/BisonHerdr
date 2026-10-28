@@ -113,6 +113,23 @@
     <string name="hardware_key_sheet_tap_nfc">Hold your NFC YubiKey against the back of the tablet to sign the SSH challenge.</string>
     <string name="hardware_key_key_type_label">Key Type: %1$s</string>
 
+    <!-- SSH Host Key Check -->
+    <string name="host_key_unknown_title">Unknown Host Key</string>
+    <string name="host_key_unknown_body">The app does not know the host key of %1$s. Compare this fingerprint with the fingerprint on the host before you accept the key.</string>
+    <string name="host_key_fingerprint_hint">On the host, the command ssh-keygen -lf shows the fingerprint of a host key file in /etc/ssh.</string>
+    <string name="host_key_type_label">Key type: %1$s</string>
+    <string name="host_key_accept">Accept and Connect</string>
+    <string name="host_key_reject">Reject</string>
+    <string name="host_key_changed_title">Host Key Changed</string>
+    <string name="host_key_changed_body">The host key of %1$s is different from the saved key. An attacker can be between this device and the host. Do not connect until you know why the key changed.</string>
+    <string name="host_key_changed_saved_label">Saved key (%1$s)</string>
+    <string name="host_key_changed_sent_label">Key from the host (%1$s)</string>
+    <string name="host_key_changed_remove_hint">If the host has a new key, remove the saved key. The app then shows the new key, and you can accept it.</string>
+    <string name="host_key_changed_remove">Remove Saved Key</string>
+    <string name="known_hosts_title">Known Host Keys</string>
+    <string name="known_hosts_empty">This machine has no saved host key. The app asks you to accept the key at the next connection.</string>
+    <string name="known_hosts_delete">Delete the host key of %1$s</string>
+
     <!-- Settings & Color Themes (Gruvbox Dark Default + 18 Palettes) -->
     <string name="settings_title">Settings</string>
     <string name="settings_section_appearance">Appearance &amp; Color Palette</string>

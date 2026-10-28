@@ -78,6 +78,7 @@ fun ConnectingMachineScreen(
     onCancel: () -> Unit,
 ) {
     val viewModel: ConnectingMachineViewModel by rememberViewModel(arg = machineId)
+    val state by viewModel.state.collectAsState()
     val machine by viewModel.machine.collectAsState()
     val progress by viewModel.progress.collectAsState()
     val steps by viewModel.steps.collectAsState()
@@ -316,6 +317,17 @@ fun ConnectingMachineScreen(
                         }
                     }
                 }
+            }
+
+            // Host key decision: the connection stops until the user accepts or rejects the key.
+            val hostKeyPrompt = state.hostKeyPrompt
+            if (hostKeyPrompt != null) {
+                HostKeyPromptSheet(
+                    prompt = hostKeyPrompt,
+                    onAccept = { viewModel.onEvent(ConnectingMachineViewModel.Event.AcceptHostKey) },
+                    onReject = { viewModel.onEvent(ConnectingMachineViewModel.Event.RejectHostKey) },
+                    onRemoveSavedKey = { viewModel.onEvent(ConnectingMachineViewModel.Event.RemoveSavedHostKey) },
+                )
             }
         }
     }

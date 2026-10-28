@@ -533,6 +533,11 @@ fun ConfigureMachineScreen(
                     }
                 }
 
+                // 6. Saved host keys of this machine
+                if (state.isEditingExisting) {
+                    KnownHostsSection(machineId = state.id)
+                }
+
                 // Actions
                 Row(
                     modifier = Modifier.fillMaxWidth(),

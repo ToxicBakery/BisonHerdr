@@ -6,6 +6,7 @@ import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegateImpl
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineViewModel
+import com.toxicbakery.app.bison.common.screen.machine.KnownHostsViewModel
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
 import com.toxicbakery.app.bison.common.version.ReleaseFetcher
 import com.toxicbakery.app.bison.common.version.VersionWatcher
@@ -46,6 +47,14 @@ val viewModelModule = DI.Module("viewModelModule") {
             machineStore = instance(),
             machineViewModelDelegate = instance(),
             sshDebugLog = instance(),
+            knownHostsStore = instance(),
+        )
+    }
+    bindFactory<String, KnownHostsViewModel> { machineId: String ->
+        KnownHostsViewModel(
+            machineId = machineId,
+            machineStore = instance(),
+            knownHostsStore = instance(),
         )
     }
     bindSingleton<MachineViewModelDelegate> {
