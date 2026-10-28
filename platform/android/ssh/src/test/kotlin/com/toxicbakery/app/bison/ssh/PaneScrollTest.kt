@@ -712,6 +712,38 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aSecondBatchShowsItsNewerTextWhenTheSnapshotShowsTheScroll() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        fake.layoutPaneIds = listOf("w1:p1")
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // Herdr moves p2 at once, but the answer stays in flight.
+        fake.layoutPaneIds = listOf("w1:p1", "w1:p2")
+        fake.applyScrollsAtOnce = true
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 30))
+        assertEquals(ScrollCall("w1:p2", 30), fake.nextScrollCall(), "The request must go to Herdr")
+
+        // The snapshot of the poll shows p2 at 30. Herdr holds the second batch of the poll before it reads p2.
+        val held = fake.holdNextPoll(beforeRead = true, snapshot = false)
+        val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        held.awaitHeld()
+
+        // The answer arrives during the second batch. Then the shell writes new output, and the second batch reads it.
+        val requestRevision = assertNotNull(surfaceBus.surfaceFor("box")).revision
+        fake.answerScroll()
+        withTimeout(TIMEOUT_MS) { surfaceBus.surfaces.first { it.getValue("box").revision > requestRevision } }
+        fake.newOutput = " NEW"
+        held.release()
+        poll.join()
+
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertEquals(30, frame.offset("w1:p2"), "The poll must show the position of the scroll")
+        assertTrue(frame.showsText("line at 30 NEW", "w1:p2"), "The second batch read after the scroll, so keep its text")
+    }
+
+    @Test
     fun aPollInFlightAtADisconnectPublishesNothing() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
         val fake = FakeHerdr()
