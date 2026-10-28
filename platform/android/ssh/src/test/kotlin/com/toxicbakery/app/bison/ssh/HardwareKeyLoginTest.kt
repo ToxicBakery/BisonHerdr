@@ -55,6 +55,7 @@ class HardwareKeyLoginTest {
         keystoreKeyManager = server.keyManager,
         knownHostsStore = knownHostsStore,
         secretStore = softwareKeySecretStore(),
+        localNetworkGuard = permittedLocalNetwork(),
         hardwareKeySigner = checkingSigner,
     )
     private val hostScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
