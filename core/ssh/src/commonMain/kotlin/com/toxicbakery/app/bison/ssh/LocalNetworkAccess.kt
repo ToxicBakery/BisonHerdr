@@ -16,16 +16,19 @@ import kotlinx.coroutines.withTimeoutOrNull
  * A request of the transport for the local network permission (`ACCESS_LOCAL_NETWORK`) of Android 17. [hostPort] is
  * the first host of the route that needs the permission: the bastion, or the target when the route has no bastion.
  *
+ * When [timedOut] is false, Android stops each connection to [hostPort]. When [timedOut] is true, the connect to the
+ * private address of [hostPort] timed out, and Android can be the cause. The UI tells the user the correct reason.
+ *
  * Two requests are equal only when they are the same instance.
  */
-class LocalNetworkRequest internal constructor(val hostPort: String) {
+class LocalNetworkRequest internal constructor(val hostPort: String, val timedOut: Boolean = false) {
     /** The answer to this request. Only the first answer has an effect. */
     internal val answer = CompletableDeferred<LocalNetworkOutcome>()
 
     /** The number of machines that wait for [answer]. */
     internal val waiters = MutableStateFlow(0)
 
-    override fun toString(): String = "LocalNetworkRequest(hostPort=$hostPort)"
+    override fun toString(): String = "LocalNetworkRequest(hostPort=$hostPort, timedOut=$timedOut)"
 }
 
 /** The result of a [LocalNetworkRequest]. */
@@ -72,6 +75,7 @@ class LocalNetworkAccess {
 
     /**
      * Asks the UI for the local network permission for [hostPort] of [machineId], and waits for the answer.
+     * [timedOut] tells the reason of the request. See [LocalNetworkRequest].
      *
      * - When no UI runs [hostRequests], it returns [LocalNetworkOutcome.NoUi] at once and puts no request.
      * - When a request is open, it waits for the answer to that request.
@@ -79,7 +83,12 @@ class LocalNetworkAccess {
      * - [cancel] for [machineId] makes it return [LocalNetworkOutcome.Cancelled] at once.
      * - When no other machine waits for the request, it removes the request at the end. A late answer has no effect.
      */
-    suspend fun request(machineId: String, hostPort: String, timeout: Duration): LocalNetworkOutcome {
+    suspend fun request(
+        machineId: String,
+        hostPort: String,
+        timeout: Duration,
+        timedOut: Boolean = false,
+    ): LocalNetworkOutcome {
         if (hosts.value == 0) return LocalNetworkOutcome.NoUi
         val cancel = CompletableDeferred<LocalNetworkOutcome>()
         var replaced: CompletableDeferred<LocalNetworkOutcome>? = null
@@ -89,7 +98,7 @@ class LocalNetworkAccess {
         }
         // A new wait of the same machine ends its older wait.
         replaced?.complete(LocalNetworkOutcome.Cancelled)
-        val created = LocalNetworkRequest(hostPort)
+        val created = LocalNetworkRequest(hostPort, timedOut)
         val request = _openRequest.updateAndGet { open -> open ?: created } ?: created
         request.waiters.update { it + 1 }
         var outcome: LocalNetworkOutcome = LocalNetworkOutcome.TimedOut
@@ -118,9 +127,13 @@ class LocalNetworkAccess {
         cancels.value[machineId]?.complete(LocalNetworkOutcome.Cancelled)
     }
 
-    /** Ends the waits of all machines in [request] with [LocalNetworkOutcome.Cancelled]. */
-    fun cancelAll() {
-        cancels.value.values.forEach { it.complete(LocalNetworkOutcome.Cancelled) }
+    /**
+     * Ends the waits of all machines in [request] with [LocalNetworkOutcome.Cancelled]. Returns the ids of the
+     * machines whose wait it ended, so that the caller can disconnect them.
+     */
+    fun cancelAll(): Set<String> {
+        val waits = cancels.value
+        return waits.filterValues { it.complete(LocalNetworkOutcome.Cancelled) }.keys
     }
 
     /**

@@ -134,7 +134,8 @@ class LocalNetworkAccessTest {
         runCurrent()
 
         access.cancel("unknown-box")
-        access.cancelAll()
+        assertEquals(setOf(MACHINE_ID), access.cancelAll())
+        assertEquals(emptySet(), access.cancelAll())
 
         assertEquals(LocalNetworkOutcome.Cancelled, result.await())
         runCurrent()
@@ -155,6 +156,22 @@ class LocalNetworkAccessTest {
         assertEquals(LocalNetworkOutcome.Cancelled, older.await())
         answer.complete(LocalNetworkOutcome.Denied)
         assertEquals(LocalNetworkOutcome.Denied, newer.await())
+    }
+
+    @Test
+    fun theUiGetsTheReasonOfTheRequest() = runTest {
+        val kinds = mutableListOf<Boolean>()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            access.hostRequests { request ->
+                kinds += request.timedOut
+                LocalNetworkOutcome.Denied
+            }
+        }
+
+        access.request(MACHINE_ID, HOST_PORT, TIMEOUT)
+        access.request(MACHINE_ID, HOST_PORT, TIMEOUT, timedOut = true)
+
+        assertEquals(listOf(false, true), kinds)
     }
 
     @Test
