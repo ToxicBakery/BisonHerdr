@@ -219,6 +219,13 @@ internal class RealHerdrSshClient(
     private val paneScrollSignals = ConcurrentHashMap<String, Channel<Unit>>()
     private val paneScrollJobs = ConcurrentHashMap<String, Job>()
 
+    /**
+     * Each change to [pendingPaneScrolls] and [paneScrolls] occurs in this lock, together with the frame that
+     * shows the change. This makes sure that a frame with an older scroll position does not replace a frame with
+     * a newer position.
+     */
+    private val paneScrollLock = Any()
+
     private data class PendingPaneScroll(val paneId: String, val offsetFromBottom: Int)
 
     private fun sessionMutexFor(machineId: String): Mutex =
@@ -425,10 +432,12 @@ internal class RealHerdrSshClient(
         val resolvedSnapshotObj = snapshotObj ?: return@withContext false
         val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
         // A queued scroll position is newer than the snapshot, so a poll must not move the pane back.
-        paneScrolls[machine.id] = pendingPaneScrolls[machine.id]?.let { pending ->
-            val scroll = serverScrolls[pending.paneId] ?: PaneSurfaceScroll()
-            serverScrolls + (pending.paneId to scroll.copy(offsetFromBottom = pending.offsetFromBottom.toUInt()))
-        } ?: serverScrolls
+        synchronized(paneScrollLock) {
+            paneScrolls[machine.id] = pendingPaneScrolls[machine.id]?.let { pending ->
+                val scroll = serverScrolls[pending.paneId] ?: PaneSurfaceScroll()
+                serverScrolls + (pending.paneId to scroll.copy(offsetFromBottom = pending.offsetFromBottom.toUInt()))
+            } ?: serverScrolls
+        }
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
         val parsed = parseSnapshotObject(machine.id, resolvedSnapshotObj, sel)
@@ -1041,9 +1050,11 @@ internal class RealHerdrSshClient(
     ) {
         val maxOffset = paneScrolls[machine.id]?.get(paneId)?.maxScrollback?.toInt() ?: 0
         val target = if (maxOffset > 0) offsetFromBottom.coerceIn(0, maxOffset) else offsetFromBottom.coerceAtLeast(0)
-        pendingPaneScrolls[machine.id] = PendingPaneScroll(paneId, target)
-        setLocalPaneScrollOffset(machine.id, paneId, target)
-        republishCachedSurface(machine.id)
+        synchronized(paneScrollLock) {
+            pendingPaneScrolls[machine.id] = PendingPaneScroll(paneId, target)
+            setLocalPaneScrollOffset(machine.id, paneId, target)
+            republishCachedSurface(machine.id)
+        }
 
         val signal = paneScrollSignals.computeIfAbsent(machine.id) { Channel(Channel.CONFLATED) }
         paneScrollJobs.compute(machine.id) { _, job ->
@@ -1077,18 +1088,21 @@ internal class RealHerdrSshClient(
                     RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(scroll.paneId)),
                 ),
             )
-            // A newer request replaces this one. Keep the newer position on the screen.
-            if (pendingPaneScrolls[machine.id] == null) {
-                setLocalPaneScrollOffset(machine.id, scroll.paneId, scroll.offsetFromBottom)
-            }
             val paneAnsi = extractPaneAnsiFromResponse(out, scroll.paneId)
-            if (paneAnsi != null) {
-                updateFocusedPaneSurfaceFromInput(
-                    machineId = machine.id,
-                    paneId = scroll.paneId,
-                    paneAnsi = paneAnsi,
-                    confirmedSeq = 0L,
-                )
+            // In the lock, a new request cannot occur after the check or before the frame goes to the bus.
+            synchronized(paneScrollLock) {
+                // A newer request replaces this one. Keep the newer position on the screen.
+                if (pendingPaneScrolls[machine.id] == null) {
+                    setLocalPaneScrollOffset(machine.id, scroll.paneId, scroll.offsetFromBottom)
+                }
+                if (paneAnsi != null) {
+                    updateFocusedPaneSurfaceFromInput(
+                        machineId = machine.id,
+                        paneId = scroll.paneId,
+                        paneAnsi = paneAnsi,
+                        confirmedSeq = 0L,
+                    )
+                }
             }
         }.onFailure { err ->
             sshDebugLog.record(
