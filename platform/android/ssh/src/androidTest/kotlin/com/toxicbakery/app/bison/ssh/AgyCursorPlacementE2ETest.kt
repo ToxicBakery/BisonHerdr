@@ -83,6 +83,7 @@ class AgyCursorPlacementE2ETest {
                 semanticNotificationBus = SemanticNotificationBus(),
                 keystoreKeyManager = AndroidKeystoreKeyManager(),
                 knownHostsStore = knownHostsStore,
+                secretStore = InMemorySecretStore(),
             ),
             moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
             sshStateManager = stateManager,

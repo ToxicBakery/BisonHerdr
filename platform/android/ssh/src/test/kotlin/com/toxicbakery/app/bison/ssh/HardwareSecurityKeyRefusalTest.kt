@@ -64,6 +64,7 @@ class HardwareSecurityKeyRefusalTest {
                 semanticNotificationBus = SemanticNotificationBus(),
                 keystoreKeyManager = AndroidKeystoreKeyManager(),
                 knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+                secretStore = InMemorySecretStore(),
             )
             val machine = hardwareKeyMachine(port = listener.localPort)
 

@@ -34,7 +34,7 @@ class RealSshBackend internal constructor(
         semanticNotificationBus: SemanticNotificationBus,
         keystoreKeyManager: AndroidKeystoreKeyManager,
         knownHostsStore: KnownHostsStore,
-        secretStore: SecretStore? = null,
+        secretStore: SecretStore,
     ) : this(
         client = RealHerdrSshClient(
             sshDebugLog = sshDebugLog,

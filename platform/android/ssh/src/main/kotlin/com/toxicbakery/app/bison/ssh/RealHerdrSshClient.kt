@@ -96,8 +96,8 @@ internal class RealHerdrSshClient(
     private val semanticNotificationBus: SemanticNotificationBus,
     private val knownHostsStore: KnownHostsStore,
     private val keystoreKeyManagerProvider: () -> AndroidKeystoreKeyManager = { AndroidKeystoreKeyManager() },
-    /** Gives the passwords. When it is null, a [SecretRef] value gives a [MissingSecretException]. */
-    private val secretStore: SecretStore? = null,
+    /** Gives the passwords of the machines that keep a [SecretRef] value. */
+    private val secretStore: SecretStore,
     private val remoteBatchExecutor: (
         suspend (
             machine: HostMachine,
@@ -1493,7 +1493,7 @@ internal class RealHerdrSshClient(
             return value.encodeToByteArray()
         }
         val ref = SecretRef.parse(value) ?: throw MissingSecretException(machine.name)
-        return secretStore?.get(ref) ?: throw MissingSecretException(machine.name)
+        return secretStore.get(ref) ?: throw MissingSecretException(machine.name)
     }
 
     private fun workerMapFor(lane: WorkerLane): ConcurrentHashMap<String, PersistentShellWorker> =
