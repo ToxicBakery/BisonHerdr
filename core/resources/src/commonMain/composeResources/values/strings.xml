@@ -110,6 +110,11 @@
     <string name="machine_connecting_step_handshake">3. Verifying Mosh UDP SSP / Endpoint Gen 1 handshake&#8230;</string>
     <string name="machine_connecting_step_snapshot">4. Synchronizing Herdr workspace &amp; agent snapshot&#8230;</string>
 
+    <!-- User Authentication Prompt for an SSH Key that Requires a Biometric -->
+    <string name="user_auth_prompt_title">Unlock the SSH Key</string>
+    <string name="user_auth_prompt_subtitle">Connect to %1$s</string>
+    <string name="user_auth_prompt_description">The key %1$s needs your biometric or your screen lock before the app can use it to connect.</string>
+
     <!-- YubiKey / FIDO2 Hardware Security Key Prompt -->
     <string name="hardware_key_sheet_title">Security Key Verification Required</string>
     <string name="hardware_key_sheet_touch_usb">Touch the flashing contact on your USB-C YubiKey to sign the SSH challenge.</string>

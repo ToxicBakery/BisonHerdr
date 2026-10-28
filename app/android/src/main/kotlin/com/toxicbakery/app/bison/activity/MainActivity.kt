@@ -5,7 +5,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.ReportDrawn
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -20,7 +19,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.toxicbakery.app.bison.AppTheme
 import com.toxicbakery.app.bison.common.App
 import com.toxicbakery.app.bison.debug.DebugServer
@@ -36,7 +38,8 @@ import org.kodein.di.android.closestDI
 import org.kodein.di.compose.withDI
 import org.kodein.di.instance
 
-class MainActivity : ComponentActivity(), DIAware {
+/** A [FragmentActivity], because the `androidx.biometric` prompt needs one. */
+class MainActivity : FragmentActivity(), DIAware {
 
     override val di: DI by closestDI()
 
@@ -87,6 +90,14 @@ class MainActivity : ComponentActivity(), DIAware {
         // The app starts on the machine list, so this request comes before the first connect.
         if (savedInstanceState == null) {
             requestNotificationPermissionIfNeeded()
+        }
+
+        // Show the user authentication prompts of SSH keys only while this activity is started. In the
+        // background, a login with such a key stops at once and does not wait for the user.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                sshStateManager.hostUserAuthPrompts { prompt -> showUserAuthPrompt(prompt) }
+            }
         }
     }
 
