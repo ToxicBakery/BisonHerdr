@@ -1,14 +1,21 @@
 package com.toxicbakery.app.bison.activity
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.ReportDrawn
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
@@ -38,6 +45,12 @@ class MainActivity : ComponentActivity(), DIAware {
     private val sshStateManager: SshStateManager by instance()
     private val startedActivityCounter: StartedActivityCounter by instance()
 
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            log.d { "POST_NOTIFICATIONS granted: $granted" }
+        }
+    private var showNotificationRationale by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         enableEdgeToEdge()
@@ -56,8 +69,22 @@ class MainActivity : ComponentActivity(), DIAware {
                         )
                         ReportDrawn()
                     }
+                    if (showNotificationRationale) {
+                        NotificationPermissionRationale(
+                            onContinue = {
+                                showNotificationRationale = false
+                                launchNotificationPermissionRequest()
+                            },
+                            onDismiss = { showNotificationRationale = false },
+                        )
+                    }
                 }
             }
+        }
+
+        // The app starts on the machine list, so this request comes before the first connect.
+        if (savedInstanceState == null) {
+            requestNotificationPermissionIfNeeded()
         }
     }
 
@@ -109,6 +136,27 @@ class MainActivity : ComponentActivity(), DIAware {
             log.d { "Enabling FakeHerdrServer via EXTRA_FAKE_SERVER" }
             debugServer.enable()
         }
+    }
+
+    /**
+     * Asks for `POST_NOTIFICATIONS` on API 33 and later. When the user denied the permission one
+     * time, the activity first shows [NotificationPermissionRationale]. When the user denied it two
+     * times, Android shows no dialog.
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val permission = Manifest.permission.POST_NOTIFICATIONS
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) return
+        if (shouldShowRequestPermissionRationale(permission)) {
+            showNotificationRationale = true
+        } else {
+            notificationPermissionLauncher.launch(permission)
+        }
+    }
+
+    private fun launchNotificationPermissionRequest() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     private fun startSessionService() {

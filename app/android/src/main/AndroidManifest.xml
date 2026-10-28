@@ -4,7 +4,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.NFC" />
@@ -39,10 +38,10 @@
             android:name=".service.BisonSessionService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|specialUse">
+            android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Persistent SSH/Mosh terminal multiplexer session and coding agent monitor" />
+                android:value="Keeps SSH terminal sessions open in the background" />
         </service>
     </application>
 
