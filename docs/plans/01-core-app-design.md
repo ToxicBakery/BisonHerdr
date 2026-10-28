@@ -2,6 +2,8 @@
 
 This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for **BisonHerdr** (`com.toxicbakery.app.bison`), the native Android / Tablet client for Herdr.
 
+> **Status.** This document describes the target design. Some parts do not ship in this version. The Mosh UDP backbone (Part IV), the Rust JNI core, `russh`, and `libghostty-vt` rendering over JNI are planned. The SSH endpoint path over JSch is the only transport, and Compose draws the Herdr `PaneSurfaceFrame` cells. Item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) records this decision, and [issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work for Mosh. Section E of Part V also describes targets that do not work yet: encrypted credential storage (item 2), direct Tailscale hosts (item 4), biometric key unlock (item 6), keyboard-interactive prompts (item 8), and ProxyJump over a `direct-tcpip` channel (item 9). [Issue #20](https://github.com/ToxicBakery/BisonHerdr/issues/20) holds these items.
+
 ---
 
 ## Part I: Executive Summary & Problem Statement
@@ -391,7 +393,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet 
 ### 2. Touch-First Split & Viewport Gestures
 
 1. **Direct BSP Divider Dragging:**
-   - `PaneSurfaceFrame.splits` provides the exact cell `hit_rect` and binary tree `path: Vec<bool>` for every split divider. When running on the Mosh UDP backbone, `rust/herdr-mobile-core` derives the equivalent `PaneSurfaceSplit` list from `PaneLayoutSnapshot` (`pane.layout`), parsing `path: Vec<bool>` from `PaneLayoutSplit.id` (e.g., `"s0:root"`, `"s1:lr"`), computing the 1-cell divider `hit_rect` from `direction`, `ratio`, and subtree `rect`, and collapsing to the single focused pane when `zoomed == true`.
+   - `PaneSurfaceFrame.splits` provides the exact cell `hit_rect` and binary tree `path: Vec<bool>` for every split divider. On the planned Mosh UDP backbone, `deriveSplitsFromLayout` in `:core:protocol` (`PaneLayoutDerivation.kt`) derives the equivalent `PaneSurfaceSplit` list from `PaneLayoutSnapshot` (`pane.layout`), parsing `path: Vec<bool>` from `PaneLayoutSplit.id` (e.g., `"s0:root"`, `"s1:lr"`), computing the 1-cell divider `hit_rect` from `direction`, `ratio`, and subtree `rect`, and collapsing to the single focused pane when `zoomed == true`.
    - The Compose overlay inflates each divider's touch target to `24.dp`. Dragging renders a live preview splitter line and sends `layout.set_split_ratio` on release.
 2. **Double-Tap / Spread to Zoom a Pane:**
    - Double-tapping a pane header or performing a two-finger expand gesture inside a split pane invokes `pane.zoom { pane_id, mode: "toggle" }`, maximizing that pane across the full Zen Canvas.
@@ -435,6 +437,8 @@ All 18 color palettes from Herdr's `src/app/state.rs` (`Palette`) plus `OLED Pit
 
 ## Part IV: Mosh UDP Connection Backbone, Always-On Backgrounding & Roaming
 
+> **Status: planned.** This version does not include Mosh. The app always uses the SSH Endpoint path (`herdr remote-client-bridge`), and the parts of Part IV that apply to Mosh describe the target design only. The surface lease and the `NetworkCallback` fast-roam (Part I) are the answer to roaming in this version. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work and the acceptance list for a real Mosh path.
+
 ### 1. Mosh (`mosh-server` / UDP SSP) as the Primary Connection Backbone
 
 When `mosh-server` is available on the remote machine and UDP is reachable, **Mosh is used as the primary connection backbone**, paired with Herdr's Endpoint & API sideband (`herdr remote-client-bridge` + multiplexed SSH2 `herdr remote-api-bridge` exec channels) against **100% unmodified upstream Herdr servers**. When `mosh-server` is unavailable or UDP is blocked by a captive portal/firewall, the app automatically falls back to Herdr's SSH Endpoint Bridge (`herdr remote-client-bridge` with `surface_active: true`).
@@ -473,8 +477,8 @@ sequenceDiagram
 2. **Client-Side Predictive Echo on High-Latency Links:**
    - Mosh's SSP engine predicts printable typing and cursor movement locally on the tablet and underlines tentative predictions until acknowledged by the remote frame diff—eliminating typing lag on cellular or cross-continent connections.
 3. **Unified `PaneSurfaceFrame` Synthesis Against Unmodified `herdr` (`HERDR_CONFIG_PATH` + `pane.layout` Geometry):**
-   - When launched by the tablet under `mosh-server`, the bootstrap script passes `HERDR_CONFIG_PATH` pointing to an ephemeral tablet config (`onboarding = false`, `ui.sidebar_start_collapsed = true`, `ui.sidebar_collapsed_mode = "hidden"`, `ui.mobile_width_threshold = 0`, `ui.hide_tab_bar_when_single_tab = true`, `ui.tab_bar_position = "top"`, `ui.pane_borders = "off"`, `ui.pane_outer_borders = false`, `ui.pane_scrollbars = false`, `ui.pane_gaps = false`) so unmodified `herdr` hides its sidebar, mobile header, startup overlays, and inner ASCII box-drawing borders/scrollbars without altering the user's personal `~/.config/herdr/config.toml`. When `tab_count > 1`, `rust/herdr-mobile-core` requests `rows + 1` on the Mosh PTY and strips row `0` (the 1-row top tab bar) so 100% of the synthesized viewport is dedicated to pure pane cells, while Compose renders all borders, scrollbars, and split dividers natively at 120Hz.
-   - Inside `rust/herdr-mobile-core`, the Mosh SSP framebuffer is parsed through `libghostty-vt` and combined with the Control Sideband's `pane.layout` (`PaneLayoutSnapshot`) to emit a standard `PaneSurfaceFrame` onto `PaneSurfaceBus`. As a result, **the Compose Zen Canvas UI, split-divider dragging, and touch overlays work identically whether connected via Mosh UDP or the SSH Endpoint fallback.**
+   - When launched by the tablet under `mosh-server`, the bootstrap script passes `HERDR_CONFIG_PATH` pointing to an ephemeral tablet config (`onboarding = false`, `ui.sidebar_start_collapsed = true`, `ui.sidebar_collapsed_mode = "hidden"`, `ui.mobile_width_threshold = 0`, `ui.hide_tab_bar_when_single_tab = true`, `ui.tab_bar_position = "top"`, `ui.pane_borders = "off"`, `ui.pane_outer_borders = false`, `ui.pane_scrollbars = false`, `ui.pane_gaps = false`) so unmodified `herdr` hides its sidebar, mobile header, startup overlays, and inner ASCII box-drawing borders/scrollbars without altering the user's personal `~/.config/herdr/config.toml`. When `tab_count > 1`, the planned Mosh client requests `rows + 1` on the Mosh PTY and strips row `0` (the 1-row top tab bar) so 100% of the synthesized viewport is dedicated to pure pane cells, while Compose renders all borders, scrollbars, and split dividers natively at 120Hz.
+   - In the planned Mosh client, a VT emulator (for example `libghostty-vt`) parses the Mosh SSP framebuffer. The client combines the result with the Control Sideband's `pane.layout` (`PaneLayoutSnapshot`) to emit a standard `PaneSurfaceFrame` onto `PaneSurfaceBus`. The app does not have a VT emulator in this version. As a result, **the Compose Zen Canvas UI, split-divider dragging, and touch overlays work identically whether connected via Mosh UDP or the SSH Endpoint fallback.**
    - **Synchronized Workspace & Tab Focus in Mosh Mode:** Because each `herdr-client.sock` connection maintains its own independent `ClientShellLocation`, sending focus RPCs over a second `herdr-client.sock` connection would not switch `mosh-server`'s active tab. Instead, when Mosh UDP is active, all focus/navigation RPCs (`workspace.focus`, `tab.focus`, `pane.focus`, `agent.focus`, `workspace.create { focus: true }`, `tab.create { focus: true }`) are dispatched over `herdr remote-api-bridge` (`herdr.sock`), which triggers `focus_all_shell_clients_on_default_target()` on the unmodified Herdr server and immediately switches the Mosh `herdr` client's view.
    - By pairing the **Mosh UDP Backbone** with the **Herdr Control Sideband** (`herdr remote-client-bridge` + multiplexed SSH2 `herdr remote-api-bridge` exec channels), the tablet gets **both**:
      - **Mosh UDP Backbone:** Unbreakable terminal rendering, instant wake-from-sleep, and local predictive echo.
@@ -571,10 +575,10 @@ The Android/KMP client (**BisonHerdr**, package namespace `com.toxicbakery.app.b
 
 ### 1. Layered Module Graph & Directory Structure
 
-Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")`), the root of `/home/ian/workspace/herdr-tablet` hosts the Gradle multi-module project (`composite/`, `app/android/`, `core/*`, `platform/android/*`), the vendored `libghostty-vt` C/Zig library (`vendor/libghostty-vt`), and the standalone Rust JNI workspace (`rust/`):
+Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")`), the root of `/home/ian/workspace/herdr-tablet` hosts the Gradle multi-module project (`composite/`, `app/android/`, `core/*`, `platform/android/*`) and the standalone Rust reference workspace (`rust/`):
 
 - **App Target Strategy:** `:app:android` (`applicationId = "com.toxicbakery.app.bison"`, `minSdk = 31`, `compileSdk = 36`, `targetSdk = 36`, plus `:app:android:baseline`) is the sole `app/` target built right now, while **all `:core:*` modules use `kotlinMultiplatform` (`commonMain` / `commonTest`)** under `com.toxicbakery.app.bison.*` so the vast majority of the codebase remains 100% platform-agnostic and portable to Desktop, iOS, or Web later without refactoring.
-- **No Upstream `herdr` Submodule:** The temporary `herdr/` checkout used for protocol discovery is removed completely. All Rust crates in `rust/` are standalone Apache-2.0 crates owned by this repository that communicate with **unmodified upstream Herdr servers**.
+- **No Upstream `herdr` Submodule:** The temporary `herdr/` checkout used for protocol discovery is removed completely. The one Rust crate in `rust/` (`herdr-protocol`) is a standalone Apache-2.0 reference crate owned by this repository. It describes the wire types of **unmodified upstream Herdr servers**. Gradle does not build it, and the app does not use it.
 
 ```text
 /home/ian/workspace/herdr-tablet/
@@ -589,14 +593,10 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 │           ├── OptIn.kt              # Central configureOptIns() for KMP & Android modules
 │           ├── StringResource.kt
 │           └── Version.kt            # Calendar/Git-derived projectVersion & projectVersionCode()
-├── vendor/
-│   ├── libghostty-vt.vendor.json     # Vendored libghostty-vt version metadata
-│   └── libghostty-vt/                # Vendored Zig/C libghostty-vt VT parser source
-├── rust/
-│   ├── Cargo.toml                    # Standalone Rust workspace (ghostty-vt, herdr-protocol, herdr-mobile-core)
-│   ├── ghostty-vt/                   # Safe Rust bindings for vendor/libghostty-vt (with Android NDK zig targets)
-│   ├── herdr-protocol/               # Standalone pure protocol crate (Endpoint Gen 1, wire, surface_delta/reuse/scroll)
-│   └── herdr-mobile-core/            # Hybrid Rust JNI crate (russh + herdr-protocol + ghostty-vt + clean-room Mosh UDP SSP client)
+├── rust/                             # Reference only: Gradle does not build it, CI runs cargo test + clippy
+│   ├── Cargo.toml                    # Standalone Rust workspace (herdr-protocol)
+│   ├── README.md                     # Status of the workspace
+│   └── herdr-protocol/               # Reference crate for the Herdr wire types (Endpoint Gen 1, wire, surface_delta/reuse/scroll)
 ├── app/
 │   └── android/                      # Android app entry (Application, MainActivity, BisonSessionService)
 │       ├── baseline/                 # Android Baseline Profile generator (:app:android:baseline)
@@ -619,7 +619,7 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 │   ├── fake-server/                  # FakeHerdrServer behind DebugServer seam; debugImplementation only!
 │   ├── di/                           # Kodein DI root (coreDiModule -> sshCoreModule, storeModule, viewModelModule)
 │   ├── model/                        # @Serializable domain models (HostMachine, SshAuthMethod, ProxyJumpConfig, AppSettings, ...)
-│   ├── protocol/                     # KMP wrapper over rust/herdr-mobile-core (Endpoint Gen 1 JSON/Bincode & Surface Delta assembler)
+│   ├── protocol/                     # KMP Herdr protocol (Endpoint Gen 1 JSON/Bincode, Surface Delta assembler, pane.layout splits)
 │   ├── resources/                    # Compose Multiplatform resources (strings.xml, icons, JetBrains Mono NerdFont)
 │   ├── ssh/                          # KMP Transport abstractions: SshRequestManager, SshStateManager, MoshSessionEngine, HardwareKeySigner
 │   ├── store/                        # MachineStore, AppSettingsStore, StoreIOProvider, AppJson (atomic Mutex + kotlinx-io)
@@ -627,7 +627,7 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 └── platform/
     └── android/
         ├── di/                       # Android platformModule (imports sshModule)
-        ├── ssh/                      # Android MoshUdpEngine (JNI), SshTransportManager, Keystore, YubiKey/FIDO2 NFC+USB, ProxyJump
+        ├── ssh/                      # Android JSch SSH client, SshTransportManager, Keystore, ProxyJump, YubiKey/FIDO2 and Mosh (planned)
         └── store/                    # StoreIOProviderAndroid (Context file IO + ContentResolver)
 ```
 
@@ -957,17 +957,18 @@ data class ScreenKeyMachineConfigure(
 - `App.kt` hosts `NavDisplay` with `rememberNavBackStack`, `rememberSaveableStateHolderNavEntryDecorator()`, and `rememberViewModelStoreNavEntryDecorator()`.
 - Responsive tablet layout uses `fitsTwoPanes(maxWidth, maxHeight)` (`maxWidth > maxHeight && maxWidth >= 600.dp`) to automatically adapt between landscape multi-pane tablet mode and compact single-column mode.
 
-#### E. Hybrid Rust JNI Core, SSH Authentication Suite & Rendering Subsystems
+#### E. Protocol Core, SSH Authentication Suite & Rendering Subsystems
 
-1. **Hybrid Rust JNI Core (`rust/herdr-mobile-core` → `:core:protocol` & `:platform:android:ssh`):**
-   - Links **`russh` + `ssh-key`** (Apache-2.0 / MIT), the standalone **`rust/herdr-protocol`** crate (containing pure wire/endpoint/delta types `wire`, `endpoint`, `surface_delta`, `surface_reuse`, `surface_scroll`, plus `AgentStatus`, `WindowsKeyRecord`, `ToastHerdrPosition`, and `RgbColor`, with zero TUI or OS daemon dependencies), and **`rust/ghostty-vt`** (backed by `vendor/libghostty-vt` with Android NDK `aarch64-linux-android` / `x86_64-linux-android` target mappings in `build.rs`) to provide unified SSH2 channel multiplexing, zero-drift Endpoint Generation 1 handshake (`endpoint.hello.v1` / `endpoint.welcome.v1`), `ClientShellSnapshot` (`shell.snapshot.v1`), and stateful cell buffer reconstruction (`PaneSurfaceFrame` + `endpoint.surface-delta.v1` / `endpoint.surface-reuse.v1` / `endpoint.surface-scroll.v1`).
-   - Includes a **clean-room Apache-2.0 Mosh UDP SSP (`AES-128-OCB`, RFC 7253 + Protobuf `mosh.transport` / `mosh.host` / `mosh.user`) client engine** built exclusively with permissive Rust crates (`prost`, `aes`, `ocb3`, `flate2`—never linking or copying GPLv3 `mosh` code), complete with client-side predictive echo, instant source-IP roaming, and `PaneSurfaceFrame` synthesis from `libghostty-vt` + `pane.layout`.
+1. **Herdr Protocol Core (`:core:protocol`, Kotlin Multiplatform):**
+   - Implements the zero-drift Endpoint Generation 1 handshake (`endpoint.hello.v1` / `endpoint.welcome.v1`), `ClientShellSnapshot` (`shell.snapshot.v1`), and stateful cell buffer reconstruction (`PaneSurfaceFrame` + `endpoint.surface-delta.v1` / `endpoint.surface-reuse.v1` / `endpoint.surface-scroll.v1`) in pure Kotlin.
+   - The standalone **`rust/herdr-protocol`** crate is a tested reference for the same wire types (`wire`, `endpoint`, `surface_delta`, `surface_reuse`, `surface_scroll`, plus `AgentStatus`, `WindowsKeyRecord`, `ToastHerdrPosition`, and `RgbColor`, with zero TUI or OS daemon dependencies). Gradle does not build it, and the app does not link it.
+   - **Planned, not in this version:** a Rust JNI core with a **clean-room Apache-2.0 Mosh UDP SSP (`AES-128-OCB`, RFC 7253 + Protobuf `mosh.transport` / `mosh.host` / `mosh.user`) client engine**, client-side predictive echo, instant source-IP roaming, and `PaneSurfaceFrame` synthesis from a VT emulator (`libghostty-vt`) + `pane.layout`. It must use only permissive crates (never link or copy GPLv3 `mosh` code). [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work.
 
-2. **Full v1 SSH Authentication, ProxyJump & Hardware Key Suite (`:core:ssh` + `:platform:android:ssh` + `russh` JNI):**
-   - **Android Keystore Private Keys:** On-device generation and PEM/OpenSSH import of `Ed25519`, `RSA` (2048/4096), and `ECDSA` keys backed by hardware `AndroidKeyStore` (with optional biometric prompt unlock), invoked from `russh`'s custom `Signer` trait over JNI.
+2. **Full v1 SSH Authentication, ProxyJump & Hardware Key Suite (`:core:ssh` + `:platform:android:ssh` + JSch):**
+   - **Android Keystore Private Keys:** On-device generation and PEM/OpenSSH import of `Ed25519`, `RSA` (2048/4096), and `ECDSA` keys backed by hardware `AndroidKeyStore` (with optional biometric prompt unlock), invoked from a custom JSch `Identity` (`AndroidKeystoreJschIdentity`).
    - **Password & Key Passphrase Authentication:** Encrypted credential storage plus interactive keyboard-interactive / passphrase prompts.
-   - **Tailscale / WireGuard & SSH Jump Hosts (`ProxyJump`):** Direct connection over Tailscale `100.x.y.z` / MagicDNS hostnames, plus multi-hop SSH bastion tunneling (`ProxyJump` / `russh` `direct-tcpip` channel forwarding) for both the SSH bootstrap and Herdr Control Sideband.
-   - **Hardware Security Keys (YubiKey / FIDO2 over NFC & USB-C):** Supports OpenSSH FIDO2 resident and non-resident keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) and PIV smartcard authentication via Android NFC / USB CTAP2/PIV bridged into `russh`. When a hardware key signature is requested during SSH auth, `SshRequest.PromptHardwareKeyTouch` triggers a floating sheet prompting the user to tap or touch their YubiKey.
+   - **Tailscale / WireGuard & SSH Jump Hosts (`ProxyJump`):** Direct connection over Tailscale `100.x.y.z` / MagicDNS hostnames, plus multi-hop SSH bastion tunneling (`ProxyJump` over a JSch `direct-tcpip` channel) for both the SSH bootstrap and Herdr Control Sideband.
+   - **Hardware Security Keys (YubiKey / FIDO2 over NFC & USB-C, planned):** [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds the work for OpenSSH FIDO2 resident and non-resident keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) over Android NFC / USB CTAP2 with yubikit-android, bridged into JSch through a custom `Identity`. When a hardware key signature is requested during SSH auth, `SshRequest.PromptHardwareKeyTouch` triggers a floating sheet prompting the user to tap or touch their YubiKey.
 
 3. **Hardware-Accelerated Compose Terminal Canvas (`:core:common/.../terminal/`):**
    - Renders `FrameData` cells using pre-shaped monospace glyph atlases, truecolor RGB (`0x02_RR_GG_BB`), 256-color palette (`0x01_00_00_XX`), curly underlines, Kitty graphics placements (`SurfaceGraphicsAsset`), and interactive split-handle overlays.
@@ -978,11 +979,12 @@ data class ScreenKeyMachineConfigure(
 
 ### Phase 1: Standalone Rust Protocol & VT Crates (`vendor/libghostty-vt`, `rust/`), Remove Reference `herdr/` Checkout, & KMP Multi-Module Scaffold
 - Extract `vendor/libghostty-vt`, `rust/ghostty-vt` (with Android NDK `aarch64-linux-android` / `x86_64-linux-android` target mappings in `build.rs`), and the standalone pure `rust/herdr-protocol` crate into the root repository, then remove the temporary `herdr/` submodule and `.gitmodules`.
+- **Status:** done. Later, item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) deleted `vendor/libghostty-vt` and `rust/ghostty-vt`. Only `rust/herdr-protocol` stays, as a reference crate.
 - Scaffold the KMP Gradle root in `/home/ian/workspace/herdr-tablet` (`settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml`, and `composite/` build-logic plugin under `com.toxicbakery.app.bison`).
 - Scaffold KMP `:core:*` modules (`:core:model`, `:core:store` with `MachineStore` + `AppSettingsStore` defaulting to `Gruvbox Dark`, `:core:ssh`, `:core:protocol`, `:core:debug-server`, `:core:fake-server`, `:core:resources`, `:core:common`, `:core:di`) and Android modules (`:platform:android:store`, `:platform:android:ssh`, `:platform:android:di`, `:app:android`, `:app:android:baseline`).
 
 ### Phase 2: Hybrid Rust JNI Core (`rust/herdr-mobile-core`), Mosh UDP Backbone & SSH Auth Suite
-- Create `rust/herdr-mobile-core` exposing `russh` SSH2 channel multiplexing, Herdr's Endpoint Generation 1 `bincode` / `surface_delta` state machine, and the clean-room Apache-2.0 Mosh UDP SSP + `libghostty-vt` client over JNI.
+- **Rust JNI core: not started.** The prototype `rust/herdr-mobile-core` crate did not build and is deleted (item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md)). [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work. The target: a Rust JNI core exposing `russh` SSH2 channel multiplexing, Herdr's Endpoint Generation 1 `bincode` / `surface_delta` state machine, and the clean-room Apache-2.0 Mosh UDP SSP + `libghostty-vt` client over JNI.
 - Implement SSH bootstrap (`command -v mosh-server` + `mosh-server new -s -c 256 -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr` with `pane_borders = "off"`, `pane_outer_borders = false`, `pane_scrollbars = false`, `pane_gaps = false`), `MOSH CONNECT <port> <key>` parser, persistent `herdr remote-client-bridge` + multiplexed SSH2 `herdr remote-api-bridge` control sideband (routing Mosh focus RPCs via `herdr.sock`), automatic fallback to `herdr remote-client-bridge`, and the full SSH authentication suite (Android Keystore Ed25519/RSA/ECDSA, Password/Passphrase, Tailscale + `ProxyJump` bastion hopping, and YubiKey/FIDO2 NFC/USB signing).
 - Implement `BisonSessionService` (`ForegroundService` with `connectedDevice` + `specialUse`), `ConnectivityManager.NetworkCallback` roaming supervisor, and zero-bandwidth background parking (`Mosh Suspend` + `client_shell.surface.set` + `endpoint.presentation.ready.v1`).
 
@@ -995,5 +997,5 @@ data class ScreenKeyMachineConfigure(
 - Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste, and offline Mosh roaming queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
 
 ### Definition of Done (All Phases)
-- **Zero-Warning Builds:** Every Gradle/Kotlin and Cargo/Rust build (`./gradlew build`, `cargo build`, `cargo test`, `cargo clippy`) must complete **with zero warnings** and zero errors.
+- **Zero-Warning Builds:** Every Gradle/Kotlin build (`./gradlew build`) and the Cargo checks of `rust/herdr-protocol` (`cargo test -p herdr-protocol`, `cargo clippy -p herdr-protocol --all-targets -- -D warnings`) must complete **with zero warnings** and zero errors.
 - **Verified Commits on `main`:** Each completed phase or logical unit of work is verified and committed directly to `main` with a clean working tree.

@@ -15,9 +15,9 @@ It is designed around two core principles:
 Traditional SSH clients on Android drop connections when you switch apps to inspect a browser preview, lock the tablet, or walk from Wi-Fi to 5G. BisonHerdr eliminates connection fragility through a layered lifecycle and transport architecture:
 
 - **Android Foreground Service (`connectedDevice` / `specialUse`)**: Holds active transport sockets open inside a persistent `BisonSessionService` with live notification actions (*Approve Pending Agent*, *Disconnect All*) while you switch to browsers, docs, or other apps.
-- **Mosh UDP SSP Backbone + Zero-Traffic Background Suspend**: Uses Mosh's State Synchronization Protocol (`AES-128-OCB` over UDP) so packets stop flowing automatically when backgrounded, resuming and synchronizing to the latest terminal frame in a single UDP round-trip on wake.
+- **Mosh UDP SSP Backbone + Zero-Traffic Background Suspend (planned)**: This version does not include Mosh. The SSH endpoint path is the only transport. A later version will use Mosh's State Synchronization Protocol (`AES-128-OCB` over UDP). Then the app sends no packets in the background, and gets the latest terminal frame in one UDP round trip when it comes back. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) has the work for Mosh.
 - **Zero-Bandwidth Daemon Surface Lease**: When `ON_STOP` fires on the Herdr control channel, the client sends `client_shell.surface.set({ active: false })` to pause high-frequency terminal surface deltas while retaining the logical session lease, then restores the viewport and requests a fresh keyframe via `client_shell.surface.set({ active: true })` on `ON_START`.
-- **Sub-100ms Network Roaming (`ConnectivityManager.NetworkCallback`)**: Detects Wi-Fi ↔ cellular handoffs immediately, rebinds UDP sockets and triggers an SSP heartbeat to roam IP addresses seamlessly while re-establishing the Herdr control sideband in the background.
+- **Sub-100ms Network Roaming (`ConnectivityManager.NetworkCallback`, planned)**: In this version, a network change has no effect on the SSH session. A later version will detect Wi-Fi ↔ cellular handoffs immediately, and connect the SSH session and the Herdr control sideband again in the background. Items 10 and 11 of [issue #20](https://github.com/ToxicBakery/BisonHerdr/issues/20) hold this work. The UDP socket rebind and the SSP heartbeat need Mosh, which is also planned.
 
 ### 2. Primary Input: Touch-First Terminal Experience
 On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. BisonHerdr replaces tiny text-mode chrome with native, ergonomic touch controls:
@@ -26,7 +26,7 @@ On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-clas
 - **Split-Thumb Ergonomic Floating Clusters**: Docked at the bottom-left (`Esc`, `Ctrl`, `Alt`, `Tab`, `/`, `-`, `|`, `~`) and bottom-right (`↑`, `↓`, `←`, `→`, `Enter`, `PgUp`/`PgDn`, `Prompt`) corners—right under your thumbs when holding a tablet in landscape, leaving the center viewport unobstructed.
 - **Native Prompt & Command Composer**: A collapsible Material 3 bottom sheet supporting full Android IME features—voice dictation, swipe typing, spellcheck/autocorrect, multi-line editing, clipboard/screenshot attachment, and target selection (focused pane, specific agent, or broadcast)—dispatched atomically via Herdr's `agent.prompt` / `pane.send_input` RPCs.
 - **Direct BSP Touch Manipulation**: Drag pane dividers with snap points (25% / 33% / 50% / 67% / 75%), double-tap a divider to equalize splits, double-tap a pane header to zoom/unzoom (`pane.zoom`), and use two-finger swipe to switch workspaces.
-- **120Hz Native Compose Canvas + `libghostty-vt`**: Renders dirty terminal cells directly from shared `DirectByteBuffer` memory over JNI with box-drawing geometry, 24-bit TrueColor, and 19 curated themes (defaulting to **Gruvbox Dark**, plus an **OLED Pitch Black** battery-saver mode).
+- **120Hz Native Compose Canvas**: `TerminalSurfaceCanvas` draws the cells of each Herdr `PaneSurfaceFrame` in Compose, with box-drawing geometry, 24-bit TrueColor, and 19 curated themes. **Gruvbox Dark** is the default theme, and **OLED Pitch Black** is a battery-saver theme. A `libghostty-vt` VT parser over JNI is planned for the Mosh path.
 
 ---
 
@@ -34,19 +34,19 @@ On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-clas
 
 | Layer | Technology | Responsibility |
 | :--- | :--- | :--- |
-| **UI & Ergonomics** | Jetpack Compose + Material 3 Adaptive (`WindowSizeClass`) | 120Hz `PaneSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, command palette, multi-machine fleet drawer |
+| **UI & Ergonomics** | Jetpack Compose + Material 3 Adaptive (`WindowSizeClass`) | 120Hz `TerminalSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, command palette, multi-machine fleet drawer |
 | **Shared Client Logic** | Kotlin Multiplatform (`commonMain`) + Kodein DI | Unidirectional MVI state stores, session lifecycle orchestration, SSH host management, theme & keymap persistence |
-| **Native Terminal & Transport Core** | Rust (`rust/herdr-mobile-core`) + `libghostty-vt` via JNI | Clean-room Apache-2.0 Mosh UDP SSP client + Herdr `EndpointControl` (`rust/herdr-protocol`) delta decoder + SIMD-accelerated VT parser |
+| **Terminal & Transport Core** | Kotlin (`:core:protocol`, `:platform:android:ssh`) + [JSch](https://github.com/mwiede/jsch) | SSH transport over JSch + Herdr Endpoint Generation 1 models and `SurfaceDeltaAssembler` in `:core:protocol`. A Mosh UDP SSP client and a `libghostty-vt` VT parser are planned. |
 | **Remote Host Daemon** | [Herdr](https://github.com/herdrdev/herdr) (`remote-client-bridge` / `remote-api-bridge`) | Unmodified remote daemon providing persistent workspaces, BSP panes, PTY multiplexer, coding-agent status detection (`claude`, `codex`, `gemini`, `aider`, `opencode`), and JSON-RPC control plane |
 
-For the complete technical specification, transport state machine, JNI memory contract, and implementation roadmap, see the **[Core App Design Document](docs/plans/01-core-app-design.md)**.
+For the complete technical specification, transport state machine, and implementation roadmap, see the **[Core App Design Document](docs/plans/01-core-app-design.md)**.
 
 ---
 
 ## Repository Structure
 
 - [`docs/plans/01-core-app-design.md`](docs/plans/01-core-app-design.md) — Comprehensive architecture, UX, transport, and phased implementation plan.
-- `rust/` & `vendor/libghostty-vt/` — Standalone Apache-2.0 Rust protocol types (`herdr-protocol`), JNI Mosh/VT bridge (`herdr-mobile-core`), and vendored `libghostty-vt`.
+- [`rust/`](rust/README.md) — `herdr-protocol`, a standalone Apache-2.0 Rust reference crate for the Herdr wire types. Gradle does not build it, and the app does not use it.
 
 ---
 

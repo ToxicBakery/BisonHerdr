@@ -154,8 +154,6 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-          submodules: 'true'
-          lfs: 'true'
           ref: ${{ needs.preflight.outputs.ref }}
           # The build runs third-party Gradle plugins. Do not keep the token in .git/config.
           persist-credentials: false
