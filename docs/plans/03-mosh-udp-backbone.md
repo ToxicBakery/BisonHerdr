@@ -5,13 +5,13 @@ This plan gives the design and the delivery order for
 path. Each decision gives the evidence, the result, and the reasons.
 
 - Line references to this repository are at `e95a280`, which is `main` after pull requests #39 and #41.
-  `main` is now `2d7e2ac`, after #47 and #52. A line can have moved since `e95a280`.
+  `main` is now `f34ce59`, after #42, #43, #44, #47, and #52. A line can have moved since `e95a280`.
 - Line references to Herdr are at the tag
   [`v0.9.5`](https://github.com/herdrdev/herdr/tree/v0.9.5). A review found the cited facts the same in
   v0.9.0, v0.9.5, and the master branch.
 - The `mosh-server` version is 1.4.0.
 
-This is revision 5. Four review rounds, the decisions of the user, and pull request #52 changed it. The
+This is revision 6. Five review rounds, the decisions of the user, and pull request #52 changed it. The
 sections that start at [Changes after review round 1](#changes-after-review-round-1) list each change.
 
 ## Summary of decisions
@@ -27,7 +27,7 @@ sections that start at [Changes after review round 1](#changes-after-review-roun
 | 7 | Session policy | Short and polite. No `--takeover`. The app detaches a pane that leaves the screen, and all panes 3 minutes after it goes to the background. `MOSH_SERVER_NETWORK_TMOUT=900`. The UI shows the size lock. |
 | 8 | Tests | JVM tests against a real local `mosh-server`, and key tests against real Herdr 0.9.5 and 0.9.0 binaries, on Linux CI. |
 
-The plan has 15 pull requests and 39.5 engineer-days. An independent clean-room review before the last pull
+The plan has 15 pull requests and 40.5 engineer-days. An independent clean-room review before the last pull
 request adds about 1 day.
 
 **Status of the work.**
@@ -36,7 +36,10 @@ request adds about 1 day.
 |-------------------|--------|-------|
 | 2, `fix/herdr-session-name` | #47 (fixes #46) | Merged |
 | 4, `feat/mosh-wire` | #52 | Merged, with the real `mosh-server` tests on CI |
-| The SSH key name fix that pull request 3 needs | #49 (fixes #48 and #55) | In review. It also changes the SSH paste path (R7). |
+| The SSH key name fix that pull request 3 needs | #49 (fixes #48 and #55) | In review. It refuses a paste over the request limit on the SSH path (R7), and it no longer splits a paste. |
+| 5, `feat/mosh-ssp` | #60 | In review. It adds wire facts 23 to 29. |
+| 1, `chore/license-guard`, and 7, `feat/mosh-terminal` | none yet | In progress |
+| Target SDK 37, and `FeatureFlags` | #44, #43 | Merged |
 
 ## Decisions of the user
 
@@ -61,7 +64,8 @@ earlier choices of the user.
 | R4, SSH key name fix | Pull request #49 (issue #48). Pull request 3 depends on it. |
 | R5, SSH keys in a stall | An SSH key goes over Mosh in CSI form also while the lane is `Live`, in four stall cases (decision 5). |
 | R6, SSH keys in `NetworkSettle` | An SSH key goes over Mosh in CSI form and does not start a reconnect. |
-| R7, paste over the request limit | The app refuses it with a message, on the Mosh path and on the SSH path. Typed text can split into more raw-byte lines, in order. |
+| R7, paste over the request limit | The app refuses it with a message, on the Mosh path and on the SSH path. This applies to all machines, also SSH endpoint machines. #49 does this on the SSH path. Typed text can split into more raw-byte lines, in order. |
+| R8, SSH keys in `LossHold` | An SSH key goes over Mosh in CSI form and does not start a reconnect, as in `NetworkSettle`. Other SSH-only operations still start a reconnect. |
 
 ## Evidence
 
@@ -279,6 +283,8 @@ Then the next attach fails with "already has an attached client". Thus:
   `machineKey` is a hex hash of the machine ID.
 - Two scripts can change the file at the same time. Each script holds a lock on the file with `flock` when
   the host has it. Else it uses a lock directory, because `mkdir` is atomic.
+- The lock directory holds the PID of its script. A later script removes a lock with a dead PID, or a lock
+  that is older than 60 s. Thus a lost session cannot keep the lock.
 - Before each start for a terminal, the script stops the old PID of this install for that terminal.
 - On a full connect, the script stops all PIDs in the file.
 - Each stop by PID uses SIGKILL. The script then waits up to 6 s until the PID and its attach child exit.
@@ -292,8 +298,8 @@ steps:
 1. Send the first state with the size of the pane. Send it again each 250 ms. Wait for the first authentic
    reply for at most 3 s.
 2. Send the gate key `\n`.
-3. Wait 500 ms from the server acknowledgment of the state with the gate key. Join the soft-wrapped rows
-   of the screen before each text match.
+3. Wait 500 ms from the first host frame after the server acknowledgment of the state with the gate key.
+   Join the soft-wrapped rows of the screen before each text match.
 4. "already has an attached client": when the script stopped a PID of this install for this terminal, try
    again 3 times in 5 s. Else, or after these tries, stop the session. The pane uses the `pane.read` path and
    shows the mark "pane in use on another device". Do not try again until the pane leaves the screen. This
@@ -445,10 +451,10 @@ code.
 | 6 | `diff` | The diff |
 | 7 | `noise` | Random bytes with a random length |
 
-**Wire facts.** Each fact has a source. P is the [Mosh paper](https://mosh.org/mosh-paper.pdf) (USENIX ATC
-2012). B is a black-box test. M is the `mosh-server` banner and its man page. The prototype in `8cf8063` is
-not a source (see [Clean-room rules](#clean-room-rules)). Pull request #52 confirms facts 1 to 8 and adds
-facts 18 to 21.
+**Wire facts.** Each fact has a source. The sources are P (the [Mosh paper](https://mosh.org/mosh-paper.pdf),
+USENIX ATC 2012), B (a black-box test), and M (the `mosh-server` banner and its man page). The prototype in
+`8cf8063` is not a source (see [Clean-room rules](#clean-room-rules)). Pull request #52 confirms wire facts 1
+to 8 and adds facts 18 to 21. Pull request #60 adds facts 23 to 29.
 
 | # | Fact | Source |
 |---|------|--------|
@@ -474,19 +480,29 @@ facts 18 to 21.
 | 20 | The largest server datagram in the probes had 1,252 bytes, with 1,214 bytes of fragment content. | B (#52) |
 | 21 | `mosh-server` exits about 4 s after SIGTERM. | B (#52) |
 | 22 | When a user state changes the screen, the echo ack comes about 250 ms after the ack. When it does not, the ack and the echo ack come together, about 50 ms to 60 ms after the state arrives. The RTT values were 0, 50, 200, and 600 ms. The times (ack, echo ack) in ms with a change were (9, 259), (60, 310), (210, 460), and (610, 860). With no change, they were (60, 60), (110, 110), (260, 260), and (660, 660). | B (review) |
+| 23 | The timestamp reply is only in the first server datagram after a client timestamp. An idle heartbeat has none. | B (#60) |
+| 24 | The timestamp reply includes the hold time, except in the first reply of a session (an error of 6 ms to 22 ms). | B (#60) |
+| 25 | An idle server makes a new state about each 3 s. | B (#60) |
+| 26 | Detail of fact 17: the server makes each diff from its newest sent state. After a timeout, it makes the diff from the client acknowledgment, and its `keepState` is that acknowledgment. | B (#60) |
+| 27 | After the client acknowledges the end state, the server exits in about 0.2 s. Else it exits in about 4 s. | B (#60) |
+| 28 | When `MOSH_SERVER_NETWORK_TMOUT` ends, the server sends the end state and exits. | B (#60) |
+| 29 | The server joined a burst of 220 fragments (256 KiB). | B (#60) |
 
 **Values that this plan selects.** These values are not from Mosh. They are the choices of this client.
 
 | Value | Choice | Reason |
 |-------|--------|--------|
 | Maximum RTO | 1000 ms | A keystroke does not wait more than 1 s for a retransmission. |
+| RTO back-off | The RTO doubles after each resend, up to 1000 ms. A new RTT sample resets it. | #60 |
+| Before the first RTT sample | RTO 250 ms and frame interval 250 ms | #60 |
+| Data with no acknowledgment | At most 192 KiB of user data, with keys in parts of 16 KiB | #60. A paste of 128 KiB fits, and the server joins such a burst (wire fact 29). |
 | Maximum frame interval | 250 ms | The paper uses this value in its traces. |
 | New socket after silence | 10 s with no authentic datagram | A NAT can drop the old port entry. A new local port gets a new entry. |
 | UDP budget | 3 s, with a send each 250 ms | A cellular RTT can be more than 1 s under load. |
-| Received states kept | All states at or after the `keepState` of the server, at most 32 | The server can diff from a state that the client did not acknowledge (fact 17). |
+| Received states kept | All states at or after the `keepState` of the server, at most 32 | The server can diff from a state that the client did not acknowledge (wire fact 17). |
 | Client datagram size | At most 1,232 bytes, so a fragment holds at most 1,194 bytes of content | The UDP payload of the IPv6 minimum MTU (#52) |
-| Size limits | 1024 fragments, 8 MiB for the joined zlib stream, 8 MiB after zlib, and the parts of the 4 newest instruction IDs | A 300x150 truecolor paint used 474 fragments (fact 11). The highest IDs are the newest IDs (fact 18). Only an authentic packet gets to zlib. |
-| Receive buffer | 8 MiB asked, the given size logged, and a dedicated reader thread | The reader thread is the condition that the test showed (fact 11). The system can give less than 8 MiB. |
+| Size limits | 1024 fragments, 8 MiB for the joined zlib stream, 8 MiB after zlib, and the parts of the 4 newest instruction IDs | A 300x150 truecolor paint used 474 fragments (black-box fact 11). The highest IDs are the newest IDs (wire fact 18). Only an authentic packet gets to zlib. |
+| Receive buffer | 8 MiB asked, the given size logged, and a dedicated reader thread | The reader thread is the condition that the test showed (black-box fact 11). The system can give less than 8 MiB. |
 
 **Sender rules (client to server).** The user state is the list of the user events (keys and sizes). The
 state number increases by one for each sent state that adds events.
@@ -495,21 +511,25 @@ state number increases by one for each sent state that adds events.
    current state. The diff holds all events after `fromState`.
 2. The real-server test with loss must prove that each event reaches the pane one time.
 3. A heartbeat or an ack: `fromState` and `toState` are the newest state that the server acknowledged. The
-   diff field can be empty or absent (fact 19).
+   diff field can be empty or absent (wire fact 19).
 4. `keepState` is the newest state that the server acknowledged.
 5. Send again after the RTO while the server did not acknowledge the current state.
-6. Send a new user state at once when the last send is older than the frame interval. Else send it at the
-   end of the interval. The frame interval is SRTT / 2, in the range 20 ms to 250 ms.
+6. Send a new user state at once when the last new user state is older than the frame interval. Else send
+   it at the end of the interval. The frame interval is SRTT / 2, in the range 20 ms to 250 ms.
+7. `UserStream` gives the event count of each state. The input queue of pull request 8 and the
+   `NotConfirmed` count of pull request 11 use it.
 
 **Receiver rules (server to client).**
 
 1. Drop each datagram that does not decrypt. Do not log its content.
-2. Take the timestamp, the timestamp reply, and `ackState` from each authentic datagram. Do this also when
-   the client cannot apply the diff.
+2. Take `ackState` from each authentic datagram, also when the client cannot apply the diff. Take the
+   timestamp and the timestamp reply only from a datagram with a sequence number higher than all before.
 3. Apply the diff only when the client has `fromState` and does not have `toState`. Keep the new state.
 4. Remove the states before the `keepState` of the server.
 5. Acknowledge the newest state after the delayed ack interval, or at once with the next user state.
-6. Take an RTT sample from each timestamp reply that is less than 5 s old.
+   Acknowledge the end state at once, so that the server exits in about 0.2 s (wire fact 27).
+6. Take an RTT sample from each timestamp reply that is less than 5 s old. Send one timestamp reply for each
+   server timestamp (wire fact 23).
 
 ## Decision 5: Keys and input
 
@@ -536,17 +556,17 @@ pane (black-box fact 8).
 | SSH | Arrows, F1 to F12, with or without modifiers | `pane.send_keys` |
 | SSH | Shift+Tab, Shift+Enter, Ctrl+Enter, and each key with Alt, Super, or a Ctrl or Shift that is not in the Mosh rows | `pane.send_keys` |
 | SSH | Paste over 128 KiB | `pane.send_input` with the text and `keys: []`, on the single-shot path. Herdr wraps it as a paste when the pane turned on bracketed paste. |
-| Refused (R7) | A paste whose JSON request line is over 1,000,000 bytes, on the Mosh path and on the SSH path | The UI shows "The paste is too large". Herdr drops a line over 1,048,576 bytes with no error (fact 18). |
+| Refused (R7) | A paste whose JSON request line is over 1,000,000 bytes, on the Mosh path and on the SSH path | The UI shows "The paste is too large". Herdr drops a line over 1,048,576 bytes with no error (black-box fact 18). |
 
 **Paste rules.**
 
 - A Mosh paste of 128 KiB is about 110 fragments. That fits in the default receive buffer of
   `mosh-server` (212,992 bytes on Linux).
 - The app computes the size of the JSON request line after the JSON escape, before it sends a large paste.
-  A text with many escape characters can grow by more than 60 percent (fact 18).
+  A text with many escape characters can grow by more than 60 percent (black-box fact 18).
 - An empty reply of `remote-api-bridge` is a failure. The UI then shows that the paste did not arrive.
   Today an empty output counts as success, so the new path changes this.
-- Do not use `pane.send_text` for a paste. It sends raw bytes, so a shell runs each line (fact 17).
+- Do not use `pane.send_text` for a paste. It sends raw bytes, so a shell runs each line (black-box fact 17).
 - A large paste over SSH uses the single-shot path of the SSH key calls: no new worker, no one-shot channel,
   and no second send. Today `executeBatchOnLane` runs a failed batch again (`RealHerdrSshClient.kt:2449`,
   `2457`), so a lost reply can give two or three pastes.
@@ -554,14 +574,20 @@ pane (black-box fact 8).
   the line. A 1 MB line thus gets about 33 s. A passed deadline is a failure, and the app does not send again.
 - Typed text over the request limit goes out as more raw-byte lines, in order (#49). Only a paste is
   refused (R7).
+- When the large paste cannot go out, the app refuses it with "The paste did not arrive" and releases the
+  queue. These are the cases:
+  - The wait for the lock passes its deadline.
+  - The call fails before the write.
+  - The SSH lane is closed.
 
 **The `0x02` rule.** Outside a complete paste, the encoder doubles each `0x02` byte of a Mosh state, not
 only the byte of Ctrl+B. The attach client then sends one `0x02` to the pane, and `ESC 0x02 q` cannot
 detach (black-box fact 9). Inside a paste, the encoder does not double `0x02`.
 
 **Composer submit (R2).** A composer prompt or an inline reply to a Mosh pane goes out as two Mosh states.
-The first state is the paste. The second state is `\r`, 300 ms after the echo ack of the first state.
-When the paste changes the screen, the Enter thus goes about 1 RTT + 550 ms after the paste (fact 22).
+The first state is the paste. The second state is `\r`, 300 ms after the echo ack of the first state. The
+held `\r` is a queue item, and it holds all later input of the pane until it goes or the queue drops it.
+When the paste changes the screen, the Enter thus goes about 1 RTT + 550 ms after the paste (wire fact 22).
 Herdr waits 300 ms in `agent.prompt` for the same reason (Herdr issue #1878).
 
 The current SSH path sends the text and the Enter key in one `pane.send_input` call. A separate fix for
@@ -581,9 +607,9 @@ The current SSH path sends the text and the Enter key in one `pane.send_input` c
 **Order barrier.** One ordered input queue for each pane holds both classes. `S` is the user state number
 of the last Mosh byte in the queue.
 
-1. A Mosh key goes into the Mosh user stream at once. The condition: no SSH key of the pane is in the
-   queue or in flight.
-2. Before an SSH key, the queue waits for an echo ack of `S` or higher (fact 15).
+1. A Mosh key goes into the Mosh user stream at once. The condition: no SSH key, held composer Enter, or
+   detach of the pane is in the queue or in flight.
+2. Before an SSH key, the queue waits for an echo ack of `S` or higher (wire fact 15).
 3. When the state `S` ends with a lone ESC or holds a paste, the queue waits 200 ms more after the echo
    ack. The attach client holds a lone ESC for 150 ms, and it holds a paste until its end marker.
 4. Sometimes the server acknowledges `S`, but no echo ack comes in 1 s from the arrival of that
@@ -594,7 +620,8 @@ of the last Mosh byte in the queue.
    over Mosh in CSI form.
 7. The queue merges only SSH keys that are next to each other in the queue into one `pane.send_keys` call.
    "Up, x, Down" stays three steps.
-8. Later Mosh keys stay in the queue until the call ends (see the call rules).
+8. Later Mosh keys stay in the queue until the call ends (see the call rules), or until the queue refuses
+   a paste.
 9. For a pane with a Mosh session, no `pane.read` follows the call. The Mosh screen shows the result.
 
 **SSH key calls.** A failed batch on a lane runs again today (`RealHerdrSshClient.kt:2449`, `2457`), so a
@@ -607,10 +634,12 @@ key can go out two or three times. An SSH key call thus has its own path:
 - A call that fails before the write, for example with `SessionUnavailableException`, also sends its keys
   in CSI form. The queue never drops them.
 - After the write: the deadline is 1 s plus the Mosh SRTT, from the time of the write. At the deadline, the
-  queue closes the input worker, so that the blocked `readLine()` ends (`RealHerdrSshClient.kt:2495`). It
-  starts the liveness check of the control lane.
-- The queue never sends a written call again, because it can have reached Herdr. The user sees the result
-  on the Mosh screen and can press the key again.
+  queue closes the input worker, so that the blocked `readLine()` ends (`RealHerdrSshClient.kt:2495`). In
+  `Live`, it also starts the liveness check of the control lane. In the other states, the state table
+  decides the check, and the deadline starts no reconnect.
+- When no reply came, the queue never sends the written call again, because it can have reached Herdr. The
+  user sees the result on the Mosh screen and can press the key again.
+- An error reply, for example `invalid_key`, had no effect. Its keys go over Mosh in CSI form.
 - Until the liveness check passes, the queue sends SSH keys over Mosh in CSI form.
 
 **CSI form while the lane is `Live` (R5).** An SSH key goes over Mosh in CSI form in four stall cases:
@@ -623,16 +652,15 @@ key can go out two or three times. An SSH key call thus has its own path:
 **SSH lane closed.** The SSH lane is closed when the supervisor is not in `Live` (decision 6). Then an SSH
 key goes over Mosh at once, in the xterm form for a terminal with no special modes. Examples: `CSI A` for
 Up, `CSI 1;5C` for Ctrl+Right, `CSI 15~` for F5, `CSI Z` for Shift+Tab, and `ESC x` for Alt+x. This is a
-best effort: a curses program in keypad mode does not read `CSI A` as an arrow. In `Dormant` and
-`LossHold`, the key also starts a reconnect. In `NetworkSettle` (R6), `NeedsLogin`, and `Failed`, it does
-not.
+best effort: a curses program in keypad mode does not read `CSI A` as an arrow. In `Dormant`, the key also
+starts a reconnect. In `LossHold` (R8), `NetworkSettle` (R6), `NeedsLogin`, and `Failed`, it does not.
 
 **Latency cost.** RTT is the round trip time, and H is the run time of the Herdr command on the host.
 
 | Case | Added delay |
 |------|-------------|
 | SSH key with no recent Mosh key | 1 RTT + H, the same as the SSH path today |
-| SSH key just after a Mosh key that changed the screen | Up to 1 RTT + 260 ms for the echo ack (fact 22), then 1 RTT + H |
+| SSH key just after a Mosh key that changed the screen | Up to 1 RTT + 260 ms for the echo ack (wire fact 22), then 1 RTT + H |
 | SSH key just after a Mosh key that did not change the screen | Up to 1 RTT + 60 ms, then 1 RTT + H |
 | SSH key just after a lone Esc or a paste | 200 ms more (D3) |
 | Mosh key just after an SSH key | The rest of the SSH call, then 0.5 RTT |
@@ -665,11 +693,16 @@ arrived. The pane shows the mark "N keys were not confirmed".
 - When the pane falls back to `pane.read`, the queue sends the held input over SSH in order, in the forms
   of #49.
 - At a D4 switch, queued input that never went to Mosh goes over SSH in order. It cannot be a duplicate.
+- All held input that goes over SSH uses the single-shot path, with no retry.
 - When no echo ack of the composer paste comes in 1 s from the server acknowledgment, the Enter goes 300 ms
   later. The Enter never goes before the server acknowledged the paste state.
-- A composer prompt over 128 KiB: the paste goes over SSH `pane.send_input`, and the Enter goes over Mosh
-  300 ms after the call returns.
-- The detach bytes `0x02 q` skip the `0x02` rule.
+- At a D4 switch, a fallback to `pane.read`, or a session end, the server can still lack the paste state.
+  Then the queue drops the held `\r` and counts it in `NotConfirmed`. The UI shows "The prompt was not
+  sent". A lone Enter can approve a permission prompt of an agent, so it must not go out.
+- A composer prompt over 128 KiB: the paste goes over SSH `pane.send_input`. The Enter goes over Mosh
+  300 ms after a success reply, and not after a failure.
+- The detach is a queue item. Its bytes `0x02 q` skip the `0x02` rule and go in a state of their own. Later
+  input waits for the end state, and then goes out as for a pane with no Mosh session.
 - An accepted risk: after the deadline of a written call, a later Mosh key can arrive before the late SSH
   key.
 
@@ -688,8 +721,9 @@ arrived. The pane shows the mark "N keys were not confirmed".
 6. Run the start script for these panes. Parse the port, the key, and the PID of each pane.
 7. Open a `MoshConnection` for each pane to the IP address of the SSH socket peer, not to a new DNS result.
 8. Do the attach check of decision 1 for each session.
-9. Return `ActiveBackbone.MoshUdp` when the focused pane passes the check. The `rttMs` is the first
-   measured RTT. A pane that fails the check uses the `pane.read` path with its mark.
+9. Return `ActiveBackbone.MoshUdp` when at least one pane passes the check. The `rttMs` is the first
+   measured RTT. A pane that fails the check uses the `pane.read` path with its mark, also the focused pane.
+   When UDP works but no pane passes, return `SshEndpoint` with the reason "Mosh attach failed".
 10. When no session gets an authentic reply in 3 s, stop the servers by PID over SSH. Store the UDP failure
     for this network. Return `SshEndpoint` with the reason "No UDP reply from `<ip>:<port>` in 3 s. The
     network can block UDP."
@@ -702,7 +736,8 @@ exit about 60 s after their start with no client, also when the stop by PID fail
 `ActiveBackbone.MoshUdp` gets `sessionCount`, with a default value so that old JSON still loads. A new
 `MoshMachineState` in `SshStateManager` holds the state of the control lane: `Open`, `Offline`,
 `NeedsLogin`, or `Stopped`. It also holds a mark for each pane: `Mosh`, `InUseElsewhere`, `OverLimit`,
-`UdpBlocked`, `Failed`, or `NotConfirmed`.
+`UdpBlocked`, `Failed`, or `NotConfirmed`. It also holds the time of the last authentic reply of each
+session, for the contact text of the UI.
 
 **Lifecycle of a session.**
 
@@ -729,8 +764,11 @@ exit about 60 s after their start with no client, also when the stop by PID fail
 - The 3 s window starts at the first datagram that the client sends from the new socket.
 - The engine never acts on a parked session. In the background, all sessions are parked and send nothing,
   so the rule cannot act there.
-- The engine acts at the first time that two conditions are true. No authentic reply came in the window,
-  and the SSH lane is `Live`.
+- The engine acts at the first time that two conditions are true. No authentic reply came in the window.
+  The SSH lane is `Live`, and a liveness check or a connect passed after the change.
+- Before it marks `UdpBlocked`, the engine checks the server PIDs with `ps -p`. A dead PID gives the restart
+  rule, not D4.
+- When the stop by PID fails, the engine repeats it at the next `Live`.
 - In the foreground, the lane comes back to `Live` only after the 5 s settle and the liveness check, so the
   rule acts then.
 
@@ -779,7 +817,7 @@ is `Stopped`. All other states are `Offline`, and `Failed` also shows its cause.
 | State | The supervisor | Next state |
 |-------|----------------|------------|
 | `Live` | The SSH session is open. The control poll runs. | On a session close: `LossHold` in the foreground, `Dormant` in the background. `NetworkSettle` on a network change in the foreground. |
-| `LossHold` | The session closed in the foreground. A 2 s timer runs (D2). | `NetworkSettle` on a network event. `Reconnecting` when the timer ends or on a trigger. `Dormant` when the app goes to the background. |
+| `LossHold` | The session closed in the foreground. A 2 s timer runs (D2). | `NetworkSettle` on a network event. `Reconnecting` when the timer ends or on a trigger other than an SSH key (R8). `Dormant` when the app goes to the background. |
 | `Dormant` | No session and no attempt. The control poll pauses. The UI shows "control lane offline", and the agent status shows as old. | `Reconnecting` on a trigger. `NetworkSettle` on a network change in the foreground. |
 | `NetworkSettle` | The app is in the foreground, and the default network changed. A 5 s timer runs. A session close does nothing in this state. | A new timer on each new network change, up to 15 s in all. When the timer ends: a liveness check when the session is open, or `Reconnecting` when it is closed. `Reconnecting` at once on a trigger other than an SSH key (R6). When the app goes to the background: `Live` when the session is open, else `Dormant`. `Dormant` when the network is lost. |
 | `Reconnecting` | The current loop of attempts with the current delays, through the control-lane login | `Live` on success. `NetworkSettle` on a network change in the foreground. A cause class below on a failure that is not a network error. `Dormant` when the app is in the background and no SSH-only operation waits. |
@@ -794,7 +832,7 @@ is `Stopped`. All other states are `Offline`, and `Failed` also shows its cause.
 - These triggers start a reconnect from `Dormant`, `LossHold`, and `NetworkSettle`:
   - An RPC through `sendEndpointCommand` that is not input to or a scroll of a Mosh pane.
   - A prompt to a named agent in a pane with no Mosh session.
-  - An SSH key, but not in `NetworkSettle` (R6).
+  - An SSH key, only in `Dormant` (R6, R8).
   - The start of a Mosh session for a new pane on the screen.
   - A pane with no Mosh session that comes on the screen and needs `pane.read`.
   - A tap on the mark, or the move of the app to the foreground.
@@ -846,7 +884,7 @@ queues a prompt to a named agent when the control lane is not `Open`. A prompt t
 Mosh.
 
 **Background.** `setSurfaceLease(active = false)` parks the sessions. A parked session sends nothing, and
-the server stops after about 40 s (fact 12). `client_shell.surface.set` has no effect on this path,
+the server stops after about 40 s (wire fact 12). `client_shell.surface.set` has no effect on this path,
 because the tablet has no thin client.
 
 **Wake of a parked session.** A new user state on a parked session wakes it. The session opens a socket on
@@ -854,6 +892,18 @@ the current network and sends the state until the server acknowledges it. It wai
 the input rules need it, and then it parks again. A notification action or an inline reply thus reaches the
 pane in the background, with no login and a few datagrams. The other choice, SSH while parked, needs the
 control lane, and a login in the background can stop it.
+
+Limits of the wake:
+
+- During a wake, the session stays parked for D4 and for the restart rule.
+- When the server gives no acknowledgment in 10 s, the input is `NotConfirmed`. The notification then
+  shows "Open the app to answer".
+- With no network, the wake waits for `onAvailable` within the same 10 s.
+
+**Long background.** In CPU sleep, the 3-minute detach can fire hours late, and a server exits after 900 s
+of silence. At each move to the foreground, the engine reads the background time with
+`SystemClock.elapsedRealtime()`. When the time is 3 minutes or more, the engine does not unpark. It stops
+the servers by PID and starts new sessions.
 
 **Detach.** After 3 minutes in the background, the engine detaches each session over Mosh. The attach
 client exits, Herdr removes the size lock, and `mosh-server` ends. A session with no reply ends after
@@ -865,17 +915,14 @@ reconnects SSH and starts new sessions.
 Mosh UDP socket. When the permission is denied, the engine returns `SshEndpoint` with the reason "Local
 network access is off".
 
-**Feature flag.** The flag has two cases:
+**Feature flag.** Pull request #43 added `FeatureFlags` in `:core:model`. A Gradle property sets each
+field, and a release build with the property stops (`checkReleaseFeatureFlags`).
 
-- Pull request #43 adds `FeatureFlags` in `:core:model`. A Gradle property sets each field, and a release
-  build with the property stops. When #43 merges first, add the field `moshTransport` to `FeatureFlags`,
-  with the Gradle property `bison.moshTransport`.
-- When #43 does not merge first, add `MoshFeatureFlag(enabled: Boolean)` with the same Gradle property and
-  the same release check. When #43 merges later, move the flag into `FeatureFlags`.
+- Add the field `moshTransport` to `FeatureFlags`, with the Gradle property `bison.moshTransport`.
 - With the flag off, the code path is the code path of today. The tests construct the backend with the flag
   on.
-- The last pull request turns the flag on in release, removes its release check, and enables the
-  `MoshOnly` choice (`ConfigureMachineScreen.kt:264`).
+- The last pull request turns the flag on in release and removes its release check. Pull request 14 shows
+  the `MoshOnly` choice (`ConfigureMachineScreen.kt:264`) when the flag is on.
 
 ## Decision 7: Tests and CI
 
@@ -912,7 +959,7 @@ processes at the end. The server picks a free port. The tests:
 7. End of session: `exit` in the shell gives the end state.
 8. Emulator oracle: run a seeded generator of random output in two sessions. Client A acknowledges each
    state. Client B never acknowledges a host state. B keeps all received states, because the server can
-   diff from a state that B did not acknowledge (fact 17). The final screens of A and B must be equal.
+   diff from a state that B did not acknowledge (wire fact 17). The final screens of A and B must be equal.
 9. Width probe: a program in `mosh-server` writes each test code point and asks for the cursor position
    (`CSI 6n`). The program prints the width that the server gives, and the test compares it with
    `CellWidth`. The sample has U+00AD, U+200B, U+200D, U+0301, U+20DD, U+FE0F, U+1160, U+11A8, U+D7B0,
@@ -947,13 +994,14 @@ rule of one attach client for each terminal, so the real Herdr tests cover that 
 | 7 | The bastion route and an old Herdr version give the reasons. | 10 |
 | 8 | Lifecycle: a pane leaves the screen, and its session detaches after 15 s. A session ends while its pane is on the screen, and it starts again. A stale server of this install for the same terminal stops before the start. | 11 |
 | 9 | A dead server: SIGKILL of `mosh-server` while its pane is on the screen. The engine starts a new server after the silence rule. After two failed starts, the pane uses `pane.read` with the reason. | 11 |
-| 10 | UDP loss after a network change, with the lease on: a relay drops all datagrams after the change. 3 s after the first datagram from the new socket, the panes use `pane.read` with the `UdpBlocked` mark, and the servers stop. A key with no acknowledgment gives `NotConfirmed`. Queued keys that never went to Mosh arrive over SSH in order. | 11, and again in 13 with the settle |
+| 10 | UDP loss after a network change, with the lease on: a relay drops all datagrams after the change. 3 s after the first datagram from the new socket, the panes use `pane.read` with the `UdpBlocked` mark, and the servers stop. A key with no acknowledgment gives `NotConfirmed`. A dead server PID gives the restart rule, not D4. | 11, and again in 13 with the settle |
 | 11 | Background: no datagram goes out while parked, except for a wake by a new user state. After 3 minutes (virtual time), the engine sends the detach, and the fake attach exits. `ServiceStopPolicy` then counts the machine as not active. | 11 |
 | 12 | The network change tests (see below). | 13 |
 | 13 | Cause classes: a `TimeBound` key and a closed SSH session. In the background, no prompt shows, and the Mosh session continues. In the foreground, the control-lane login asks for the prompt, and `negotiateBackbone` does not run again. A declined prompt does not come back at the next arrow key. A changed host key gives `Stopped`. No stored password gives `NeedsLogin`. | 13 |
-| 14 | A network change in the background with a `Live` lane gives no D4. The unpark gives a reply and no D4. | 11 |
-| 15 | With the lease off, a notification Enter reaches the pane within 3 s, through a wake of the parked session. An inline reply arrives as a paste and then Enter. | 12 |
-| 16 | Input while a session starts again, and before the attach check passes, arrives in order after the attach. When the pane falls back to `pane.read`, it arrives over SSH in order. | 12 |
+| 14 | A network change in the background with a `Live` lane gives no D4. The unpark gives a reply and no D4. The test then keeps the app in the background for 3 minutes or more (virtual time). At the move to the foreground, the engine stops the servers and starts new sessions, with no D4. | 11 |
+| 15 | With the lease off, a notification Enter reaches the pane within 3 s, through a wake of the parked session. An inline reply arrives as a paste and then Enter. With no acknowledgment in 10 s, the input is `NotConfirmed`, and the notification shows "Open the app to answer". With no network, the wake waits for `onAvailable` within the 10 s. | 12 |
+| 16 | Input while a session starts again, and before the attach check passes, arrives in order after the attach. When the pane falls back to `pane.read`, it arrives over SSH in order. At a D4 switch, queued keys that never went to Mosh arrive over SSH in order, on the single-shot path. | 12 |
+| 17 | A key typed during the wait for the composer Enter arrives after the Enter. The server can lack the paste state at a D4 switch, a fallback, and a session end. In each case, the queue drops the Enter and shows "The prompt was not sent". Input after a detach waits for the end state. | 12 |
 
 **The network change tests.** A localhost test with no change of path proves nothing, so the tests change
 the path. The SSH session goes through a local TCP relay, and the Mosh datagrams go through a local UDP
@@ -1097,7 +1145,8 @@ commit (`4792096`) added it, with no record of its sources. Its comments use the
 **Process.**
 
 - The wire facts table of decision 4 is the specification. Each pull request that adds a protocol fact
-  adds it to that table with its source. Pull request #52 found facts 18 to 21, and this revision adds them.
+  adds it to that table with its source. Pull requests #52 and #60 found wire facts 18 to 21 and 23 to
+  29, and the table has them.
 - A fact with no public source must have a black-box test before the code uses it.
 - Each pull request description has the line "No GPL Mosh source was read or copied for this change."
 - Pull request 1 adds a license check that stops the build on a dependency without an allowed license.
@@ -1174,10 +1223,10 @@ flowchart LR
 
 | # | Risk | Effect | Mitigation |
 |---|------|--------|------------|
-| 1 | The width table and the libc of a host do not agree | A cell moves until the next full paint | Width rules from fact 13. Width probe on CI. "Refresh pane". |
+| 1 | The width table and the libc of a host do not agree | A cell moves until the next full paint | Width rules from black-box fact 13. Width probe on CI. "Refresh pane". |
 | 2 | An emulator rule differs from the server rule | A wrong screen until the next full paint | Emulator oracle test. "Refresh pane". |
 | 3 | Known limits 1 to 3 of decision 5 | A program can read a different key, or PageUp scrolls the scrollback | Tests on a real Herdr document the behavior. |
-| 4 | The order barrier adds delay | An SSH key after text waits up to 1 RTT + 50 ms, and 200 ms more after a lone Esc | The latency table. Only mixed sequences pay it. |
+| 4 | The order barrier adds delay | An SSH key after text waits up to 1 RTT + 260 ms, and 200 ms more after a lone Esc | The latency table. Only mixed sequences pay it. |
 | 5 | An SSH key call hangs on a dead path | Input stalls | The call path with no retry, the two deadlines, and the CSI form over Mosh |
 | 6 | A desktop client sees the pane at the tablet size | The desktop layout looks wrong | The UI shows the lock. Detach a hidden pane after 15 s and all panes after 3 minutes in the background. No `--takeover`. |
 | 7 | A `mosh-server` stays on the host | Processes and ports on the host | 60 s exit with no client, `MOSH_SERVER_NETWORK_TMOUT=900`, the detach, and the locked PID file with the `ps` check |
@@ -1188,7 +1237,7 @@ flowchart LR
 | 12 | `Network.bindSocket` with the UDP socket does not work on a device | The socket uses the old network | A plain `DatagramSocket`. The device test card checks it. |
 | 13 | Licensee does not work with AGP 9.4.1 or 9.5.0, or it does not know the license names of JSch ("Revised BSD", ISC) | Pull request 1 fails or warns | Pull request 1 checks both. Fallback: a script that reads the POM licenses. |
 | 14 | R8 removes a class that the Mosh path needs | A release build fails at run time | The device test card runs a minified release build. |
-| 15 | The 3-minute detach fires late in CPU sleep | The size lock stays longer | The 900 s server timeout bounds it. The device test card checks it. |
+| 15 | The 3-minute detach fires late in CPU sleep | The size lock stays longer, and the servers can die in the background | The long background rule of decision 6. The 900 s server timeout bounds the lock. The device test card checks it. |
 | 16 | The host sets `ui.mouse_scroll_lines` to a value other than 3 | A scroll moves a different count of lines | The next snapshot corrects the scroll state of the app. |
 
 ## Order of pull requests
@@ -1199,21 +1248,21 @@ green with zero warnings. Until pull request 15, the flag keeps Mosh off in rele
 
 | Order | Branch | Scope | Size | Depends on |
 |-------|--------|-------|------|------------|
-| 1 | `chore/license-guard` | License check for all dependencies | 1 day | none |
+| 1 | `chore/license-guard` (in progress) | License check for all dependencies | 1 day | none |
 | 2 | `fix/herdr-session-name` (#47, merged) | The control lane passes `--session` | 0.5 day | none |
 | 3 | `refactor/key-events` | Larger key model, chords as key events | 1 day | #49 |
 | 4 | `feat/mosh-wire` (#52, merged) | `:core:mosh` module, wire format, crypto, first real-server tests | 2 days | none |
-| 5 | `feat/mosh-ssp` | SSP state machine, timers, RTT | 3 days | 4 |
+| 5 | `feat/mosh-ssp` (#60) | SSP state machine, timers, RTT | 3 days | 4 |
 | 6 | `feat/mosh-connection` | UDP port with a reader thread, connection loop, recovery resize, real-server tests | 3 days | 5 |
-| 7 | `feat/mosh-terminal` | Kotlin emulator, width rules, screen state | 2.5 days | 4 |
+| 7 | `feat/mosh-terminal` (in progress) | Kotlin emulator, width rules, screen state | 2.5 days | 4 |
 | 8 | `feat/mosh-surface-input` | Composer, layout scale, key classes, encoders, order queue, real-server tests 8 to 10 | 3.5 days | 3, 6, 7 |
 | 9 | `feat/mosh-bootstrap` | Start script, gate, attach check, locked PID file, stop by PID with the wait | 3.5 days | 2, 6, 7 |
 | 10 | `feat/mosh-engine` | Engine, `negotiateBackbone`, frames, shown machine, RTT, flag | 3.5 days | 8, 9 |
-| 11 | `feat/mosh-engine-lifecycle` | Lifecycle, restart rule, D4 window, wake of a parked session, `Network`, detach, connected state | 3.5 days | 10 |
-| 12 | `feat/mosh-hybrid-keys` | Barrier with SSH keys, the single-shot path, paste, composer, input during transitions, other input paths, real Herdr tests | 4.5 days | 10 |
+| 11 | `feat/mosh-engine-lifecycle` | Lifecycle, restart rule, D4 window and checks, wake of a parked session with its limits, long background, `Network`, detach, connected state | 4 days | 10 |
+| 12 | `feat/mosh-hybrid-keys` | Barrier with SSH keys, the single-shot path, paste, composer item, detach item, input during transitions, other input paths, real Herdr tests | 5 days | 11 |
 | 13 | `feat/mosh-lazy-control` | Supervisor states, cause classes, control-lane login, settle | 4.5 days | 11, 12 |
 | 14 | `feat/mosh-ui` | RTT and contact text, marks, size lock, "Refresh pane" | 2 days | 10 |
-| 15 | `feat/mosh-enable` | Flag on, documents, device test card, clean-room record | 1.5 days | 12, 13, 14, the independent review, and #44 when it merges first |
+| 15 | `feat/mosh-enable` | Flag on, documents, device test card, clean-room record | 1.5 days | 12, 13, 14, and the independent review |
 
 **Lanes that can run in parallel.**
 
@@ -1222,10 +1271,11 @@ green with zero warnings. Until pull request 15, the flag keeps Mosh off in rele
 | Preparation | 1, and 3 (after #49). Pull request 2 is merged. |
 | Transport | 5, 6, then 9 (after 6 and 7). Pull request 4 is merged. |
 | Terminal | 7, then 8 (after 3, 6, and 7) |
-| App | 10, then 11, 12, and 14 in parallel, then 13 (after 11 and 12), then 15 |
+| App | 10, then 11 and 14 in parallel, then 12, then 13, then 15 |
 
 Pull requests 11, 12, and 13 change `SshTransportManager` and `MoshUdpEngine`. Expect small merge conflicts.
-Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for each other.
+Pull request 10 adds `MoshMachineState`, so that 11 and 14 do not wait for each other. Pull request 12
+needs the park and the wake of pull request 11.
 
 ### 1. `chore/license-guard`
 
@@ -1265,7 +1315,7 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
   and three handshake tests. CI changes of decision 7.
 - **Done.** CI is green with the real `mosh-server` tests. No production code calls the module.
 
-### 5. `feat/mosh-ssp`
+### 5. `feat/mosh-ssp` (#60)
 
 - **Files.** `core/mosh/src/commonMain/.../ssp/*` except `MoshConnection`, `commonTest`.
 - **Scope.** `SspTransport` as a pure state machine with the time as input. `UserStream`, `HostStateStore`
@@ -1322,8 +1372,10 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
   - `core/protocol/.../ProtocolTest.kt:265-276` (the parser and the tablet config).
   - `SshTransportManager.kt`: delete `buildMoshServerBootstrapCommand` and `REMOTE_TABLET_CONFIG_PATH`
     (`SshTransportManager.kt:822`, `856-863`).
-  - The deleted names also leave `app/android/src/main/baseline-prof.txt`, `startup-prof.txt`, and their
-    copies in `app/android/src/main/generated/baselineProfiles/`.
+  - The deleted names also leave the profile files. `buildMoshServerBootstrapCommand` is in
+    `app/android/src/main/baseline-prof.txt`, `startup-prof.txt`, and their copies in
+    `app/android/src/main/generated/baselineProfiles/`. `buildTabletHerdrConfigToml` is in the two
+    `baseline-prof.txt` files.
   - `validation.yml` (install `mosh` on the `android` target), `platform/android/ssh/build.gradle.kts`
     (`BISON_REQUIRE_MOSH` as a test input), and tests with `TestSshServer.installHerdr`.
 - **Scope.** The start script, the PID file with its lock, the attach check, and the lifecycle start rules.
@@ -1343,18 +1395,18 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
 - **Files.**
   - `MoshUdpEngine.kt`: replace it. Delete the old prediction, layout, and frame code
     (`MoshUdpEngine.kt:40-378`).
-  - The eight test files that construct `MoshUdpEngine`: `ProxyJumpTest.kt`, `SshPlatformTest.kt`,
+  - The nine test files that construct `MoshUdpEngine`: `ProxyJumpTest.kt`, `SshPlatformTest.kt`,
     `HardwareSecurityKeyRefusalTest.kt`, `SshTransportManagerTest.kt`, `UserAuthLoginTest.kt`,
-    `SessionReconnectTest.kt`, `ConnectionPathsE2ETest.kt` (`testDebug`), and
-    `AgyCursorPlacementE2ETest.kt` (`androidTest`, which CI compiles).
+    `SessionReconnectTest.kt`, `LocalNetworkPermissionTest.kt` (from #44), `ConnectionPathsE2ETest.kt`
+    (`testDebug`), and `AgyCursorPlacementE2ETest.kt` (`androidTest`, which CI compiles).
   - `RealSshBackend.kt`, and `RealHerdrSshClient.kt` (control-mode poll, the publisher rules, the RTT rules).
   - `SshTransportManager.kt`: replace the old Mosh code at lines `335`, `370`, `417`, `535-536`, `580`, and
     `688`.
   - `MoshBootstrapConfig.kt`: delete `isFocusRpcRequiringApiSocketInMoshMode`, with its use in
-    `SimulatedSshBackend.kt:466`, its test in `ProtocolTest.kt:278-282`, and its lines in the four baseline
-    and startup profile files.
+    `SimulatedSshBackend.kt:466`, its test in `ProtocolTest.kt:278-282`, and its lines in the two
+    `baseline-prof.txt` files.
   - `core/ssh/.../SshDebugLogAndEngines.kt` (`MoshSessionEngine` with pane IDs) and `SshStateManager.kt`
-    (`MoshMachineState`).
+    (`MoshMachineState`, with the time of the last reply).
   - `core/model/.../AppSettingsAndTransport.kt` (`sessionCount`), and the feature flag.
   - The users of `NOT_AVAILABLE`, `MOSH_SERVER_FOUND`, and `fallbackReasonFor`: `SimulatedSshBackend.kt`,
     `FakeHerdrServer.kt`, `ConnectionPathsE2ETest.kt`, `BackboneReportTest.kt`, and `SshPlatformTest.kt`.
@@ -1369,13 +1421,14 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
 
 ### 11. `feat/mosh-engine-lifecycle`
 
-- **Files.** `MoshUdpEngine.kt`, `SshTransportManager.kt`, `BisonSessionService.kt` (pass the `Network`),
-  `ServiceStopPolicy.kt`, and tests.
+- **Files.** `MoshUdpEngine.kt`, `SshTransportManager.kt`, `BisonSessionService.kt` and
+  `NetworkEventQueue.kt` (the events carry the `Network`), `ServiceStopPolicy.kt`, and tests.
 - **Scope.** These parts of decision 6:
   - The lifecycle of a session, and the restart rule with its backoff and limit.
-  - The D4 rule with its window, and the input with no acknowledgment.
-  - The wake of a parked session for a new user state.
-  - The network events for the Mosh sockets, the background detach, and the connected state.
+  - The D4 rule with its window and its checks, and the input with no acknowledgment.
+  - The wake of a parked session for a new user state, with its limits.
+  - The long background rule, the network events for the Mosh sockets, the background detach, and the
+    connected state.
 - **Tests.** Integration tests 8 to 11 and 14 of decision 7.
 - **Done.** A killed server restarts while its pane is on the screen. The D4 test passes with the lease on.
   A network change in the background with a `Live` lane gives no D4.
@@ -1388,17 +1441,19 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
   - `SshTransportManager.kt` (input and scroll requests of a Mosh pane go to its queue).
   - `core/common/.../MachineViewModelDelegate.kt` (scroll requests), and `BisonSessionService.kt`
     (notification input and inline replies).
-  - `core/resources/.../values/strings.xml`: "Open the app to answer" and "The paste is too large", with
-    the code that shows them.
+  - `core/resources/.../values/strings.xml`, with the code that shows each text:
+    - "Open the app to answer" and "The prompt was not sent".
+    - "The paste is too large" and "The paste did not arrive".
   - `validation.yml` and `.github/herdr.sha256` (Herdr downloads), `platform/android/ssh/build.gradle.kts`
     (`BISON_HERDR_BIN` and `BISON_HERDR_090_BIN` as test inputs), and tests with a `HerdrFixture`.
 - **Scope.** Connect `OrderedInputQueue` to the Mosh sessions and to `pane.send_keys`. Add these parts of
   decision 5:
   - The call rules, the CSI cases, and the closed-lane fallback.
-  - The paste rules with the single-shot path, and the composer submit.
-  - The input during transitions, and the other input paths.
+  - The paste rules with the single-shot path, and the refusal when the paste cannot go out.
+  - The composer submit, with the held Enter as a queue item.
+  - The detach as a queue item, the input during transitions, and the other input paths.
   - Composer prompts and inline replies to a Mosh pane over Mosh.
-- **Tests.** The key tests on a real Herdr, and integration tests 15 and 16, of decision 7.
+- **Tests.** The key tests on a real Herdr, and integration tests 15 to 17, of decision 7.
 - **Done.** Each order test passes 50 runs on CI. No key name gives `invalid_key`. The paste tests and the
   0.9.0 smoke test pass.
 
@@ -1418,9 +1473,12 @@ Pull request 10 adds `MoshMachineState`, so that 11, 12, and 14 do not wait for 
 ### 14. `feat/mosh-ui`
 
 - **Files.** `core/common/.../PollTimeText.kt` (rename to `BackboneLatencyText.kt`), the HUD pill, the pane
-  header, `ConfigureMachineScreen.kt`, `core/resources/.../values/strings.xml`.
+  header, `ConfigureMachineScreen.kt`, `core/resources/.../values/strings.xml`. For "Refresh pane": a new
+  `SshRequest.RefreshPane` in `core/ssh/.../SshRequestManager.kt`, and its path through
+  `SshTransportManager.kt` to `MoshUdpEngine.refresh`.
 - **Scope.**
-  - "RTT n ms" for Mosh and "poll n ms" for SSH, and "Last reply n s ago".
+  - "RTT n ms" for Mosh and "poll n ms" for SSH. "Last reply n s ago", from the reply time in
+    `MoshMachineState`.
   - The marks "control lane offline", "control lane needs login", and "pane in use on another device".
   - The marks "Mosh failed" and "N keys were not confirmed", and the UDP loss reason.
   - The size lock mark, the "Refresh pane" action, and the `MoshOnly` choice when the flag is on.
@@ -1464,10 +1522,13 @@ The app has the `predictiveEchoUnderlines` option already. This work is not in i
 Wi-Fi to cellular. The app does not open a new SSH connection." The new text:
 
 > After a change from Wi-Fi to cellular, each pane on the Mosh backbone continues to show output and to
-> accept text input. The app opens no new SSH connection for this. The app opens a new SSH connection only
-> in three cases. The first case is the first operation that needs SSH. The second case is a move of the
+> accept text input. The app opens no new SSH connection for this.
+>
+> The app opens a new SSH connection only
+> in four cases. The first case is the first operation that needs SSH. The second case is a move of the
 > app to the foreground. The third case is a new network that is stable for 5 s while the app is in the
-> foreground.
+> foreground. The fourth case is a loss of the SSH session in the foreground with no network event in the
+> next 2 s.
 
 ## Corrections to other documents
 
@@ -1546,6 +1607,21 @@ Pull request 15 makes these corrections.
 | Status | #47 and #52 are merged. `main` is `2d7e2ac`. | Status table |
 | Estimate | 39.5 engineer-days, 1.5 more than revision 4 | Order of pull requests |
 
+## Changes after review round 5
+
+| Review item | Change | Where |
+|-------------|--------|-------|
+| Major 1, composer Enter | The held `\r` is a queue item that holds all later input. The server can lack the paste state at a D4 switch, a fallback, or a session end. Then the queue drops the `\r` and shows "The prompt was not sent". Held input over SSH uses the single-shot path. New test 17. | Decision 5, decision 7 |
+| Major 2, order of 11 and 12 | Pull request 12 depends on 11. The queued-key assertion moves from test 10 to test 16. | Order of pull requests |
+| R8 and the R7 scope | An SSH key in `LossHold` goes in CSI form with no reconnect. The paste refusal applies to all machines, and #49 does it on the SSH path. | Decisions table, decisions 5 and 6 |
+| Pull request #60 | Wire facts 23 to 29, and the client values of #60 | Decision 4 |
+| Minors 1 and 2 | The long background rule, the `ps -p` check before D4, and the limits of the wake | Decision 6, tests 10, 14, and 15 |
+| Minors 3 and 4 | The detach as a queue item. A large paste that cannot go out is refused, and the queue is released. | Decision 5 |
+| Minors 5 and 6 | A call deadline starts the liveness check only in `Live`. D4 needs a passed check or connect after the change, and repeats a failed stop. | Decisions 5 and 6 |
+| Minors 8 to 10 | The attach window starts at the first host frame after the gate acknowledgment. The lock directory holds a PID and has an age limit. The acceptance text has the D2 case. | Decision 1, acceptance map |
+| Nits | Status values, the ninth test file, the profile files, `NetworkEventQueue.kt`, and the "Refresh pane" path. Risk 4, the fact labels, the error reply rule, `negotiateBackbone` step 9, and the single flag case. | All |
+| Estimate | 40.5 engineer-days, 1 more than revision 5 | Order of pull requests |
+
 ## Open questions
 
-None. Decisions 1 to 4 of review round 4 answer the open points.
+None. Decisions R7 and R8 of review round 5 answer the open points.
