@@ -63,13 +63,41 @@ class DeviceNetworksTest {
     fun aNetworkWithAProxyGivesNoPrefixButItsAddressesStayOwnAddresses() {
         networks.update("wlan0", network("192.168.1.5" to 24, hasProxy = true))
         networks.update("tun0", tailscale)
+        // A network with no proxy on the same subnet, for example Ethernet.
+        networks.update("eth0", network("192.168.1.7" to 24))
 
         val view = networks.view { null }
 
         assertTrue(view.isProtected)
-        assertNotLocal(view, "192.168.1.42", "192.168.1.5")
-        // Multicast stays local, because the VPN network has the protection.
+        // The prefix of eth0 contains both addresses, but 192.168.1.5 is an own address of wlan0.
+        assertLocal(view, "192.168.1.42")
+        assertNotLocal(view, "192.168.1.5", "192.168.1.7")
+        // Multicast stays local, because a network has the protection.
         assertLocal(view, "224.0.0.251")
+    }
+
+    @Test
+    fun theProtectionFollowsTheDefaultNetwork() {
+        networks.update("wlan0", network("192.168.1.5" to 24, hasProxy = true))
+        networks.update("rmnet0", network("10.64.1.5" to 30))
+
+        // The Wi-Fi network with a proxy carries the traffic, so its multicast is not stopped.
+        val wifiDefault = networks.view(defaultKey = "wlan0") { null }
+        assertFalse(wifiDefault.isProtected)
+        assertNotLocal(wifiDefault, "224.0.0.251")
+
+        val cellularDefault = networks.view(defaultKey = "rmnet0") { null }
+        assertTrue(cellularDefault.isProtected)
+        assertLocal(cellularDefault, "224.0.0.251")
+
+        // With no known default network, a network with no proxy turns the protection on.
+        assertTrue(networks.view(defaultKey = "unknown") { null }.isProtected)
+    }
+
+    @Test
+    fun beforeTheFirstCallbackTheProtectionFollowsTheFallback() {
+        assertFalse(networks.view { network("192.168.1.5" to 24, hasProxy = true) }.isProtected)
+        assertTrue(networks.view { network("192.168.1.5" to 24) }.isProtected)
     }
 
     @Test

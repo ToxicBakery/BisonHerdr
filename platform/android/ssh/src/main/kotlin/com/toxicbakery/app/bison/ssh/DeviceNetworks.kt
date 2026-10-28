@@ -28,25 +28,41 @@ class DeviceNetworks<K : Any> {
     }
 
     /**
-     * Returns the view of the known networks. With no known network, the view uses [fallback]. An example is the
-     * default network before the first callback. The class does not keep [fallback], so it cannot become stale.
+     * Returns the view of the known networks. [defaultKey] is the key of the default network, or null when it is not
+     * known. With no known network, the view uses [fallback] as the default network. An example is the default network
+     * before the first callback. The class does not keep [fallback], so it cannot become stale.
      */
-    fun view(fallback: () -> DeviceNetwork?): LocalNetworkView =
-        localNetworkViewOf(networks.values.toList().ifEmpty { listOfNotNull(fallback()) })
+    fun view(defaultKey: K? = null, fallback: () -> DeviceNetwork?): LocalNetworkView {
+        val known = networks.toMap()
+        if (known.isEmpty()) {
+            val default = fallback()
+            return localNetworkViewOf(listOfNotNull(default), default)
+        }
+        return localNetworkViewOf(known.values, defaultKey?.let(known::get))
+    }
 
     companion object {
         /**
          * Returns the [LocalNetworkView] of [networks]. Only a network with no proxy gives local prefixes. The own
          * addresses come from all networks.
+         *
+         * The protection flag follows [defaultNetwork], because the default network carries multicast, the `.local`
+         * queries, and the traffic to a routed address. When [defaultNetwork] is null, the flag is true when a network
+         * has no proxy, or when there is no network.
          */
-        fun localNetworkViewOf(networks: Collection<DeviceNetwork>): LocalNetworkView {
+        fun localNetworkViewOf(
+            networks: Collection<DeviceNetwork>,
+            defaultNetwork: DeviceNetwork? = null,
+        ): LocalNetworkView {
             val protectedNetworks = networks.filterNot { it.hasProxy }
+            val isProtected = defaultNetwork?.let { !it.hasProxy }
+                ?: (networks.isEmpty() || protectedNetworks.isNotEmpty())
             return LocalNetworkView(
                 prefixes = protectedNetworks.flatMap { it.addresses }.mapNotNull { (address, length) ->
                     LocalNetworkAddresses.localPrefixOf(address, length)
                 },
                 ownAddresses = networks.flatMap { network -> network.addresses.map { it.first } },
-                isProtected = networks.isEmpty() || protectedNetworks.isNotEmpty(),
+                isProtected = isProtected,
             )
         }
 

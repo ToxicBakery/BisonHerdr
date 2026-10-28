@@ -96,7 +96,7 @@ class LocalNetworkAddressesTest {
     }
 
     @Test
-    fun multicastAndBroadcastAddressesAreAlwaysLocal() {
+    fun multicastAndBroadcastAddressesAreLocalWhileANetworkHasTheProtection() {
         listOf("224.0.0.251", "239.255.255.250", "255.255.255.255", "ff02::fb", "ff05::c").forEach { text ->
             assertTrue(LocalNetworkAddresses.isLocal(address(text), LocalNetworkView.EMPTY), "$text must be local")
             assertTrue(LocalNetworkAddresses.isPrivate(address(text)), "$text must be private")

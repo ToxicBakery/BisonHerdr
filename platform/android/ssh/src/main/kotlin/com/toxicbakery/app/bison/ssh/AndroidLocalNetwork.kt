@@ -66,7 +66,8 @@ private class AndroidLocalNetworks(private val connectivity: ConnectivityManager
     }
 
     /** Returns the view of all networks, or of the default network before the first callback. */
-    fun view(): LocalNetworkView = networks.view { defaultLinkProperties()?.let(::deviceNetworkOf) }
+    fun view(): LocalNetworkView =
+        networks.view(defaultKey = connectivity?.activeNetwork) { defaultLinkProperties()?.let(::deviceNetworkOf) }
 
     /** Returns true when the device has a global HTTP proxy. See [DeviceNetworks.isGlobalProxy]. */
     fun hasGlobalProxy(): Boolean {

@@ -21,8 +21,9 @@ package com.toxicbakery.app.bison.ssh
  * that Android can stop the connection on a network that has its range.
  *
  * An own address of the device is not local. Linux sends a packet to it through the loopback interface, and that
- * interface has no list. Loopback addresses are also not local. A host name with the mDNS suffix `.local` is local
- * ([isLocalName]), because its query is a multicast.
+ * interface has no list. Loopback addresses are also not local. A host name with the mDNS suffix `.local`
+ * ([isLocalName]) is local while the network that carries its query has the protection. The query is a multicast.
+ * See [LocalNetworkView.isProtected].
  */
 object LocalNetworkAddresses {
 
@@ -132,8 +133,9 @@ object LocalNetworkAddresses {
  *
  * - [prefixes] are the local prefixes of the networks with the protection ([LocalNetworkAddresses.localPrefixOf]).
  * - [ownAddresses] are the addresses of all networks of the device.
- * - [isProtected] is true when at least one network has the protection, or when the app sees no network. A network
- *   with an HTTP proxy has no protection. Multicast, broadcast, and `.local` names are local only while it is true.
+ * - [isProtected] is true when the default network has the protection. A network with an HTTP proxy has no
+ *   protection. When the app does not know the default network, it is true when a network has the protection, or
+ *   when the app sees no network. Multicast, broadcast, and `.local` names are local only while it is true.
  */
 class LocalNetworkView(
     val prefixes: List<AddressPrefix>,
