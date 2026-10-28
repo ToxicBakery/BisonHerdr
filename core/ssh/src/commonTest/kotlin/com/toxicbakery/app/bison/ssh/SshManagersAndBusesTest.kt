@@ -16,8 +16,13 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 
 class SshManagersAndBusesTest {
@@ -66,6 +71,66 @@ class SshManagersAndBusesTest {
         assertTrue(requestManager.tryEmit(SshRequest.Connect("workbox")))
         val received = deferred.await()
         assertEquals(SshRequest.Connect("workbox"), received)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun sshRequestManagerKeepsRequestsUntilTheFirstCollectorStarts() = runTest {
+        val requestManager = SshRequestManager()
+
+        // No collector exists yet, for example before BisonSessionService starts.
+        requestManager.emit(SshRequest.SetSurfaceLease("workbox", active = true))
+        assertTrue(requestManager.tryEmit(SshRequest.Connect("gpu-rig")))
+
+        val received = mutableListOf<SshRequest>()
+        val collector = launch { requestManager.bus.collect { received.add(it) } }
+        runCurrent()
+
+        assertEquals(
+            listOf(
+                SshRequest.SetSurfaceLease("workbox", active = true),
+                SshRequest.Connect("gpu-rig"),
+            ),
+            received,
+        )
+        collector.cancel()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun sshRequestManagerDoesNotReplayAnOldRequestToANewCollector() = runTest {
+        val requestManager = SshRequestManager()
+
+        val firstCollector = launch { requestManager.bus.first() }
+        runCurrent()
+        requestManager.emit(SshRequest.Disconnect("workbox"))
+        runCurrent()
+        assertTrue(firstCollector.isCompleted)
+
+        // A new collector, for example a restarted service, must not get the old Disconnect again.
+        val received = mutableListOf<SshRequest>()
+        val secondCollector = launch { requestManager.bus.collect { received.add(it) } }
+        runCurrent()
+        assertTrue(received.isEmpty())
+
+        requestManager.emit(SshRequest.Connect("workbox"))
+        runCurrent()
+        assertEquals(listOf<SshRequest>(SshRequest.Connect("workbox")), received)
+        secondCollector.cancel()
+    }
+
+    @Test
+    fun sshRequestManagerTryEmitFailsWhenTheQueueIsFull() = runTest {
+        val requestManager = SshRequestManager()
+        repeat(SshRequestManager.REQUEST_CAPACITY) { index ->
+            assertTrue(requestManager.tryEmit(SshRequest.Connect("machine-$index")))
+        }
+        assertFalse(requestManager.tryEmit(SshRequest.Connect("overflow")))
+
+        val requests = requestManager.bus.take(SshRequestManager.REQUEST_CAPACITY).toList()
+        assertEquals(SshRequestManager.REQUEST_CAPACITY, requests.size)
+        assertEquals(SshRequest.Connect("machine-0"), requests.first())
+        assertEquals(SshRequest.Connect("machine-63"), requests.last())
     }
 
     @Test
