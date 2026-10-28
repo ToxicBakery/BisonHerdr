@@ -11,6 +11,7 @@ import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import java.net.ConnectException
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -98,8 +99,9 @@ class SshTransportManagerTest {
     }
 
     @Test
-    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLine() = runTest {
-        // Each command batch fails, as on a broken SSH channel.
+    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLineOnEachLane() = runTest {
+        // Each command batch fails, as on a broken SSH channel. The executor records the lane of each batch.
+        val lanes = CopyOnWriteArrayList<RealHerdrSshClient.WorkerLane>()
         val client = RealHerdrSshClient(
             localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
@@ -108,20 +110,42 @@ class SshTransportManagerTest {
             semanticNotificationBus = SemanticNotificationBus(),
             knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
             secretStore = InMemorySecretStore(),
-            remoteBatchExecutor = { _, _, _, _ -> throw IOException("Broken pipe") },
+            remoteBatchExecutor = { _, _, lane, _ ->
+                lanes += lane
+                throw IOException("Broken pipe")
+            },
         )
         val backend = RealSshBackend(client, stateManager, AndroidKeystoreKeyManager(allowSoftwareKeys = true))
         val manager = manager(backend)
         // A resize gives the profile of the machine to the manager, with no command on the host.
         manager.handleRequest(SshRequest.ResizeShell(lanBox.id, cols = 80u, rows = 24u), lanBox)
 
-        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
+        // pane.layout uses the poll lane of the client.
+        val layoutResponse = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
 
-        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
-        val errors = debugLog.entries.value.filter { it.isError }
-        assertEquals(1, errors.size, debugLogDump())
-        assertTrue(errors.single().message.startsWith("RPC pane.layout error: Broken pipe"), debugLogDump())
+        assertTrue(layoutResponse.contains(SshTransportManager.NO_RESPONSE_CODE), layoutResponse)
+        assertEquals(listOf("RPC pane.layout error: Broken pipe"), errorMessages(), debugLogDump())
+        // The RPC and the read of the surface after it use the poll lane.
+        assertEquals(setOf(RealHerdrSshClient.WorkerLane.Poll), lanes.toSet())
+        val pollBatches = lanes.size
+
+        // pane.send_keys uses the input lane of the client, which has its own error path.
+        val keysResponse = manager.sendEndpointCommand(
+            lanBox.id,
+            HerdrRpcBuilder.paneSendKeys(paneId = "w1:p1", keys = listOf("Enter")),
+        )
+
+        assertTrue(keysResponse.contains(SshTransportManager.NO_RESPONSE_CODE), keysResponse)
+        assertEquals(
+            listOf("RPC pane.layout error: Broken pipe", "RPC pane.send_keys error: Broken pipe"),
+            errorMessages(),
+            debugLogDump(),
+        )
+        assertEquals(listOf(RealHerdrSshClient.WorkerLane.Input), lanes.drop(pollBatches))
     }
+
+    /** Returns the messages of the error entries of the debug log, in sequence. */
+    private fun errorMessages(): List<String> = debugLog.entries.value.filter { it.isError }.map { it.message }
 
     @Test
     fun anRpcForAMachineWithNoProfileGivesAnErrorResponse() = runTest {
@@ -510,6 +534,13 @@ class SshTransportManagerTest {
         connectAll(manager, backend, lanBox)
         manager.setSurfaceLease(lanBox.id, active = false)
         val events = assertNotNull(backend.sessionEvents)
+
+        assertTrue(
+            debugLog.entries.value.any {
+                it.message.startsWith("Surface lease off: the poll reads no snapshot and no panes.")
+            },
+            debugLogDump(),
+        )
 
         events.onReconnecting(lanBox.id, null)
         events.onReconnected(lanBox.id)
