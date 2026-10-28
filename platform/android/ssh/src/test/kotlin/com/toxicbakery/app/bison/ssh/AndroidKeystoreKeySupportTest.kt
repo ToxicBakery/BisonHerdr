@@ -16,7 +16,7 @@ class AndroidKeystoreKeySupportTest {
 
     @Test
     fun authorizedKeyLineIsAnOpenSshPublicKey() = runTest {
-        val manager = AndroidKeystoreKeyManager()
+        val manager = AndroidKeystoreKeyManager(allowSoftwareKeys = true)
         val line = manager.authorizedKeyLine("jvm_test_ecdsa", KeyAlgorithm.EcdsaP256, requireBiometric = false)
         assertEquals("ecdsa-sha2-nistp256", line.substringBefore(' '))
         assertEquals(line, manager.getOrCreatePublicKey("jvm_test_ecdsa", KeyAlgorithm.EcdsaP256).openSshAuthorizedKeyLine)

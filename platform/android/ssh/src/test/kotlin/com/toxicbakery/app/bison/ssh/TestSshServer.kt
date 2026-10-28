@@ -35,8 +35,9 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * The server accepts three users:
  * - [PASSWORD_USER] with [PASSWORD] (`password` method).
- * - [KEY_USER] with a key in [authorizedKeys] (`publickey` method). The constructor adds the [KEY_ALIAS]
- *   key of [keyManager]. On the JVM, [AndroidKeystoreKeyManager] makes this key with its JCA fallback.
+ * - [KEY_USER] with a key in [authorizedKeys] (`publickey` method). The constructor makes the [KEY_ALIAS]
+ *   key of [keyManager] and adds it. The JVM has no AndroidKeyStore, so the default [keyManager] makes
+ *   software keys.
  * - [INTERACTIVE_USER] with the answers of [interactivePrompts] (`keyboard-interactive` method).
  *
  * An `exec` request runs `sh -c <command>` on the test machine. When [allowTcpForwarding] is true, the
@@ -46,7 +47,7 @@ import org.apache.sshd.server.shell.ProcessShell
  * client sent no credentials, for example after a host key check stopped the connection.
  */
 internal class TestSshServer(
-    val keyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(),
+    val keyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
     val keyAlgorithm: KeyAlgorithm = KeyAlgorithm.Ed25519,
     private val allowTcpForwarding: Boolean = false,
 ) : AutoCloseable {

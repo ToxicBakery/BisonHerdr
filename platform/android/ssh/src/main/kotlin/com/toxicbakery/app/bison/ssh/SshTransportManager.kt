@@ -472,6 +472,8 @@ class SshTransportManager(
             is SshAuthResult.HostKeyChanged ->
                 "HostKeyChanged (${result.presented.hostPort} saved ${result.known.fingerprint}, " +
                     "sent ${result.presented.fingerprint})"
+
+            is SshAuthResult.KeyMissing -> "KeyMissing (${result.message})"
         }
 
     private fun hostKeyPromptFor(machineId: String, result: SshAuthResult.HostKeyRejected): HostKeyPrompt =

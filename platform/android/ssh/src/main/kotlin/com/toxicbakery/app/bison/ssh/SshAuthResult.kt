@@ -40,4 +40,14 @@ sealed interface SshAuthResult {
      * for its `host:port`. This can be an attack. The user can remove [known] and then connect again.
      */
     data class HostKeyChanged(val known: KnownHost, override val presented: KnownHost) : HostKeyRejected
+
+    /**
+     * The key store has no key for [keyAlias]. The user must make the key and add its public key to the
+     * host. A retry without a change fails again.
+     */
+    data class KeyMissing(val keyAlias: String) : SshAuthResult {
+        /** The text that tells the user what to do. */
+        val message: String
+            get() = MissingKeyException.messageFor(keyAlias)
+    }
 }

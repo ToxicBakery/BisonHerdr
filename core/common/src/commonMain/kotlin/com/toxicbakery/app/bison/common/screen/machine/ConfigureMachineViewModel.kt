@@ -8,6 +8,8 @@ import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.ssh.KeyCreationException
+import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.util.BaseViewModel
@@ -59,6 +61,8 @@ class ConfigureMachineViewModel(
         val publicKeyLine: String? = null,
         val isLoadingPublicKey: Boolean = false,
         val publicKeyError: String? = null,
+        /** The cause when the device key store did not make the key. The screen shows it next to the key types. */
+        val keyCreationFailure: KeyCreationFailure? = null,
         val passwordRef: String = "",
         /**
          * The hardware security key of a loaded machine. The screen cannot change it, so "Save Host" keeps
@@ -146,7 +150,9 @@ class ConfigureMachineViewModel(
                     ).withoutPublicKey()
                 }
             }
-            is Event.UpdateRequireBiometric -> updateState { it.copy(requireBiometric = event.require) }
+            is Event.UpdateRequireBiometric -> updateState {
+                it.copy(requireBiometric = event.require, keyCreationFailure = null)
+            }
             is Event.ShowPublicKey -> loadPublicKey()
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
             is Event.UpdateProxyJumpEnabled -> updateState { it.copy(proxyJumpEnabled = event.enabled) }
@@ -168,7 +174,7 @@ class ConfigureMachineViewModel(
     }
 
     private fun State.withoutPublicKey(): State =
-        copy(publicKeyLine = null, isLoadingPublicKey = false, publicKeyError = null)
+        copy(publicKeyLine = null, isLoadingPublicKey = false, publicKeyError = null, keyCreationFailure = null)
 
     private fun loadPublicKey() {
         val provider = sshPublicKeyProvider ?: return
@@ -176,9 +182,10 @@ class ConfigureMachineViewModel(
         if (request.isLoadingPublicKey) return
         val alias = request.keystoreAlias.trim().ifBlank { request.keyAlgorithm.defaultKeystoreAlias }
         val algorithm = request.keyAlgorithm
-        updateState { it.copy(isLoadingPublicKey = true, publicKeyError = null) }
+        updateState { it.copy(isLoadingPublicKey = true, publicKeyError = null, keyCreationFailure = null) }
         viewModelScope.launch {
             val result = runCatching { provider.authorizedKeyLine(alias, algorithm, request.requireBiometric) }
+            val error = result.exceptionOrNull()
             updateState { current ->
                 val currentAlias = current.keystoreAlias.trim().ifBlank { current.keyAlgorithm.defaultKeystoreAlias }
                 when {
@@ -187,7 +194,8 @@ class ConfigureMachineViewModel(
                     else -> current.copy(
                         isLoadingPublicKey = false,
                         publicKeyLine = result.getOrNull(),
-                        publicKeyError = result.exceptionOrNull()?.let { err ->
+                        keyCreationFailure = (error as? KeyCreationException)?.failure,
+                        publicKeyError = error?.takeIf { it !is KeyCreationException }?.let { err ->
                             "Could not get the public key: ${err.message ?: err::class.simpleName}"
                         },
                     )

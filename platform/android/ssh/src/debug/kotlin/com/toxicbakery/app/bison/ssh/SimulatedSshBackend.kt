@@ -89,11 +89,16 @@ class SimulatedSshBackend(
         val challenge = "ssh-userauth:${machine.id}:${route.targetHost}:${route.targetPort}".toByteArray(Charsets.UTF_8)
         return when (val auth = machine.authMethod) {
             is SshAuthMethod.KeystoreKey -> {
-                val exported = keystoreKeyManager.getOrCreatePublicKey(
-                    keyAlias = auth.keyAlias,
-                    algorithm = auth.algorithm,
-                    requireBiometric = auth.requireBiometric,
-                )
+                val exported = try {
+                    keystoreKeyManager.getOrCreatePublicKey(
+                        keyAlias = auth.keyAlias,
+                        algorithm = auth.algorithm,
+                        requireBiometric = auth.requireBiometric,
+                    )
+                } catch (error: KeyCreationException) {
+                    // The device key store did not make the key. The login error gives the cause.
+                    return SshAuthResult.Failed(error)
+                }
                 val sig = keystoreKeyManager.signSshChallenge(
                     keyAlias = auth.keyAlias,
                     algorithm = auth.algorithm,
