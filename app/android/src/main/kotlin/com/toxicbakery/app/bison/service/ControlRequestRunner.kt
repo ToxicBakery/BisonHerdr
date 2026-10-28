@@ -5,6 +5,8 @@ import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.isConnectSt
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 
 /**
  * Runs [dispatch] for [request]. Returns the error of [dispatch], or null when it completes.
@@ -12,7 +14,11 @@ import kotlinx.coroutines.CancellationException
  * A [SshRequest.Connect] that throws or that is cancelled can leave the progress of its machine
  * at a connect step. [ServiceStopPolicy] counts a connect step as busy, so the service then does
  * not stop. Thus this function sets the progress to [ConnectionProgress.Failed] when the machine
- * is still at a connect step. It then throws a [CancellationException] again.
+ * is still at a connect step.
+ *
+ * When the coroutine of the caller is cancelled, this function then throws the [CancellationException] again.
+ * A [CancellationException] from inside the request, for example a `TimeoutCancellationException`, is a failed
+ * request. This function returns it, and the loop of the caller continues.
  */
 internal suspend fun SshStateManager.runControlRequest(
     request: SshRequest,
@@ -20,7 +26,7 @@ internal suspend fun SshStateManager.runControlRequest(
 ): Throwable? {
     val error = runCatching { dispatch(request) }.exceptionOrNull() ?: return null
     markInterruptedConnectFailed(request)
-    if (error is CancellationException) throw error
+    rethrowIfCancelled(error)
     return error
 }
 
@@ -31,4 +37,15 @@ internal fun SshStateManager.markInterruptedConnectFailed(request: SshRequest) {
     if (step.isConnectStep()) {
         setConnectionProgress(request.machineId, ConnectionProgress.Failed)
     }
+}
+
+/**
+ * Throws [error] again when it is a [CancellationException] and the coroutine of the caller is cancelled.
+ *
+ * A [CancellationException] can also come from inside a request, for example a `TimeoutCancellationException` of a
+ * `withTimeout` in the request. The coroutine of the caller then stays active, and the caller must handle the error
+ * as a failed request. If the caller throws it again, the loop of the caller stops.
+ */
+internal suspend fun rethrowIfCancelled(error: Throwable) {
+    if (error is CancellationException && !currentCoroutineContext().isActive) throw error
 }
