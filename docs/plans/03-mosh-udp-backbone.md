@@ -18,11 +18,11 @@ This is revision 2. Review round 1 and the decisions of the user changed it. The
 | 3 | VT emulator | A new Kotlin emulator for the small set of controls that `mosh-server` sends in its diffs. Its screen state is copy-on-write. |
 | 4 | Crypto | BouncyCastle `OCBBlockCipher` with `AESEngine.newInstance()`. BouncyCastle 1.86 is already a dependency. |
 | 5 | Keys | Hybrid. Text, Enter, Backspace, Tab, Esc, and Ctrl keys go over Mosh. Keys that depend on the mode of the pane go over SSH `pane.send_keys`. An order barrier keeps the two paths in sequence. |
-| 6 | Integration | `negotiateBackbone` returns `ActiveBackbone.MoshUdp` only after a decrypted reply and a successful attach. When no reply comes in 3 s, the app uses the SSH endpoint path and shows the reason. The SSH control lane of a Mosh machine reconnects lazily. A flag keeps Mosh off in release builds until the last pull request. |
+| 6 | Integration | `negotiateBackbone` returns `ActiveBackbone.MoshUdp` only after a decrypted reply and a successful attach. When no reply comes in 3 s, the app uses the SSH endpoint path and shows the reason. The SSH control lane of a Mosh machine reconnects lazily in the background, and 5 s after a network change in the foreground. A flag keeps Mosh off in release builds until the last pull request. |
 | 7 | Session policy | Short and polite. No `--takeover`. The app detaches 3 minutes after it goes to the background. `MOSH_SERVER_NETWORK_TMOUT=900`. The UI shows the size lock. |
 | 8 | Tests | JVM tests against a real local `mosh-server`, and key tests against a real Herdr 0.9.5 binary, on Linux CI. |
 
-The plan has 12 pull requests and 29 engineer-days. An independent clean-room review before the last pull
+The plan has 12 pull requests and 29.5 engineer-days. An independent clean-room review before the last pull
 request adds about 1 day. Issue #22 gives 29 engineer-days for a Rust path with fewer features.
 
 ## Decisions of the user
@@ -30,7 +30,9 @@ request adds about 1 day. Issue #22 gives 29 engineer-days for a Rust path with 
 | Topic | Decision |
 |-------|----------|
 | Keys | Hybrid, with an order barrier. Mode-dependent keys go over SSH. While SSH is down after a network change, these keys go over Mosh in CSI form as a best effort. |
-| Network change | Lazy reconnect. Mosh panes continue with no SSH. The app opens SSH again only at the first SSH-only operation, or when the app comes to the foreground. |
+| Network change | Lazy reconnect. Mosh panes continue with no SSH. The app opens SSH again at the first SSH-only operation, or when the app comes to the foreground. |
+| Network change in the foreground | A visible app must not show old agent status and layout. When the default network changes in the foreground, the app reconnects the control lane after the new network is stable for 5 s. |
+| Kitty mode | Esc and the Ctrl keys stay on Mosh. A kitty flag 1 program gets their legacy bytes. This is a known limit with a test. Shift+Enter and the other modified keys stay on SSH. |
 | Session policy | No `--takeover`. A pane in use by a different attach client uses the `pane.read` path and shows a mark. Detach 3 minutes after the app goes to the background. `MOSH_SERVER_NETWORK_TMOUT=900`. Show the size lock. |
 | Herdr version | 0.9.0 or later. |
 | Speculative local echo | Out of scope. It becomes a follow-up issue. |
@@ -410,6 +412,12 @@ pane (black-box fact 8).
 | SSH | Arrows, Home, End, PageUp, PageDown, Insert, Delete, F1 to F12 | `pane.send_keys` with the key names of `mapKeyEventToHerdrKeySpec` (`RealHerdrSshClient.kt:1674`) |
 | SSH | Shift+Tab, Shift+Enter, Ctrl+Enter, and each key with Alt, Super, or a Ctrl or Shift that is not in the Mosh rows | `pane.send_keys` |
 
+**Known limit: kitty mode.** Kitty keyboard flag 1 changes the bytes of Esc and of the Ctrl keys to
+`CSI u` forms. Over Mosh, a kitty flag 1 program gets the legacy bytes, for example `0x1B` for Esc and
+`0x01` for Ctrl+A. Most programs accept the legacy bytes. A test on a real Herdr records the bytes that
+such a program gets, so that a change of this behavior shows. Shift+Enter and the other modified keys stay
+on SSH, and Herdr encodes them for the pane.
+
 **Order barrier.** One ordered input queue for each pane holds both classes.
 
 1. A Mosh key goes into the Mosh user stream at once, when no SSH call is in flight for the pane. The
@@ -496,17 +504,29 @@ control-mode poll of a `MoshUdp` machine records no poll time, so that the two k
 The UI shows "RTT n ms" for `MoshUdp` and "poll n ms" for `SshEndpoint`. When no authentic datagram came
 for 5 s and the session is not parked, the UI shows "Last reply n s ago".
 
-**Lazy control lane.** For a Mosh machine, `SessionSupervisor` gets a lazy mode.
+**Lazy control lane.** For a Mosh machine, `SessionSupervisor` gets a lazy mode with these states. The
+UI state of `MoshMachineState` follows them: `Live` is `Open`, and `NeedsLogin` is `NeedsLogin`. All
+other states are `Offline`.
 
-- When the SSH session closes, the supervisor goes to a new state `Dormant`. It makes no attempt. The
-  control poll pauses, and the UI shows the mark "control lane offline". The agent status shows as old.
-- These operations start one reconnect:
+| State | The supervisor | Next state |
+|-------|----------------|------------|
+| `Live` | The SSH session is open. The control poll runs. | `Dormant` when the session closes. `NetworkSettle` on a network change in the foreground. |
+| `Dormant` | No session and no attempt. The control poll pauses. The UI shows "control lane offline", and the agent status shows as old. | `Reconnecting` on a trigger. `NetworkSettle` on a network change in the foreground. |
+| `NetworkSettle` | The app is in the foreground, and the default network changed. A 5 s timer runs. | `NetworkSettle` again with a new timer on each new network change. When the timer ends: a liveness check from `Live`, or `Reconnecting` from `Dormant`. `Reconnecting` at once on a trigger. `Dormant` when the app goes to the background or the network is lost. |
+| `Reconnecting` | The current loop of attempts with the current delays | `Live` on success. `NeedsLogin` when the login needs the user. `Dormant` when the app is in the background and no SSH-only operation waits. |
+| `NeedsLogin` | No attempt. The UI shows "control lane needs login". | `Reconnecting` on a tap on the mark, on an SSH-only operation in the foreground, or when the app comes to the foreground. |
+
+- A network change is `onAvailable` or `onLinkPropertiesChanged`. `onLost` gives `Dormant`.
+- The liveness check is the current check: a keepalive message and one `exec true`, with a 3 s limit. When
+  it fails, the supervisor goes to `Reconnecting`. A Tailscale address can keep the SSH session open, and
+  then the check passes and the state stays `Live`.
+- When the app comes to the foreground in `Live`, the manager runs the liveness check once.
+- These triggers start a reconnect:
   - An RPC through `sendEndpointCommand`, or a prompt to a named agent.
   - An SSH key.
   - The start of a Mosh session for a new visible pane, or a `pane.read` for a pane with no Mosh session.
   - A tap on the mark, or the move of the app to the foreground.
 - The paused control poll does not start a reconnect.
-- After a successful reconnect, the supervisor goes back to `Live`, and the poll starts again.
 - In the background, no operation starts a reconnect that needs the user. The prompt queue keeps the
   prompts that need SSH.
 
@@ -516,7 +536,8 @@ for 5 s and the session is not parked, the UI shows "Last reply n s ago".
 - `onAvailable` and `onLinkPropertiesChanged`: the engine opens a new socket for each Mosh session. It
   binds the socket with `Network.bindSocket` and sends one datagram at once. A parked session changes its
   socket at the next unpark.
-- For a Mosh machine, the manager does not run the SSH liveness check and does not call `reconnectNow`.
+- For a Mosh machine in the background, the manager does not run the SSH liveness check and does not
+  call `reconnectNow`. In the foreground, the supervisor goes to `NetworkSettle`.
 - `onLost`: the Mosh sessions stay open, and their timers continue. The manager closes the SSH sockets as
   today (`SshTransportManager.kt:618-630`). For a Mosh machine, the supervisor goes to `Dormant`.
 
@@ -612,27 +633,40 @@ attach runs `sh` with a known prompt, or prints a chosen attach error. The tests
 4. Attach errors: "already has an attached client" gives the `InUseElsewhere` mark and the `pane.read`
    path, with no second attempt. "has a read in progress" gives a second attempt. No test sends
    `--takeover`.
-5. Frames: a `PaneSurfaceBus` that records each frame. Run the poll, a resize, Mosh keys, SSH keys, a scroll, and a focus
-   change on a Mosh machine. Each frame for the machine on the bus must be an engine frame or its lease
-   copy.
-6. No new SSH connection after a network change (see below).
+5. Frames: a `PaneSurfaceBus` that records each frame. Run the poll, a resize, Mosh keys, SSH keys, a
+   scroll, and a focus change on a Mosh machine. Each frame for the machine on the bus must be an engine
+   frame or its lease copy.
+6. Network change in the background and in the foreground (see below).
 7. Login that needs the user: a `TimeBound` key and a closed SSH session. In the background, no prompt
    shows, and the Mosh session continues. In the foreground, the attempt asks for the prompt.
 8. Background: no datagram goes out while parked. After 3 minutes (virtual time for the timer), the engine
    sends the detach, and the fake attach exits.
 9. The bastion route and an old Herdr version give the reasons.
 
-**The "no new SSH connection" test.** A localhost test with no change of path proves nothing, so the test
-changes the path:
+**The network change tests.** A localhost test with no change of path proves nothing, so the tests change
+the path. In each test, the SSH session goes through a local TCP relay, and the Mosh datagrams go through a
+local UDP relay. The test counts the SSH sessions that `TestSshServer` opens. The "IP change" closes the
+TCP relay connection hard, so the SSH session dies. It also moves the UDP relay to a new source port. Then
+the test calls `onNetworkAvailable`.
 
-1. The SSH session goes through a local TCP relay. The Mosh datagrams go through a local UDP relay.
-2. The test counts the SSH sessions that `TestSshServer` opens.
-3. The "IP change": the test closes the TCP relay connection hard, so the SSH session dies. The UDP relay
-   moves to a new source port. The test calls `onNetworkLost` and then `onNetworkAvailable`.
-4. The test types text and Enter. The output shows on the frame within 2 s.
-5. For 30 s, the test does no SSH-only operation. The session count does not change, and the supervisor
-   makes no attempt.
-6. The test then starts one SSH-only operation, a tab focus. The session count increases by exactly one.
+*Foreground variant.*
+
+1. The app is in the foreground. The test makes the IP change.
+2. The test types text and Enter. The output shows on the frame within 2 s. At that time, the session
+   count has not changed. This proves that the terminal needs no SSH.
+3. 5 s after the change, the session count increases by exactly one.
+4. A second IP change 3 s after the first one starts the timer again. The count then increases by exactly
+   one, 5 s after the second change.
+
+*Background variant.*
+
+1. The surface lease is off, so the app is in the background. The test makes the IP change.
+2. For 60 s, the test does no SSH-only operation. The session count does not change, and the supervisor
+   makes no attempt. The Mosh sessions stay open and parked.
+3. The test sets the lease on. The Mosh screen paints after one datagram, and the session count increases
+   by exactly one.
+
+A unit test with virtual time covers each transition of the state table.
 
 **Key tests on a real Herdr.** CI downloads the pinned `herdr-linux-x86_64` asset of v0.9.5 and checks its
 SHA-256. The test starts an isolated Herdr server with its own config directory and a short socket path.
@@ -643,6 +677,8 @@ The panes run two small probe programs:
   in 50 runs.
 - A raw-mode program that turns on the kitty keyboard flag 1. It must get `CSI 13;2u` for Shift+Enter, and
   the text and Enter in order with it.
+- The same program records the bytes for Esc and Ctrl+A over Mosh. The test expects the legacy bytes `0x1B`
+  and `0x01`, and documents the known limit of decision 5.
 - A third run closes the SSH lane and checks that Up arrives as `CSI A` over Mosh.
 
 **Tests that need `mosh-server` or Herdr.** When `BISON_REQUIRE_MOSH` is `1`, a test fails when
@@ -738,7 +774,7 @@ commit (`4792096`) added it, with no record of its sources. Its comments use the
   MoshUdpEngine      rewrite: sessions, frames in the frame lock, input queues, park, detach, network change
   RealSshBackend     Mosh branch of negotiateBackbone, UDP failure memory
   RealHerdrSshClient one-shot exec, peer IP, control-mode poll, the publisher rules, SSH key calls
-  SessionSupervisor  lazy mode and the Dormant state
+  SessionSupervisor  lazy mode with the Dormant, NetworkSettle, and NeedsLogin states
   SshTransportManager lease to park, network events, NeedsUser rule, releaseControlLane
 
 :core:ssh       MoshSessionEngine contract with pane IDs, MoshMachineState in SshStateManager
@@ -776,9 +812,9 @@ flowchart LR
 |---|------|--------|------------|
 | 1 | The width table and the libc of a host do not agree | A cell moves until the next full paint | Width rules from fact 13. Width probe on CI. "Refresh pane". |
 | 2 | An emulator rule differs from the server rule | A wrong screen until the next full paint | Emulator oracle test. "Refresh pane". |
-| 3 | A kitty-mode program reads Esc or a Ctrl key in its legacy form | The program can see a different key | Kitty test on a real Herdr. [Question 1](#open-questions). |
+| 3 | A kitty flag 1 program gets the legacy bytes of Esc and the Ctrl keys | The program can read a different key | A known limit. Most programs accept the legacy bytes. A test on a real Herdr documents the bytes. |
 | 4 | The order barrier adds delay | An SSH key after text waits up to 1 RTT + 50 ms | The latency table. Only mixed sequences pay it. |
-| 5 | After a network change in the foreground, the agent status and the layout are old | The user sees old data until an SSH-only operation | The "control lane offline" mark with a tap action. [Question 2](#open-questions). |
+| 5 | After a network change in the foreground, the agent status and the layout are old for a short time | The user sees old data for about 5 s and one reconnect | The 5 s settle and then a reconnect. The "control lane offline" mark shows the state. |
 | 6 | A desktop client sees the pane at the tablet size | The desktop layout looks wrong | The UI shows the lock. Detach after 3 minutes in the background. No `--takeover`. |
 | 7 | A `mosh-server` stays on the host | Processes and ports on the host | 60 s exit with no client, `MOSH_SERVER_NETWORK_TMOUT=900`, the detach, and the PID file with the `ps` check |
 | 8 | A network blocks UDP, or a NAT drops the port entry | No Mosh, or a stall | The gate, the 3 s budget, the failure memory, the heartbeat, and a new socket after 10 s |
@@ -805,7 +841,7 @@ green with zero warnings. Until pull request 12, the flag keeps Mosh off in rele
 | 7 | `feat/mosh-bootstrap` | Start script, gate, attach check, stop by PID, old code removal | 2.5 days | 4 |
 | 8 | `feat/mosh-engine` | Engine, `negotiateBackbone`, publisher rules, fallback, flag, state model | 3.5 days | 4, 6, 7, and #39 |
 | 9 | `feat/mosh-hybrid-keys` | Order barrier with SSH keys, real Herdr tests in CI | 3 days | 8 |
-| 10 | `feat/mosh-lazy-control` | Lazy supervisor, network events, `NeedsUser` rule, background detach | 3 days | 8 |
+| 10 | `feat/mosh-lazy-control` | Lazy supervisor states, foreground settle, network events, `NeedsUser` rule, background detach | 3.5 days | 8 |
 | 11 | `feat/mosh-ui` | RTT and contact text, marks, size lock, debug switch | 2 days | 8 |
 | 12 | `feat/mosh-enable` | Flag on, documents, device test card, clean-room record | 1.5 days | 9, 10, 11, the independent review, and the target SDK 37 pull request when it merges first |
 
@@ -937,10 +973,12 @@ Pull request 8 adds `MoshMachineState`, so that 9, 10, and 11 do not wait for ea
 
 - **Files.** `SessionSupervisor.kt`, `SshTransportManager.kt`, `RealHerdrSshClient.kt`, `MoshUdpEngine.kt`,
   `BisonSessionService.kt` (pass the `Network`), tests with the TCP and UDP relays.
-- **Scope.** The lazy control lane, the network events, the `NeedsUser` rule, `releaseControlLane`, and the
-  background detach of decision 6. Composer prompts to a Mosh pane go over Mosh.
-- **Tests.** Integration tests 6, 7, and 8 of decision 7.
-- **Done.** The "no new SSH connection" test passes on CI.
+- **Scope.** The state table of the lazy control lane, with the 5 s settle in the foreground. The network
+  events, the `NeedsUser` rule, `releaseControlLane`, and the background detach of decision 6. Composer
+  prompts to a Mosh pane go over Mosh.
+- **Tests.** Integration tests 6, 7, and 8 of decision 7, and the unit test of each state transition.
+- **Done.** Both network change tests pass on CI. The foreground variant gives exactly one new SSH session
+  after the 5 s settle. The background variant gives none until the app comes to the foreground.
 
 ### 11. `feat/mosh-ui`
 
@@ -987,7 +1025,9 @@ Wi-Fi to cellular. The app does not open a new SSH connection." The new text:
 
 > After a change from Wi-Fi to cellular, each pane on the Mosh backbone continues to show output and to
 > accept text input. The app opens no new SSH connection for this. The app opens a new SSH connection only
-> for the first operation that needs SSH, or when the app comes to the foreground.
+> in three cases. The first case is the first operation that needs SSH. The second case is a move of the
+> app to the foreground. The third case is a new network that is stable for 5 s while the app is in the
+> foreground.
 
 ## Corrections to other documents
 
@@ -1025,14 +1065,9 @@ Pull request 12 makes these corrections.
 | m9, file lists | The files that were not in the lists, the deletions, the install ID, and the server path | Pull requests 7, 8, and 12 |
 | Nits | SGR 2, 9, and 21. The Termux reason. `C.UTF-8`. The 60 s exit. STE fixes. | Decisions 1, 3, and 6 |
 | Unverified items | `DatagramSocket`, the Licensee checks, and the IDE import are risks with tests | Risks 11 to 13 |
+| Answers to the questions of revision 2 | Esc and the Ctrl keys stay on Mosh as a known limit. A network change in the foreground reconnects the control lane after 5 s. | Decision 5, decision 6, pull request 10 |
 
 ## Open questions
 
-1. **Kitty mode and the Mosh keys.** The decision of the user sends Esc and the Ctrl keys over Mosh. It
-   also sends "anything kitty keyboard mode changes" over SSH. Kitty flag 1 changes the bytes of Esc and of
-   most Ctrl keys. Over Mosh, a kitty-mode program gets the legacy bytes, which most programs accept. Should
-   Esc and the Ctrl keys stay on Mosh, or go over SSH with the barrier cost?
-2. **Old control data in the foreground.** When the network changes while the app is in the foreground,
-   no foreground move occurs. The agent status and the layout then stay old until the first SSH-only
-   operation or a tap on the mark. Is this acceptable, or should the app reconnect after a foreground
-   time, for example 30 s?
+None. The user answered the two questions of revision 2. Decision 5 has the kitty rule, and decision 6
+has the foreground rule.
