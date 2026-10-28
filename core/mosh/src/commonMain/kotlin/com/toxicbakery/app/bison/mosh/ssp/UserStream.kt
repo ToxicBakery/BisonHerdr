@@ -179,9 +179,9 @@ class UserStream(
          * The largest size of the events after the acknowledged state: 8 KiB. This is a choice of this client. Such a
          * diff is at most 7 fragments, so about half of its sends arrive whole when the network drops 10 percent of
          * the datagrams. The simulation used 10 percent loss in each direction and 10 seeds. There, a paste of 128 KiB
-         * took at most 18 s at an RTT of about 300 ms, and it did not complete with a limit of 192 KiB. A real server
-         * on the loopback with this loss got the paste in about 3.5 s. The cost: with no loss, a paste of 128 KiB
-         * takes 16 round trips.
+         * took at most 18 s at a one-way delay of 150 ms to 225 ms. With a limit of 192 KiB, it did not complete. A
+         * real server on the loopback with this loss got the paste in about 3.5 s. The cost: with no loss, a paste of
+         * 128 KiB takes 16 round trips.
          */
         const val MAX_DIFF_SIZE: Int = 8 * 1024
 
