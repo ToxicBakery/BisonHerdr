@@ -17,6 +17,8 @@ import org.junit.AssumptionViolatedException
  * when the test JVM exits before [close]. The server also gets `MOSH_SERVER_NETWORK_TMOUT`, so it stops by itself
  * after a silence when both of these steps fail.
  *
+ * The server and its command get no `HERDR_*` environment variable, so that a test cannot reach a live Herdr.
+ *
  * When `mosh-server` is not on the `PATH`, [start] skips the test. When the environment variable
  * [REQUIRE_VARIABLE] is `1`, [start] fails the test in place of the skip. CI sets it.
  */
@@ -82,6 +84,9 @@ class MoshServerFixture private constructor(
             val server = serverPath()
             val process = ProcessBuilder(listOf(server, "new", "-i", LOOPBACK.hostAddress, "--") + command)
                 .apply {
+                    // An inherited HERDR_SOCKET_PATH can reach the live Herdr server of the user. No test command
+                    // may see it.
+                    environment().keys.removeAll { name -> name.startsWith("HERDR_") }
                     environment()["LANG"] = "C.UTF-8"
                     environment()["LC_ALL"] = "C.UTF-8"
                     environment()["MOSH_SERVER_NETWORK_TMOUT"] = NETWORK_TIMEOUT_SECONDS

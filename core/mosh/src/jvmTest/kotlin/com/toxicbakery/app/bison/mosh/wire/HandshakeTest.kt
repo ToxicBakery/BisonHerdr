@@ -29,6 +29,8 @@ class HandshakeTest {
                 val reply = client.sendUntilAcknowledged(userState(1uL, UserEvent.Resize(60, 12)))
 
                 assertEquals(1, client.replyCount, "The first reply acknowledges the state.")
+                // The first instruction of the server has the ID 1 (wire fact 18).
+                assertEquals(1uL, reply.datagram.fragment.instructionId)
                 assertEquals(Instruction.VERSION, reply.instruction.version)
                 assertEquals(0uL, reply.instruction.fromState)
                 assertTrue(reply.instruction.toState > 0uL)
@@ -137,6 +139,9 @@ class HandshakeTest {
         /** The host events of all replies, in the order of arrival. */
         private val events = mutableListOf<HostEvent>()
 
+        /** The instruction ID of the newest fragment from the server. */
+        private var lastInstructionId = 0uL
+
         /** Returns the count of fragments that [instruction] needs. */
         fun fragmentCount(instruction: Instruction): Int =
             Fragment.split(0uL, zlib.compress(instruction.encode())).size
@@ -188,6 +193,12 @@ class HandshakeTest {
                 rejectedCount++
                 return null
             }
+            // The ID of a server instruction is never lower than the ID before it (wire fact 18). The server can
+            // send an instruction again with the same ID. FragmentAssembler depends on this order. The loopback path
+            // does not change the order of datagrams.
+            val instructionId = datagram.fragment.instructionId
+            assertTrue(instructionId >= lastInstructionId, "ID $instructionId came after ID $lastInstructionId.")
+            lastInstructionId = instructionId
             val stream = assembler.add(datagram.fragment) ?: return null
             val encoded = assertNotNull(zlib.decompress(stream, Instruction.MAX_SIZE))
             val instruction = assertNotNull(Instruction.decode(encoded))

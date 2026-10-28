@@ -28,6 +28,7 @@ private object JavaZlib : Zlib {
     }
 
     override fun decompress(data: ByteArray, maxSize: Int): ByteArray? {
+        require(maxSize >= 0) { "The size limit $maxSize is negative." }
         val inflater = Inflater()
         try {
             inflater.setInput(data)
