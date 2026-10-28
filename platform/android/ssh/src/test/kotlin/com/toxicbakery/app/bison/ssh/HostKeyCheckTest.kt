@@ -29,6 +29,7 @@ class HostKeyCheckTest {
     private val server = TestSshServer().start()
     private val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider())
     private val backend = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = SshStateManager(),
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

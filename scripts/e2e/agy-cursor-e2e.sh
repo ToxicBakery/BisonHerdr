@@ -175,7 +175,8 @@ done
 sshd_reachable || fail "The emulator cannot reach the private sshd at 10.0.2.2:$SSH_PORT."
 
 log "Install the test APK on $SERIAL."
-adb -s "$SERIAL" install -r -t "$TEST_APK" >/dev/null
+# -g grants the runtime permissions of the APK. Android 17 needs ACCESS_LOCAL_NETWORK for 10.0.2.2.
+adb -s "$SERIAL" install -r -t -g "$TEST_APK" >/dev/null
 
 run_test() {
     adb -s "$SERIAL" shell am instrument -w -r \

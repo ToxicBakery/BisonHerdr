@@ -279,6 +279,8 @@ class SshTransportManagerTest {
                 NeedsUserCause.InputCancelled("lan-box.lan:22"),
             SshAuthResult.LocalNetworkBlocked("lan-box.lan:22") to
                 NeedsUserCause.LocalNetworkPermission("lan-box.lan:22"),
+            SshAuthResult.LocalNetworkBlocked("lan-box.lan:22", timedOut = true) to
+                NeedsUserCause.LocalNetworkPermission("lan-box.lan:22", timedOut = true),
         )
 
         expected.forEach { (result, cause) ->

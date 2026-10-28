@@ -40,7 +40,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Tests the Android 17 local network permission with [RealSshBackend], [RealHerdrSshClient], and
  * [SshTransportManager] against real SSH servers ([TestSshServer]).
  *
- * The servers listen on the loopback address. Android does not stop a connection to a loopback address, so the
+ * The servers listen on the loopback address. Android does not stop a connection to a loopback address. Thus the
  * [LocalNetworkGuard] of the test puts `127.0.0.0/8` in the prefixes of the device, in place of a Wi-Fi network. The
  * permission is [permitted]. A connection that the guard stops gets to no server, and [TestSshServer.credentialChecks]
  * stays the same.
@@ -217,6 +217,67 @@ class LocalNetworkPermissionTest {
         assertEquals(setOf(PUBLIC_BASTION), resolved.toSet())
     }
 
+    @Test
+    fun aTimeoutToAPrivateAddressAsksAndTriesAgainAfterTheGrant() = runTest {
+        val batches = CopyOnWriteArrayList<String>()
+        val backend = timeoutBackend(batches)
+        startUi {
+            permitted = true
+            LocalNetworkOutcome.Granted
+        }
+        val machine = passwordMachine("routed-grant")
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        assertEquals(listOf(ROUTED_HOST_PORT), shown)
+        assertEquals(listOf("timeout", "ok"), batches)
+    }
+
+    @Test
+    fun aTimeoutToAPrivateAddressWithNoUiStopsWithTheTimeoutKind() = runTest {
+        val batches = CopyOnWriteArrayList<String>()
+        val backend = timeoutBackend(batches)
+        val machine = passwordMachine("routed-no-ui")
+
+        val result = backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine))
+
+        assertEquals(SshAuthResult.LocalNetworkBlocked(ROUTED_HOST_PORT, timedOut = true), result)
+        assertEquals(listOf("timeout"), batches)
+    }
+
+    /**
+     * Returns a backend whose client runs no real command. Its first batch fails as a connect timeout to a private
+     * address, and each later batch passes. [batches] gets the result of each batch.
+     */
+    private fun timeoutBackend(batches: MutableList<String>): RealSshBackend {
+        // The loopback address is not local here, so the check before the connect does not ask.
+        onLinkPrefixes = emptyList()
+        val client = RealHerdrSshClient(
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = surfaceBus,
+            semanticNotificationBus = SemanticNotificationBus(),
+            knownHostsStore = knownHostsStore,
+            keystoreKeyManagerProvider = { keyManager },
+            secretStore = secretStore,
+            remoteBatchExecutor = { _, _, _, _ ->
+                if (batches.isEmpty()) {
+                    batches += "timeout"
+                    throw LocalNetworkPermissionException(ROUTED_HOST_PORT, timedOut = true)
+                }
+                batches += "ok"
+                "herdr 0.1.0"
+            },
+            localNetworkGuard = LocalNetworkGuard(hasPermission = { permitted }, localPrefixes = { onLinkPrefixes }),
+        )
+        return RealSshBackend(
+            client = client,
+            sshStateManager = stateManager,
+            keystoreKeyManager = keyManager,
+            localNetworkAccess = localNetworkAccess,
+        ).also { backend = it }
+    }
+
     /**
      * Makes the client, the backend, and the transport. The reconnect loops run in the background scope. The guard
      * resolves a host with [resolve], or with the system resolver.
@@ -226,7 +287,7 @@ class LocalNetworkPermissionTest {
     ): SshTransportManager {
         val guard = LocalNetworkGuard(
             hasPermission = { permitted },
-            onLinkPrefixes = { onLinkPrefixes },
+            localPrefixes = { onLinkPrefixes },
             resolve = { host ->
                 resolved += host
                 resolve(host)
@@ -328,6 +389,9 @@ class LocalNetworkPermissionTest {
         const val TARGET = "target"
         const val BASTION = "bastion"
         const val PASSWORD_REF = "password-local-network"
+
+        /** The host and port of a host on a private subnet behind a router. */
+        const val ROUTED_HOST_PORT = "192.168.2.10:22"
 
         /** A bastion name that the guard of the test resolves to [PUBLIC_BASTION_ADDRESS]. */
         const val PUBLIC_BASTION = "bastion.example"

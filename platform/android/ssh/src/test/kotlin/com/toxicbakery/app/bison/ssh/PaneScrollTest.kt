@@ -248,6 +248,7 @@ class PaneScrollTest {
         gate: FrameGate = FrameGate(surfaceBus),
         debugLog: SshDebugLog = SshDebugLog(),
     ) = RealHerdrSshClient(
+        localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = surfaceBus,

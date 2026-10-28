@@ -113,10 +113,12 @@ sealed interface SshAuthResult {
     data class InputCancelled(val hostPort: String) : SshAuthResult
 
     /**
-     * Android stops the connection to [hostPort] on the local network, because the app does not have the local
-     * network permission (`ACCESS_LOCAL_NETWORK`). [hostPort] is the bastion or the target. The client opened no
-     * socket. A retry gives the same result until the user allows the permission, so a reconnect loop must stop. It is
-     * not a [NetworkError].
+     * The app does not have the local network permission (`ACCESS_LOCAL_NETWORK`), and [hostPort] is on the local
+     * network. [hostPort] is the bastion or the target. A retry gives the same result until the user allows the
+     * permission, so a reconnect loop must stop. It is not a [NetworkError].
+     *
+     * When [timedOut] is false, the client opened no socket, because Android stops the connection. When [timedOut] is
+     * true, the connect to a private address failed after its time limit, and Android can be the cause.
      */
-    data class LocalNetworkBlocked(val hostPort: String) : SshAuthResult
+    data class LocalNetworkBlocked(val hostPort: String, val timedOut: Boolean = false) : SshAuthResult
 }

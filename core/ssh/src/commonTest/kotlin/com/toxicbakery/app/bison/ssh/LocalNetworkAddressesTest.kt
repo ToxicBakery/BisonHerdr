@@ -3,65 +3,107 @@ package com.toxicbakery.app.bison.ssh
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Tests [LocalNetworkAddresses] against the local network definition of Android 17:
- * https://developer.android.com/privacy-and-security/local-network-definition
+ * Tests [LocalNetworkAddresses] against the local network rules of Android 17 (`ConnectivityService` at the tag
+ * `android-17.0.0_r1`): the on-link prefixes of the interfaces, multicast, and broadcast.
  */
 class LocalNetworkAddressesTest {
 
+    /** The prefixes of a device on a Wi-Fi network with IPv4 and IPv6, and with Tailscale on. */
+    private val wifiAndTailscale = listOfNotNull(
+        prefix("192.168.1.5", 24), // wlan0
+        prefix("2001:db8:1:2::5", 64), // wlan0, global
+        prefix("fe80::5", 64), // wlan0, link-local
+        prefix("100.64.0.7", 32), // tun0, Tailscale
+        prefix("fd7a:115c:a1e0::7", 128), // tun0, Tailscale
+    )
+
     @Test
-    fun theRfc1918RangesAreLocalUpToTheirLimits() {
-        assertLocal("10.0.0.0", "10.255.255.255", "172.16.0.1", "172.31.255.255", "192.168.0.1", "192.168.255.254")
-        assertNotLocal("9.255.255.255", "11.0.0.0", "172.15.255.255", "172.32.0.0", "192.167.255.255", "192.169.0.0")
+    fun anIpv4PrefixIsLocalOnlyInsideTheFiveRanges() {
+        assertPrefix("192.168.1.5", 24)
+        assertPrefix("10.20.30.2", 24)
+        assertPrefix("10.20.30.2", 32)
+        assertPrefix("172.16.4.1", 12)
+        assertPrefix("169.254.7.7", 16)
+        assertPrefix("100.64.0.7", 32)
+        assertPrefix("100.64.0.7", 10)
+        // A prefix that is larger than its range, or outside each range, is not local.
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("10.1.2.3"), 7))
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("100.64.0.7"), 9))
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("203.0.113.5"), 24))
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("192.168.1.5"), 0))
     }
 
     @Test
-    fun theCgnatRangeOfTailscaleIsLocal() {
-        assertLocal("100.64.0.0", "100.100.100.100", "100.101.102.103", "100.127.255.255")
-        assertNotLocal("100.63.255.255", "100.128.0.0")
+    fun anIpv6PrefixIsLocalWhenItsLengthIsMoreThanZero() {
+        assertPrefix("2001:db8:1:2::5", 64)
+        assertPrefix("fd7a:115c:a1e0::7", 128)
+        assertPrefix("fe80::5", 64)
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("2001:db8::5"), 0))
+        assertNull(LocalNetworkAddresses.localPrefixOf(ByteArray(5), 8))
+        assertNull(LocalNetworkAddresses.localPrefixOf(address("2001:db8::5"), 129))
     }
 
     @Test
-    fun linkLocalMulticastAndBroadcastAddressesAreLocal() {
-        assertLocal("169.254.0.1", "169.254.255.255", "224.0.0.251", "239.255.255.250", "255.255.255.255")
-        assertNotLocal("169.253.255.255", "169.255.0.0", "240.0.0.1", "255.255.255.254")
+    fun aHostOnTheWifiSubnetIsLocal() {
+        assertLocal("192.168.1.42", "192.168.1.255", "2001:db8:1:2::42", "fe80::42")
     }
 
     @Test
-    fun publicAndLoopbackIpv4AddressesAreNotLocal() {
-        assertNotLocal("8.8.8.8", "140.82.112.3", "1.1.1.1", "127.0.0.1", "0.0.0.0")
+    fun aTailscalePeerIsNotLocalBecauseTheVpnInterfaceHasOnlyItsOwnAddress() {
+        assertNotLocal("100.101.102.103", "100.64.0.8", "fd7a:115c:a1e0::9")
+        // The own addresses of the VPN interface are local.
+        assertLocal("100.64.0.7", "fd7a:115c:a1e0::7")
     }
 
     @Test
-    fun ipv6LinkLocalUniqueLocalAndMulticastAddressesAreLocal() {
-        assertLocal("fe80::1", "febf:ffff::1", "fc00::1", "fd00::5", "fd7a:115c:a1e0::1", "ff02::fb", "ff05::c")
-        assertNotLocal("fec0::1", "fe7f::1", "fb00::1", "2001:db8::1", "2606:4700::1111", "::1", "::")
+    fun aWireGuardPeerIsLocalOnlyWhenTheInterfaceHasItsSubnet() {
+        assertFalse(LocalNetworkAddresses.isLocal(address("10.20.30.40"), listOfNotNull(prefix("10.20.30.2", 32))))
+        assertTrue(LocalNetworkAddresses.isLocal(address("10.20.30.40"), listOfNotNull(prefix("10.20.30.2", 24))))
+    }
+
+    @Test
+    fun aHostOnARoutedPrivateSubnetIsNotLocalButIsPrivate() {
+        listOf("192.168.2.10", "10.0.0.7", "172.20.1.1", "fd00::42", "2001:db8:1:3::42").forEach { text ->
+            assertFalse(LocalNetworkAddresses.isLocal(address(text), wifiAndTailscale), "$text must not be local")
+        }
+        listOf("192.168.2.10", "10.0.0.7", "172.20.1.1", "100.101.102.103", "169.254.1.1", "fd00::42", "fe80::9")
+            .forEach { text -> assertTrue(LocalNetworkAddresses.isPrivate(address(text)), "$text must be private") }
+        listOf("2001:db8:1:3::42", "8.8.8.8", "127.0.0.1", "::1", "100.128.0.1").forEach { text ->
+            assertFalse(LocalNetworkAddresses.isPrivate(address(text)), "$text must not be private")
+        }
+    }
+
+    @Test
+    fun multicastAndBroadcastAddressesAreAlwaysLocal() {
+        listOf("224.0.0.251", "239.255.255.250", "255.255.255.255", "ff02::fb", "ff05::c").forEach { text ->
+            assertTrue(LocalNetworkAddresses.isLocal(address(text), emptyList()), "$text must be local")
+            assertTrue(LocalNetworkAddresses.isPrivate(address(text)), "$text must be private")
+        }
+    }
+
+    @Test
+    fun publicAndLoopbackAddressesAreNotLocal() {
+        assertNotLocal("8.8.8.8", "140.82.112.3", "127.0.0.1", "0.0.0.0", "::1", "::", "2606:4700::1111")
     }
 
     @Test
     fun anIpv4MappedIpv6AddressHasTheResultOfItsIpv4Address() {
-        assertLocal("::ffff:192.168.1.5", "::ffff:100.64.1.1")
-        assertNotLocal("::ffff:8.8.8.8", "::ffff:127.0.0.1")
-    }
-
-    @Test
-    fun anAddressInAPrefixOfTheDeviceIsLocal() {
-        val prefixes = listOf(AddressPrefix(address("2001:db8:1:2::"), 64))
-
-        assertTrue(LocalNetworkAddresses.isLocal(address("2001:db8:1:2::5"), prefixes))
-        assertTrue(LocalNetworkAddresses.isLocal(address("2001:db8:1:2:ffff:ffff:ffff:ffff"), prefixes))
-        assertFalse(LocalNetworkAddresses.isLocal(address("2001:db8:1:3::5"), prefixes))
-        assertFalse(LocalNetworkAddresses.isLocal(address("2001:db8:1:2::5")))
-        // A prefix of one size does not contain an address of the other size.
-        assertFalse(LocalNetworkAddresses.isLocal(address("8.8.8.8"), prefixes))
+        assertLocal("::ffff:192.168.1.5")
+        assertNotLocal("::ffff:192.168.2.5", "::ffff:8.8.8.8")
+        assertTrue(LocalNetworkAddresses.isPrivate(address("::ffff:10.0.0.1")))
+        assertFalse(LocalNetworkAddresses.isPrivate(address("::ffff:8.8.8.8")))
     }
 
     @Test
     fun anAddressWithAnUnknownSizeIsNotLocal() {
-        assertFalse(LocalNetworkAddresses.isLocal(ByteArray(0)))
-        assertFalse(LocalNetworkAddresses.isLocal(byteArrayOf(192.toByte(), 168.toByte(), 1)))
+        assertFalse(LocalNetworkAddresses.isLocal(ByteArray(0), wifiAndTailscale))
+        assertFalse(LocalNetworkAddresses.isLocal(byteArrayOf(192.toByte(), 168.toByte(), 1), wifiAndTailscale))
+        assertFalse(LocalNetworkAddresses.isPrivate(ByteArray(5)))
     }
 
     @Test
@@ -86,6 +128,7 @@ class LocalNetworkAddressesTest {
         assertTrue(AddressPrefix(address("10.1.2.3"), 0).contains(address("8.8.8.8")))
         assertTrue(AddressPrefix(address("10.1.2.3"), 32).contains(address("10.1.2.3")))
         assertFalse(AddressPrefix(address("10.1.2.3"), 32).contains(address("10.1.2.4")))
+        assertFalse(AddressPrefix(address("10.1.2.3"), 8).contains(address("::ffff:10.1.2.3")))
     }
 
     @Test
@@ -95,13 +138,22 @@ class LocalNetworkAddressesTest {
         assertFailsWith<IllegalArgumentException> { AddressPrefix(address("fe80::"), 129) }
     }
 
+    private fun prefix(text: String, length: Int): AddressPrefix? =
+        LocalNetworkAddresses.localPrefixOf(address(text), length)
+
+    private fun assertPrefix(text: String, length: Int) {
+        assertNotNull(prefix(text, length), "$text/$length must give a local prefix")
+    }
+
     private fun assertLocal(vararg addresses: String) {
-        addresses.forEach { text -> assertTrue(LocalNetworkAddresses.isLocal(address(text)), "$text must be local") }
+        addresses.forEach { text ->
+            assertTrue(LocalNetworkAddresses.isLocal(address(text), wifiAndTailscale), "$text must be local")
+        }
     }
 
     private fun assertNotLocal(vararg addresses: String) {
         addresses.forEach { text ->
-            assertFalse(LocalNetworkAddresses.isLocal(address(text)), "$text must not be local")
+            assertFalse(LocalNetworkAddresses.isLocal(address(text), wifiAndTailscale), "$text must not be local")
         }
     }
 

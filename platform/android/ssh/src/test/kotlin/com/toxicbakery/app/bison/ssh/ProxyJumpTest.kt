@@ -40,6 +40,7 @@ class ProxyJumpTest {
     }
     private val stateManager = SshStateManager()
     private val backend = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = stateManager,
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

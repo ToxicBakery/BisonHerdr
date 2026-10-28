@@ -57,6 +57,7 @@ class HardwareSecurityKeyRefusalTest {
         // The socket gets the connection in its backlog, also when the test does not call accept.
         ServerSocket(0, 1, InetAddress.getByName(TestSshServer.HOST)).use { listener ->
             val backend = RealSshBackend(
+                localNetworkGuard = permittedLocalNetwork(),
                 sshStateManager = stateManager,
                 sshDebugLog = debugLog,
                 endpointSnapshotBus = EndpointSnapshotBus(),

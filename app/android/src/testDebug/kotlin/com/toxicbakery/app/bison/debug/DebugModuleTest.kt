@@ -44,7 +44,9 @@ class DebugModuleTest {
         // The Application binds this directory with its Context.
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) { InMemoryStoreIOProvider() }
         // The Application also binds the local network guard with its Context.
-        bindSingleton<LocalNetworkGuard> { LocalNetworkGuard(hasPermission = { true }) }
+        bindSingleton<LocalNetworkGuard> {
+            LocalNetworkGuard(hasPermission = { true }, localPrefixes = { emptyList() })
+        }
     }
     private val backend = assertIs<SelectingSshBackend>(di.direct.instance<SshBackend>())
     private val debugLog = di.direct.instance<SshDebugLog>()

@@ -1,48 +1,51 @@
 package com.toxicbakery.app.bison.ssh
 
 /**
- * Tells if an address or a host name is on the local network, as Android 17 local network protection defines it.
- * An app that targets API 37 must have the `ACCESS_LOCAL_NETWORK` runtime permission for each TCP or UDP connection
- * to such an address. Without the permission, Android drops the packets: a TCP connect fails after its timeout, and a
- * UDP send fails with `EPERM`. See https://developer.android.com/privacy-and-security/local-network-definition.
+ * Tells if an address or a host name is on the local network, as the local network protection of Android 17 defines
+ * it. An app that targets API 37 must have the `ACCESS_LOCAL_NETWORK` runtime permission for a TCP or UDP connection to
+ * such an address. Without the permission, Android drops the packets. A TCP connect then fails after its timeout, and
+ * a UDP send fails with `EPERM`. See https://developer.android.com/privacy-and-security/local-network-definition.
  *
- * These addresses are on the local network:
- * - IPv4: the link-local range `169.254.0.0/16`, the CGNAT range `100.64.0.0/10` (Tailscale uses it), and the
- *   RFC 1918 ranges `10.0.0.0/8`, `172.16.0.0/12`, and `192.168.0.0/16`.
- * - IPv6: the link-local range `fe80::/10`, the unique local range `fc00::/7`, and the prefixes of the networks of
- *   the device (the `onLinkPrefixes` of [isLocal]).
- * - The multicast ranges `224.0.0.0/4` and `ff00::/8`, and the IPv4 broadcast address `255.255.255.255`.
- * - An IPv4-mapped IPv6 address of a local IPv4 address.
+ * Android 17 (`ConnectivityService` at the tag `android-17.0.0_r1`) makes a list for each interface of the device. The
+ * list has the on-link prefix of each address of the interface ([localPrefixOf]):
+ * - An IPv4 prefix only when it is in one of the five ranges: `169.254.0.0/16`, `100.64.0.0/10` (CGNAT), `10.0.0.0/8`,
+ *   `172.16.0.0/12`, and `192.168.0.0/16`.
+ * - Each IPv6 prefix with a length that is more than 0.
  *
- * A host name with the mDNS suffix `.local` is also on the local network ([isLocalName]), because Android stops the
- * mDNS query for it. The loopback addresses are not on the local network.
+ * The list also has the multicast ranges `224.0.0.0/4` and `ff00::/8`, and the IPv4 broadcast address. Android drops a
+ * packet only when its address is in the list of the interface that sends it. Android makes no list for a network
+ * with an HTTP proxy, or when the device has a global HTTP proxy.
  *
- * Android applies a range only to an interface that has an address in it. Thus this check can find an address local
- * when Android does not stop the connection, and the app then asks for a permission that it does not need. But the
- * app never waits for the timeout of a connection that Android stops.
+ * Thus a Tailscale or WireGuard peer is not local when the VPN interface has only its own address (`/32` or `/128`).
+ * A host on a different private subnet behind a router is also not local. For such an address, [isPrivate] tells only
+ * that Android can stop the connection on a network that has its range.
  *
- * Two ranges are local here, but the documents of Android are not clear about them. The reference of
- * `ACCESS_LOCAL_NETWORK` excludes VPN connections, but the list has the CGNAT range, and Tailscale uses that range
- * on its VPN interface. The list does not name the unique local range, but home networks and the IPv6 addresses of
- * Tailscale (`fd7a:115c:a1e0::/48`) use it.
+ * A host name with the mDNS suffix `.local` is also local ([isLocalName]), because its query is a multicast. Loopback
+ * addresses are not local.
  */
 object LocalNetworkAddresses {
 
     private const val MDNS_SUFFIX = ".local"
 
-    private val IPV4_RANGES = listOf(
+    /** The IPv4 ranges that Android puts in its lists (`NetworkStackConstants.IPV4_LOCAL_PREFIXES`). */
+    private val IPV4_LOCAL_RANGES = listOf(
         ipv4Prefix(169, 254, 0, 0, length = 16), // Link-local
         ipv4Prefix(100, 64, 0, 0, length = 10), // CGNAT, Tailscale
         ipv4Prefix(10, 0, 0, 0, length = 8), // RFC 1918
         ipv4Prefix(172, 16, 0, 0, length = 12), // RFC 1918
         ipv4Prefix(192, 168, 0, 0, length = 16), // RFC 1918
-        ipv4Prefix(224, 0, 0, 0, length = 4), // Multicast
-        ipv4Prefix(255, 255, 255, 255, length = 32), // Broadcast
     )
 
-    private val IPV6_RANGES = listOf(
+    /** The private IPv6 ranges: Android puts a prefix in them in its list when an interface has an address there. */
+    private val IPV6_PRIVATE_RANGES = listOf(
         ipv6Prefix(0xfe, 0x80, length = 10), // Link-local
         ipv6Prefix(0xfc, 0x00, length = 7), // Unique local
+    )
+
+    /** The ranges that Android puts in the list of each interface (`MULTICAST_AND_BROADCAST_PREFIXES`). */
+    private val MULTICAST_AND_BROADCAST = listOf(
+        ipv4Prefix(224, 0, 0, 0, length = 4), // Multicast
+        ipv4Prefix(255, 255, 255, 255, length = 32), // Broadcast
         ipv6Prefix(0xff, 0x00, length = 8), // Multicast
     )
 
@@ -53,29 +56,57 @@ object LocalNetworkAddresses {
 
     /**
      * Returns true when [host] has the mDNS suffix `.local`, also with a final dot and in each letter case. The query
-     * for such a name is a multicast on the local network, so Android stops it when the app does not have the
+     * for such a name is a multicast on the local network. Thus Android stops it when the app does not have the
      * permission.
      */
     fun isLocalName(host: String): Boolean =
         host.trim().trimEnd('.').lowercase().endsWith(MDNS_SUFFIX)
 
     /**
-     * Returns true when [address] is on the local network. [address] has 4 bytes (IPv4) or 16 bytes (IPv6). Each
-     * other size is not local. [onLinkPrefixes] are the prefixes of the networks of the device, for example the IPv6
-     * prefix of the Wi-Fi network. An address in one of them is local.
+     * Returns the prefix that Android puts in the list of an interface for its address [address] with the length
+     * [prefixLength]. Returns null when Android puts no prefix in the list for it. [address] has 4 bytes (IPv4) or 16
+     * bytes (IPv6).
      */
-    fun isLocal(address: ByteArray, onLinkPrefixes: List<AddressPrefix> = emptyList()): Boolean {
-        val ipv4 = when (address.size) {
-            IPV4_SIZE -> address
-            IPV6_SIZE -> address.takeIf { it.isIpv4Mapped() }?.copyOfRange(IPV4_MAPPED_PREFIX_SIZE, IPV6_SIZE)
-            else -> return false
-        }
-        if (ipv4 != null) return IPV4_RANGES.any { it.contains(ipv4) } || onLinkPrefixes.any { it.contains(ipv4) }
-        return IPV6_RANGES.any { it.contains(address) } || onLinkPrefixes.any { it.contains(address) }
+    fun localPrefixOf(address: ByteArray, prefixLength: Int): AddressPrefix? {
+        if (address.size != IPV4_SIZE && address.size != IPV6_SIZE) return null
+        if (prefixLength !in 1..address.size * Byte.SIZE_BITS) return null
+        val prefix = AddressPrefix(address, prefixLength)
+        if (address.size == IPV6_SIZE) return prefix
+        val inRange = IPV4_LOCAL_RANGES.any { range -> prefixLength >= range.length && range.contains(address) }
+        return prefix.takeIf { inRange }
     }
 
-    private fun ByteArray.isIpv4Mapped(): Boolean =
-        IPV4_MAPPED_PREFIX.indices.all { index -> this[index] == IPV4_MAPPED_PREFIX[index] }
+    /**
+     * Returns true when Android stops a connection to [address] without the permission. [address] has 4 bytes (IPv4)
+     * or 16 bytes (IPv6). Each other size is not local. [localPrefixes] are the prefixes of the interfaces of the
+     * device, from [localPrefixOf]. Multicast and broadcast addresses are always local.
+     */
+    fun isLocal(address: ByteArray, localPrefixes: List<AddressPrefix>): Boolean {
+        val candidate = ipv4Of(address) ?: address.takeIf { it.size == IPV6_SIZE } ?: return false
+        return MULTICAST_AND_BROADCAST.any { it.contains(candidate) } || localPrefixes.any { it.contains(candidate) }
+    }
+
+    /**
+     * Returns true when [address] is in a range that Android can put in the list of an interface. These ranges are
+     * the five IPv4 ranges, the IPv6 link-local and unique local ranges, multicast, and broadcast. Android stops a
+     * connection to such an address only when an interface of the device has a prefix of it. See [isLocal].
+     */
+    fun isPrivate(address: ByteArray): Boolean {
+        val ipv4 = ipv4Of(address)
+        return when {
+            isLocal(address, emptyList()) -> true
+            ipv4 != null -> IPV4_LOCAL_RANGES.any { it.contains(ipv4) }
+            else -> IPV6_PRIVATE_RANGES.any { it.contains(address) }
+        }
+    }
+
+    /** Returns [address] when it is an IPv4 address, the IPv4 address in an IPv4-mapped IPv6 address, or null. */
+    private fun ipv4Of(address: ByteArray): ByteArray? = when {
+        address.size == IPV4_SIZE -> address
+        address.size == IPV6_SIZE && IPV4_MAPPED_PREFIX.indices.all { address[it] == IPV4_MAPPED_PREFIX[it] } ->
+            address.copyOfRange(IPV4_MAPPED_PREFIX_SIZE, IPV6_SIZE)
+        else -> null
+    }
 
     private fun ipv4Prefix(first: Int, second: Int, third: Int, fourth: Int, length: Int): AddressPrefix =
         AddressPrefix(byteArrayOf(first.toByte(), second.toByte(), third.toByte(), fourth.toByte()), length)

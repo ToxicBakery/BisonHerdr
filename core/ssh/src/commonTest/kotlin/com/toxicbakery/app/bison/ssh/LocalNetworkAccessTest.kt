@@ -38,7 +38,7 @@ class LocalNetworkAccessTest {
 
     @Test
     fun withNoUiTheRequestReturnsNoUiAtOnceAndPutsNoRequest() = runTest {
-        assertEquals(LocalNetworkOutcome.NoUi, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.NoUi, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
         assertNull(access.openRequest.value)
     }
 
@@ -46,7 +46,7 @@ class LocalNetworkAccessTest {
     fun theUiGivesTheAnswerAndTheRequestCloses() = runTest {
         startUi { LocalNetworkOutcome.Granted }
 
-        assertEquals(LocalNetworkOutcome.Granted, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.Granted, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
         assertEquals(listOf(HOST_PORT), shown)
         assertNull(access.openRequest.value)
     }
@@ -55,7 +55,7 @@ class LocalNetworkAccessTest {
     fun aDenialIsTheAnswerOfTheRequest() = runTest {
         startUi { LocalNetworkOutcome.Denied }
 
-        assertEquals(LocalNetworkOutcome.Denied, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.Denied, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
     }
 
     @Test
@@ -63,8 +63,8 @@ class LocalNetworkAccessTest {
         val answer = CompletableDeferred<LocalNetworkOutcome>()
         startUi { answer.await() }
 
-        val first = async { access.request(HOST_PORT, TIMEOUT) }
-        val second = async { access.request("10.0.0.7:22", TIMEOUT) }
+        val first = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
+        val second = async { access.request("gpu-rig", "10.0.0.7:22", TIMEOUT) }
         runCurrent()
         answer.complete(LocalNetworkOutcome.Granted)
 
@@ -84,7 +84,7 @@ class LocalNetworkAccessTest {
             }
         }
 
-        assertEquals(LocalNetworkOutcome.TimedOut, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.TimedOut, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
         runCurrent()
         assertTrue(dialogCancelled)
         assertNull(access.openRequest.value)
@@ -93,24 +93,79 @@ class LocalNetworkAccessTest {
     @Test
     fun theStopOfTheLastUiCancelsTheOpenRequest() = runTest {
         val ui = startUi { awaitCancellation() }
-        val result = async { access.request(HOST_PORT, TIMEOUT) }
+        val result = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
         runCurrent()
 
         ui.cancel()
 
         assertEquals(LocalNetworkOutcome.Cancelled, result.await())
         // With no UI, the next request does not ask.
-        assertEquals(LocalNetworkOutcome.NoUi, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.NoUi, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
+    }
+
+    @Test
+    fun aCancelEndsTheWaitOfOneMachineAndTheOtherMachineGetsTheAnswer() = runTest {
+        val answer = CompletableDeferred<LocalNetworkOutcome>()
+        startUi { answer.await() }
+        val first = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
+        val second = async { access.request("gpu-rig", "10.0.0.7:22", TIMEOUT) }
+        runCurrent()
+
+        access.cancel(MACHINE_ID)
+
+        assertEquals(LocalNetworkOutcome.Cancelled, first.await())
+        // The dialog stays open for the other machine.
+        assertEquals(HOST_PORT, access.openRequest.value?.hostPort)
+        answer.complete(LocalNetworkOutcome.Granted)
+        assertEquals(LocalNetworkOutcome.Granted, second.await())
+    }
+
+    @Test
+    fun aCancelOfTheLastMachineClosesTheDialog() = runTest {
+        var dialogCancelled = false
+        startUi {
+            try {
+                awaitCancellation()
+            } finally {
+                dialogCancelled = true
+            }
+        }
+        val result = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
+        runCurrent()
+
+        access.cancel("unknown-box")
+        access.cancelAll()
+
+        assertEquals(LocalNetworkOutcome.Cancelled, result.await())
+        runCurrent()
+        assertTrue(dialogCancelled)
+        assertNull(access.openRequest.value)
+    }
+
+    @Test
+    fun aNewWaitOfTheSameMachineEndsItsOlderWait() = runTest {
+        val answer = CompletableDeferred<LocalNetworkOutcome>()
+        startUi { answer.await() }
+        val older = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
+        runCurrent()
+
+        val newer = async { access.request(MACHINE_ID, HOST_PORT, TIMEOUT) }
+        runCurrent()
+
+        assertEquals(LocalNetworkOutcome.Cancelled, older.await())
+        answer.complete(LocalNetworkOutcome.Denied)
+        assertEquals(LocalNetworkOutcome.Denied, newer.await())
     }
 
     @Test
     fun aUiThatThrowsGivesADenial() = runTest {
         startUi { throw IllegalStateException("No activity") }
 
-        assertEquals(LocalNetworkOutcome.Denied, access.request(HOST_PORT, TIMEOUT))
+        assertEquals(LocalNetworkOutcome.Denied, access.request(MACHINE_ID, HOST_PORT, TIMEOUT))
     }
 
     private companion object {
+        const val MACHINE_ID = "lan-box"
         const val HOST_PORT = "192.168.1.42:22"
         val TIMEOUT = 60.seconds
     }
