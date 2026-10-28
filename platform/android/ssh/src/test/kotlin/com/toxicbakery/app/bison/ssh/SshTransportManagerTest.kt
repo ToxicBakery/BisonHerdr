@@ -17,6 +17,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TestTimeSource
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
@@ -25,6 +26,7 @@ import kotlinx.coroutines.withTimeout
 /**
  * Tests the parts of [SshTransportManager] that do not depend on the backend type.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class SshTransportManagerTest {
 
     private val debugLog = SshDebugLog()
@@ -283,15 +285,31 @@ class SshTransportManagerTest {
     }
 
     @Test
+    fun theLivenessChecksOfAllMachinesRunAtTheSameTime() = runTest {
+        val backend = RecordingSshBackend()
+        val manager = manager(backend)
+        connectAll(manager, backend, lanBox, gpuRig)
+        backend.livenessDelay = SshTransportManager.LIVENESS_TIMEOUT
+        val start = testScheduler.currentTime
+
+        manager.onNetworkAvailable()
+
+        assertEquals(listOf("checkLiveness lan-box", "checkLiveness gpu-rig"), backend.calls.take(2))
+        // Two checks one after the other would take 6 s.
+        assertEquals(SshTransportManager.LIVENESS_TIMEOUT.inWholeMilliseconds, testScheduler.currentTime - start)
+    }
+
+    @Test
     fun aFailedLivenessCheckReconnectsAtOnce() = runTest {
         val backend = RecordingSshBackend()
         val manager = manager(backend)
         connectAll(manager, backend, lanBox)
-        backend.live = false
+        backend.liveness = LivenessResult.Dead(sessionId = 7L)
 
         manager.onNetworkAvailable()
 
-        assertEquals(listOf("checkLiveness lan-box", "reconnectNow lan-box"), backend.calls)
+        // The manager gives the session of the check, so that the backend keeps a newer session.
+        assertEquals(listOf("checkLiveness lan-box", "reconnectNow lan-box 7"), backend.calls)
         assertEquals(RoamingStatus.RoamingReconnect, stateManager.roamingState.value[lanBox.id])
     }
 
@@ -326,9 +344,12 @@ class SshTransportManagerTest {
         assertTrue(stateManager.isMachineConnected(lanBox.id), "A lost network must not disconnect the machine")
 
         // The new network comes in the same second. Its check runs, and the closed session gets a reconnect now.
-        backend.live = false
+        backend.liveness = LivenessResult.Dead(sessionId = null)
         manager.onNetworkAvailable()
-        assertEquals(listOf("closeSockets lan-box", "checkLiveness lan-box", "reconnectNow lan-box"), backend.calls)
+        assertEquals(
+            listOf("closeSockets lan-box", "checkLiveness lan-box", "reconnectNow lan-box null"),
+            backend.calls,
+        )
     }
 
     @Test

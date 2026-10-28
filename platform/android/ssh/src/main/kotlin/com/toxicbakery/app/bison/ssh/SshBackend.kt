@@ -76,17 +76,23 @@ interface SshBackend {
     fun setSessionEvents(events: SessionEvents) = Unit
 
     /**
-     * Returns true when the session of [machineId] replies in [timeout]. Returns false when the machine has no open
-     * session. The default backend has no network connection, so its session is always live.
+     * Returns [LivenessResult.Live] when the session of [machineId] replies in [timeout]. Returns
+     * [LivenessResult.Dead] when it does not reply, or when the machine has no open session. The default backend has
+     * no network connection, so its session is always live.
      */
-    suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean = true
-
-    /** Starts a reconnect attempt for [machineId] now, with no delay. The default backend does nothing. */
-    fun reconnectNow(machineId: String) = Unit
+    suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult = LivenessResult.Live
 
     /**
-     * Closes the network sockets of [machineId] after the device lost its network, and starts the reconnect loop.
-     * Thus the next attempt does not wait for a TCP timeout on the old network. The default backend does nothing.
+     * Starts a reconnect attempt for [machineId] now, with no delay. [deadSessionId] is the session of a failed
+     * liveness check ([LivenessResult.Dead.sessionId]). When a different session is live, the reconnect loop opened
+     * it after the check, and the backend keeps it. The default backend does nothing.
+     */
+    fun reconnectNow(machineId: String, deadSessionId: Long?) = Unit
+
+    /**
+     * Closes the network sockets of [machineId] after the device lost its network. Thus no attempt waits for a TCP
+     * timeout on the old network. The reconnect loop then makes no attempt until [reconnectNow], because an attempt
+     * with no network fails. The default backend does nothing.
      */
     fun closeSockets(machineId: String) = Unit
 

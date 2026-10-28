@@ -76,11 +76,11 @@ class SelectingSshBackend(
         simulated.setSessionEvents(events)
     }
 
-    override suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean =
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult =
         backendFor(machineId).checkLiveness(machineId, timeout)
 
-    override fun reconnectNow(machineId: String) =
-        backendFor(machineId).reconnectNow(machineId)
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) =
+        backendFor(machineId).reconnectNow(machineId, deadSessionId)
 
     override fun closeSockets(machineId: String) =
         backendFor(machineId).closeSockets(machineId)

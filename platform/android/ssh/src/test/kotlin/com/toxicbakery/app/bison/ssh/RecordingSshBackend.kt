@@ -6,23 +6,28 @@ import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.time.Duration
+import kotlinx.coroutines.delay
 
 /**
  * An [SshBackend] that records each call and opens no connection. [authenticate] returns [authResult].
  * A test can change [authResult] between two calls.
  *
- * [checkLiveness] returns [live]. [openSurface] runs [onOpenSurface], so that a test can make the step throw or
+ * [checkLiveness] waits for [livenessDelay] and then returns [liveness]. [openSurface] runs [onOpenSurface], so that a test can make the step throw or
  * wait. [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
  * reconnect loop.
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
-    @Volatile var live: Boolean = true,
+    @Volatile var liveness: LivenessResult = LivenessResult.Live,
     private val onOpenSurface: (suspend () -> Unit)? = null,
 ) : SshBackend {
 
     /** One entry for each call: the method name and the machine id, for example `resize workbox`. */
     val calls: MutableList<String> = CopyOnWriteArrayList()
+
+    /** The time that each liveness check takes. */
+    @Volatile
+    var livenessDelay: Duration = Duration.ZERO
 
     /** The receiver of the reconnect events, or null before [setSessionEvents]. */
     @Volatile
@@ -81,13 +86,14 @@ internal class RecordingSshBackend(
         sessionEvents = events
     }
 
-    override suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean {
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult {
         calls += "checkLiveness $machineId"
-        return live
+        delay(livenessDelay)
+        return liveness
     }
 
-    override fun reconnectNow(machineId: String) {
-        calls += "reconnectNow $machineId"
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) {
+        calls += "reconnectNow $machineId $deadSessionId"
     }
 
     override fun closeSockets(machineId: String) {

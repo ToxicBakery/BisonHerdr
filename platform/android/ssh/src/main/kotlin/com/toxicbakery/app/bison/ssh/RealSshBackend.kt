@@ -116,11 +116,11 @@ class RealSshBackend internal constructor(
         client.sessionEvents = events
     }
 
-    override suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean =
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult =
         client.checkLiveness(machineId, timeout)
 
-    override fun reconnectNow(machineId: String) {
-        client.reconnectNow(machineId)
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) {
+        client.reconnectNow(machineId, deadSessionId)
     }
 
     override fun closeSockets(machineId: String) {

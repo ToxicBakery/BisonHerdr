@@ -11,16 +11,19 @@ import kotlin.random.Random
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -165,18 +168,66 @@ class SessionReconnectTest {
     }
 
     @Test
-    fun aLostNetworkClosesTheSessionAndTheLoopOpensANewSession() = runTest {
+    fun aLostNetworkClosesTheSessionAndHoldsTheLoopUntilANetworkComes() = runTest {
         val transport = startTransport()
         val machine = passwordMachine("reconnect-network-lost")
         assertTrue(transport.connect(machine), debugLogDump())
+        val checks = server.credentialChecks
 
         transport.onNetworkLost()
+        advanceTimeBy(10.minutes)
+        runCurrent()
 
         assertEquals(RoamingStatus.RoamingReconnect, stateManager.roamingState.value[machine.id])
         assertFalse(backend().client.hasLiveSession(machine.id), "The sockets did not close")
+        // No attempt starts while the device has no network.
+        assertEquals(
+            SessionSupervisor.State.Reconnecting(failures = 0, attemptRunning = false),
+            backend().client.reconnectState(machine.id),
+        )
+        assertEquals(checks, server.credentialChecks, "The loop tried a login with no network")
+
+        transport.onNetworkAvailable()
+
         awaitValue(stateManager.roamingState, "Healthy") { it[machine.id] == RoamingStatus.Healthy }
-        assertTrue(backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT))
+        assertEquals(LivenessResult.Live, backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT))
         assertEquals("ok", runCommand(machine, "echo ok"))
+    }
+
+    @Test
+    fun aFailedCheckOfAnOldSessionDoesNotCloseTheNewSession() = runTest {
+        val transport = startTransport()
+        val machine = passwordMachine("reconnect-old-check")
+        assertTrue(transport.connect(machine), debugLogDump())
+        val oldId = backend().client.liveSessionId(machine.id) ?: fail("No session after the connect")
+
+        // The loop opens a new session after the host closes the old session.
+        server.closeSessions()
+        val newId = awaitCondition("a new session") {
+            backend().client.liveSessionId(machine.id)?.takeIf { it != oldId }
+        }
+        awaitValue(stateManager.roamingState, "Healthy") { it[machine.id] == RoamingStatus.Healthy }
+
+        // A check of the old session failed, and its result comes now.
+        backend().reconnectNow(machine.id, deadSessionId = oldId)
+
+        assertEquals(SessionSupervisor.State.Live, backend().client.reconnectState(machine.id))
+        assertEquals(newId, backend().client.liveSessionId(machine.id))
+        assertEquals("ok", runCommand(machine, "echo ok"))
+    }
+
+    @Test
+    fun aCommandAfterADisconnectOpensNoSession() = runTest {
+        val transport = startTransport()
+        val machine = passwordMachine("disconnect-no-session")
+        assertTrue(transport.connect(machine), debugLogDump())
+        transport.disconnect(machine.id)
+        val checks = server.credentialChecks
+
+        assertFailsWith<SessionUnavailableException> { runCommand(machine, "echo not reached") }
+
+        assertFalse(backend().client.hasLiveSession(machine.id))
+        assertEquals(checks, server.credentialChecks, "The command opened a session")
     }
 
     @Test
@@ -185,11 +236,15 @@ class SessionReconnectTest {
         val machine = passwordMachine("liveness")
         assertTrue(transport.connect(machine), debugLogDump())
 
-        assertTrue(backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT), debugLogDump())
+        assertEquals(
+            LivenessResult.Live,
+            backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT),
+            debugLogDump(),
+        )
 
         server.stop()
         awaitValue(stateManager.roamingState, "RoamingReconnect") { it[machine.id] == RoamingStatus.RoamingReconnect }
-        assertFalse(backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT))
+        assertIs<LivenessResult.Dead>(backend().checkLiveness(machine.id, SshTransportManager.LIVENESS_TIMEOUT))
     }
 
     /** Makes the client, the backend, and the transport. The reconnect loops run in the background scope. */
@@ -250,6 +305,22 @@ class SessionReconnectTest {
             withTimeoutOrNull(AWAIT_TIMEOUT) { flow.first(predicate) }
         } ?: fail("Timeout: $description\n${debugLogDump()}")
 
+    /**
+     * Waits a maximum of [AWAIT_TIMEOUT] in real time until [value] gives a result that is not null, and returns it.
+     * Use it for a state that is not in a flow.
+     */
+    private suspend fun <T : Any> awaitCondition(description: String, value: () -> T?): T =
+        withContext(Dispatchers.Default) {
+            withTimeoutOrNull(AWAIT_TIMEOUT) {
+                var result = value()
+                while (result == null) {
+                    delay(AWAIT_STEP)
+                    result = value()
+                }
+                result
+            }
+        } ?: fail("Timeout: $description\n${debugLogDump()}")
+
     private fun debugLogDump(): String =
         debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
 
@@ -259,5 +330,6 @@ class SessionReconnectTest {
         const val PASSWORD_REF = "password-reconnect"
         const val SEED = 10
         val AWAIT_TIMEOUT: Duration = 20.seconds
+        val AWAIT_STEP: Duration = 20.milliseconds
     }
 }

@@ -13,12 +13,18 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 
 /**
  * Tests the reconnect loop of [SessionSupervisor] in virtual time. The attempts are a script of results, so the
@@ -109,6 +115,88 @@ class SessionSupervisorTest {
 
         val state = assertIs<SessionSupervisor.State.NeedsUser>(supervisor.state.value)
         assertIs<SshAuthResult.Failed>(state.result)
+    }
+
+    @Test
+    fun aTimeoutInsideAnAttemptIsAFailedAttemptAndTheWaitersContinue() = runTest {
+        val supervisor = supervisor { withTimeout(1) { awaitCancellation() } }
+        supervisor.sessionLost()
+        val input = async { supervisor.awaitCurrentAttempt() }
+        val poll = async { supervisor.awaitLive() }
+
+        advanceTimeBy(1.seconds)
+        runCurrent()
+
+        assertFalse(input.await())
+        assertFalse(poll.await())
+        val state = assertIs<SessionSupervisor.State.NeedsUser>(supervisor.state.value)
+        assertIs<TimeoutCancellationException>(assertIs<SshAuthResult.Failed>(state.result).cause)
+    }
+
+    @Test
+    fun aCancelledScopeEndsTheLoopAndTheWaitersContinue() = runTest {
+        val loopScope = CoroutineScope(backgroundScope.coroutineContext + Job())
+        val supervisor = SessionSupervisor(
+            machineId = MACHINE_ID,
+            scope = loopScope,
+            delayAfter = ::noJitterDelay,
+            isSessionLive = { sessionLive },
+            attempt = { awaitCancellation() },
+            events = events,
+        )
+        supervisor.sessionLost()
+        runCurrent()
+        val input = async { supervisor.awaitCurrentAttempt() }
+        val poll = async { supervisor.awaitLive() }
+        runCurrent()
+
+        loopScope.cancel()
+        runCurrent()
+
+        assertFalse(input.await())
+        assertFalse(poll.await())
+        assertEquals(SessionSupervisor.State.Stopped, supervisor.state.value)
+    }
+
+    @Test
+    fun aLostNetworkHoldsTheLoopUntilReconnectNow() = runTest {
+        val attempts = ScriptedAttempts(this, listOf(SshAuthResult.Success))
+        val supervisor = supervisor(attempts)
+
+        supervisor.networkLost(IOException("The device lost its network"))
+        advanceTimeBy(10.minutes)
+        runCurrent()
+
+        assertTrue(attempts.times.isEmpty(), "The loop tried with no network at ${attempts.times}")
+        assertEquals(SessionSupervisor.State.Reconnecting(failures = 0, attemptRunning = false), supervisor.state.value)
+        assertEquals(listOf("reconnecting"), events.log)
+        // A user input fails at once, because no attempt runs.
+        assertFalse(supervisor.awaitCurrentAttempt())
+
+        supervisor.reconnectNow()
+        runCurrent()
+
+        assertEquals(listOf(10.minutes.inWholeMilliseconds), attempts.times)
+        assertEquals(SessionSupervisor.State.Live, supervisor.state.value)
+    }
+
+    @Test
+    fun aLostNetworkDuringTheLoopHoldsItAfterTheCurrentDelay() = runTest {
+        val attempts = ScriptedAttempts(this, emptyList())
+        val supervisor = supervisor(attempts)
+        supervisor.sessionLost()
+        // Attempts at 0 and 1 s. The loop then waits 2 s.
+        advanceTimeBy(1.seconds)
+        runCurrent()
+
+        supervisor.networkLost()
+        advanceTimeBy(10.minutes)
+        runCurrent()
+
+        assertEquals(listOf(0L, 1_000), attempts.times)
+        supervisor.reconnectNow()
+        runCurrent()
+        assertEquals(listOf(0L, 1_000, 601_000), attempts.times)
     }
 
     @Test

@@ -22,8 +22,10 @@ import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -531,12 +533,14 @@ class SshTransportManager(
      * available or when its link properties change. A [SshRequest.TriggerNetworkRoam] calls it for one machine.
      *
      * For [machineId], or for each connected machine when it is null, the manager does these steps. It does them
-     * one time in each [NETWORK_CHECK_INTERVAL] for each machine, and ignores the calls between.
+     * one time in each [NETWORK_CHECK_INTERVAL] for each machine, and ignores the calls between. The machines get
+     * their checks at the same time, and each check has its own timeout.
      * - On the Mosh backbone, it sends a wakeup datagram, so that `mosh-server` gets the new address of the client.
      * - It runs a liveness check with a timeout of [LIVENESS_TIMEOUT]: a keepalive message and one `exec true`. Each
      *   backbone uses the SSH session for its control commands, so the check runs for each backbone.
      * - When the check fails, it sets [RoamingStatus.RoamingReconnect] and asks the backend to reconnect now, with
-     *   no delay. After the reconnect, the reconnect events restore the status and send the queued prompts.
+     *   no delay. It gives the session of the check, so that the backend keeps a newer session. After the
+     *   reconnect, the reconnect events restore the status and send the queued prompts.
      * - When the check passes, it restores the status and sends the queued prompts.
      */
     suspend fun onNetworkAvailable(machineId: String? = null) {
@@ -546,37 +550,47 @@ class SshTransportManager(
             sshStateManager.connectedMachines.value
         }
 
-        for (id in targets) {
-            if (!takeNetworkCheck(id)) continue
-            val currentBackbone = sshStateManager.activeTransportBackbone.value[id]
-            if (currentBackbone is ActiveBackbone.MoshUdp) {
-                val roamedCount = moshUdpEngine.sendWakeupDatagram(id)
-                sshStateManager.setBackbone(
-                    machineId = id,
-                    backbone = currentBackbone.copy(roamedCount = roamedCount),
-                )
+        coroutineScope {
+            for (id in targets) {
+                if (takeNetworkCheck(id)) launch { checkAfterNetworkChange(id) }
             }
-            if (backend.checkLiveness(id, LIVENESS_TIMEOUT)) {
+        }
+    }
+
+    /** Does the steps of [onNetworkAvailable] for [machineId]. */
+    private suspend fun checkAfterNetworkChange(machineId: String) {
+        val currentBackbone = sshStateManager.activeTransportBackbone.value[machineId]
+        if (currentBackbone is ActiveBackbone.MoshUdp) {
+            val roamedCount = moshUdpEngine.sendWakeupDatagram(machineId)
+            sshStateManager.setBackbone(
+                machineId = machineId,
+                backbone = currentBackbone.copy(roamedCount = roamedCount),
+            )
+        }
+        when (val liveness = backend.checkLiveness(machineId, LIVENESS_TIMEOUT)) {
+            LivenessResult.Live -> {
                 sshDebugLog.record(
-                    machineId = id,
+                    machineId = machineId,
                     tag = "Roaming",
                     message = "The session works on the new network",
                 )
-                if (sshStateManager.roamingState.value[id] == RoamingStatus.RoamingReconnect) {
-                    sshStateManager.setRoamingStatus(id, statusAfterRoam(id))
+                if (sshStateManager.roamingState.value[machineId] == RoamingStatus.RoamingReconnect) {
+                    sshStateManager.setRoamingStatus(machineId, statusAfterRoam(machineId))
                 }
-                flushOfflinePrompts(id)
-            } else {
+                flushOfflinePrompts(machineId)
+            }
+
+            is LivenessResult.Dead -> {
                 sshDebugLog.record(
-                    machineId = id,
+                    machineId = machineId,
                     tag = "Roaming",
                     message = "The session did not reply on the new network. The app connects again now.",
                     isError = true,
                 )
-                if (sshStateManager.isMachineConnected(id)) {
-                    sshStateManager.setRoamingStatus(id, RoamingStatus.RoamingReconnect)
+                if (sshStateManager.isMachineConnected(machineId)) {
+                    sshStateManager.setRoamingStatus(machineId, RoamingStatus.RoamingReconnect)
                 }
-                backend.reconnectNow(id)
+                backend.reconnectNow(machineId, liveness.sessionId)
             }
         }
     }
@@ -584,9 +598,9 @@ class SshTransportManager(
     /**
      * Closes the sessions after the device lost its default network. `BisonSessionService` calls it from `onLost`.
      *
-     * For each connected machine, it sets [RoamingStatus.RoamingReconnect] and closes the sockets at once. Thus the
-     * reconnect loop does not wait for a TCP timeout on the old network. The next [onNetworkAvailable] checks each
-     * machine at once.
+     * For each connected machine, it sets [RoamingStatus.RoamingReconnect] and closes the sockets at once. Thus no
+     * attempt waits for a TCP timeout on the old network. The reconnect loop then makes no attempt until the next
+     * [onNetworkAvailable], which checks each machine at once.
      */
     fun onNetworkLost() {
         for (id in sshStateManager.connectedMachines.value) {
