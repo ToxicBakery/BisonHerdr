@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.common.screen.machine
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -65,9 +66,12 @@ import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
+import com.toxicbakery.app.bison.model.HardwareKeyTransport
+import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_auth_hardware_key
 import com.toxicbakery.app.bison.resources.machine_auth_keystore
 import com.toxicbakery.app.bison.resources.machine_auth_password
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
@@ -313,8 +317,9 @@ fun ConfigureMachineScreen(
                             val label = when (type) {
                                 ConfigureMachineViewModel.AuthType.KeystoreKey -> stringResource(Res.string.machine_auth_keystore)
                                 ConfigureMachineViewModel.AuthType.Password -> stringResource(Res.string.machine_auth_password)
-                                // The choices do not contain this method (issue #23), so it has no chip.
-                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> return@forEach
+                                // Only a build with security keys offers this choice (issue #23).
+                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey ->
+                                    stringResource(Res.string.machine_auth_hardware_key)
                             }
                             FilterChip(
                                 selected = state.authType == type,
@@ -415,8 +420,10 @@ fun ConfigureMachineScreen(
                             }
                         }
 
-                        // Only a loaded machine can have this method. See issue #23.
-                        ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> {
+                        // Without the flag, only a loaded machine can have this method. See issue #23.
+                        ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> if (state.hardwareKeysEnabled) {
+                            HardwareKeySection(state = state, onEvent = viewModel::onEvent)
+                        } else {
                             Text(
                                 text = "Hardware security key: ${ConfigureMachineViewModel.UNSUPPORTED_AUTH_LABEL}",
                                 style = MaterialTheme.typography.bodyMedium,
@@ -639,10 +646,7 @@ private fun PublicKeySection(
     state: ConfigureMachineViewModel.State,
     onShowPublicKey: () -> Unit,
 ) {
-    val clipboard = LocalClipboard.current
-    val scope = rememberCoroutineScope()
     val publicKeyLine = state.publicKeyLine
-    var copied by remember(publicKeyLine) { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -657,29 +661,7 @@ private fun PublicKeySection(
                 Text(if (state.isLoadingPublicKey) "Loading public key" else "Show public key")
             }
         } else {
-            Text(
-                text = "Add this line to ~/.ssh/authorized_keys on the host:",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            SelectionContainer {
-                Text(
-                    text = publicKeyLine,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.fillMaxWidth().testTag("publicKeyLine"),
-                )
-            }
-            Button(
-                onClick = {
-                    scope.launch {
-                        clipboard.setClipEntry(plainTextClipEntry(label = "SSH public key", text = publicKeyLine))
-                        copied = true
-                    }
-                },
-                modifier = Modifier.testTag("copyPublicKey"),
-            ) {
-                Text(if (copied) "Copied" else "Copy public key")
-            }
+            AuthorizedKeyLine(publicKeyLine = publicKeyLine, lineTag = "publicKeyLine", copyTag = "copyPublicKey")
         }
         state.publicKeyError?.let { error ->
             Text(
@@ -690,6 +672,133 @@ private fun PublicKeySection(
         }
     }
 }
+
+/**
+ * Shows the `authorized_keys` line [publicKeyLine] with a button that copies it. [lineTag] and [copyTag] are the test
+ * tags of the line and of the button.
+ */
+@Composable
+private fun AuthorizedKeyLine(
+    publicKeyLine: String,
+    lineTag: String,
+    copyTag: String,
+) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var copied by remember(publicKeyLine) { mutableStateOf(false) }
+
+    Text(
+        text = "Add this line to ~/.ssh/authorized_keys on the host:",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    SelectionContainer {
+        Text(
+            text = publicKeyLine,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.fillMaxWidth().testTag(lineTag),
+        )
+    }
+    Button(
+        onClick = {
+            scope.launch {
+                clipboard.setClipEntry(plainTextClipEntry(label = "SSH public key", text = publicKeyLine))
+                copied = true
+            }
+        },
+        modifier = Modifier.testTag(copyTag),
+    ) {
+        Text(if (copied) "Copied" else "Copy public key")
+    }
+}
+
+/**
+ * The FIDO2 security key settings (issue #23): the key type, the connections, and the "Enroll key" action. After an
+ * enrollment, the section shows the `authorized_keys` line of the key with a copy button.
+ */
+@Composable
+private fun HardwareKeySection(
+    state: ConfigureMachineViewModel.State,
+    onEvent: (ConfigureMachineViewModel.Event) -> Unit,
+) {
+    val publicKeyLine = state.hardwareKeyPublicKeyLine
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            HardwareKeyType.entries.filter { it.isFido2 }.forEach { keyType ->
+                FilterChip(
+                    selected = state.hardwareKeyType == keyType,
+                    enabled = !state.isEnrollingKey,
+                    onClick = { onEvent(ConfigureMachineViewModel.Event.UpdateHardwareKeyType(keyType)) },
+                    label = { Text(keyType.opensshKeyType, fontFamily = FontFamily.Monospace) },
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            HardwareKeyTransport.entries.forEach { transport ->
+                FilterChip(
+                    selected = state.hardwareKeyTransport == transport,
+                    onClick = { onEvent(ConfigureMachineViewModel.Event.UpdateHardwareKeyTransport(transport)) },
+                    label = { Text(hardwareKeyTransportLabel(transport)) },
+                )
+            }
+        }
+        if (!state.hardwareKeyType.isFido2) {
+            Text(
+                text = "This version supports only FIDO2 security keys. Select a key type and enroll the key.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Text(
+            text = "The host needs OpenSSH 8.2 or later. This version cannot use a security key that needs a PIN.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(
+            onClick = { onEvent(ConfigureMachineViewModel.Event.EnrollHardwareKey) },
+            enabled = !state.isEnrollingKey && state.hardwareKeyType.isFido2,
+            modifier = Modifier.testTag("enrollHardwareKey"),
+        ) {
+            // The touch sheet shows while the key enrolls, and this button is not available.
+            Text(if (publicKeyLine != null && !state.isEnrollingKey) "Enroll a new key" else "Enroll key")
+        }
+        if (publicKeyLine != null) {
+            AuthorizedKeyLine(
+                publicKeyLine = publicKeyLine,
+                lineTag = "hardwareKeyPublicKeyLine",
+                copyTag = "copyHardwareKeyPublicKey",
+            )
+            Text(
+                text = "Save Host keeps the enrolled key. A new enrollment replaces this key.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        state.enrollError?.let { error ->
+            Text(
+                text = error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.testTag("enrollHardwareKeyError"),
+            )
+        }
+    }
+}
+
+/** Returns the chip text of [transport]. */
+private fun hardwareKeyTransportLabel(transport: HardwareKeyTransport): String =
+    when (transport) {
+        HardwareKeyTransport.UsbAndNfc -> "USB-C and NFC"
+        HardwareKeyTransport.UsbOnly -> "USB-C"
+        HardwareKeyTransport.NfcOnly -> "NFC"
+    }
 
 @Composable
 private fun SectionCard(

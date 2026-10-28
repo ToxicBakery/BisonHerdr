@@ -26,14 +26,17 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.toxicbakery.app.bison.AppTheme
 import com.toxicbakery.app.bison.common.App
 import com.toxicbakery.app.bison.debug.DebugServer
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.service.BisonSessionService
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
+import com.toxicbakery.app.bison.ssh.SecurityKeyHub
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.hasLocalNetworkPermission
 import com.toxicbakery.logging.Arbor
+import com.yubico.yubikit.android.YubiKitManager
 import kotlinx.coroutines.launch
 import org.kodein.di.DI
 import org.kodein.di.DIAware
@@ -47,7 +50,9 @@ class MainActivity : FragmentActivity(), DIAware {
     override val di: DI by closestDI()
 
     private val debugServer: DebugServer by instance()
+    private val featureFlags: FeatureFlags by instance()
     private val localNetworkAccess: LocalNetworkAccess by instance()
+    private val securityKeyHub: SecurityKeyHub by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
     private val startedActivityCounter: StartedActivityCounter by instance()
@@ -113,6 +118,29 @@ class MainActivity : FragmentActivity(), DIAware {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 localNetworkAccess.hostRequests { request -> askForLocalNetwork(request.hostPort) }
+            }
+        }
+
+        // Find FIDO2 security keys only while this activity is visible (issue #23). The hub starts each discovery
+        // only while a security key call runs. The USB permission dialog pauses this activity, so the USB discovery
+        // runs while the activity is started. The NFC reader mode needs a resumed activity.
+        if (featureFlags.hardwareSecurityKeys) {
+            val yubiKitManager = YubiKitManager(applicationContext)
+            val usbDiscovery = YubiKeyUsbDiscovery(yubiKitManager = yubiKitManager, hub = securityKeyHub)
+            val nfcDiscovery = YubiKeyNfcDiscovery(
+                activity = this,
+                yubiKitManager = yubiKitManager,
+                hub = securityKeyHub,
+            )
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    securityKeyHub.hostDiscovery(usbDiscovery)
+                }
+            }
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    securityKeyHub.hostDiscovery(nfcDiscovery)
+                }
             }
         }
     }
