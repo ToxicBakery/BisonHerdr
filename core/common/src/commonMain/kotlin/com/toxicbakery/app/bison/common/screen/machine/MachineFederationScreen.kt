@@ -300,19 +300,15 @@ fun MachineFederationScreen(
                         credentialState = credentialState,
                         needsUserCause = needsUser[machine.id],
                         onPrimaryAction = {
-                            when {
-                                isConnected -> onOpenWorkspaceTerminal(machine.id)
-                                // The editor makes the key. A missing password needs no editor: the connect
-                                // asks for it, and the edit button still opens the editor.
-                                credentialState is CredentialState.KeyMissing -> onConfigureMachine(machine.id)
-                                machine.authMethod.isSupported -> {
+                            when (machineCardAction(machine, isConnected, credentialState)) {
+                                MachineCardAction.OpenWorkspace -> onOpenWorkspaceTerminal(machine.id)
+                                MachineCardAction.Configure -> onConfigureMachine(machine.id)
+                                MachineCardAction.Connect -> {
                                     // A tap is a new connect from the user, so the connecting screen connects at
                                     // once. An open host key decision stays, and that screen shows it first.
                                     sshStateManager.clearNeedsUser(machine.id)
                                     onConnectMachine(machine.id)
                                 }
-                                // This version cannot connect with the method. The editor tells why (issue #23).
-                                else -> onConfigureMachine(machine.id)
                             }
                         },
                         onEdit = { onConfigureMachine(machine.id) },
@@ -335,6 +331,40 @@ fun MachineFederationScreen(
         )
     }
 }
+
+/** The action of the main button of a machine card. See [machineCardAction]. */
+internal enum class MachineCardAction {
+    /** Open the terminal of the connected machine. */
+    OpenWorkspace,
+
+    /** Connect to the machine. */
+    Connect,
+
+    /** Open the machine editor. */
+    Configure,
+}
+
+/**
+ * Returns the action of the main button of the card of [machine].
+ *
+ * - A connected machine opens its terminal.
+ * - A machine with a missing key opens the editor, which makes the key.
+ * - A machine with a missing password connects. The connect asks for the password and offers to save it. The edit
+ *   button of the card still opens the editor.
+ * - A machine with an authentication method that this version does not support opens the editor, which tells why
+ *   (issue #23).
+ */
+internal fun machineCardAction(
+    machine: HostMachine,
+    isConnected: Boolean,
+    credentialState: CredentialState,
+): MachineCardAction =
+    when {
+        isConnected -> MachineCardAction.OpenWorkspace
+        credentialState is CredentialState.KeyMissing -> MachineCardAction.Configure
+        machine.authMethod.isSupported -> MachineCardAction.Connect
+        else -> MachineCardAction.Configure
+    }
 
 /**
  * Returns the [CredentialState] of each machine in [machines], by machine id. Without a [checker], or when the
