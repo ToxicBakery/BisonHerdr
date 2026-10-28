@@ -244,12 +244,18 @@ internal class SessionSupervisor(
             SshAuthResult.Failed(error)
         }
 
-    /** Sets [next] and returns true. After [stop], this changes nothing and returns false. */
+    /**
+     * Sets [next] and returns true. After [stop], this changes nothing and returns false.
+     *
+     * A live session shows that the device has a network again, so [State.Live] also clears the network flag. A
+     * later [networkLost] sets it again.
+     */
     private fun setState(next: State): Boolean = synchronized(lock) {
         if (mutableState.value == State.Stopped) {
             false
         } else {
             mutableState.value = next
+            if (next == State.Live) networkLost = false
             true
         }
     }

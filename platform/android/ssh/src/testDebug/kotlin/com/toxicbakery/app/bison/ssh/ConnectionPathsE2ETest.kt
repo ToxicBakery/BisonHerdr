@@ -19,10 +19,14 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 
 /**
@@ -39,6 +43,7 @@ class ConnectionPathsE2ETest {
 
     private class Harness(
         keystoreKeyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
+        promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     ) {
         val debugLog = SshDebugLog()
         val stateManager = SshStateManager()
@@ -64,6 +69,7 @@ class ConnectionPathsE2ETest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            promptScope = promptScope,
         )
     }
 
@@ -464,7 +470,8 @@ class ConnectionPathsE2ETest {
 
     @Test
     fun path6A_6B_6C_surfaceParking_resumePresentationFence_networkRoaming_andFifoOfflinePromptFlush() = runTest {
-        val h = Harness()
+        // The flush after the network check runs in the background scope of the test.
+        val h = Harness(promptScope = backgroundScope)
         val machineId = "roam-workbox"
         val machine = HostMachine(
             id = machineId,
@@ -520,6 +527,7 @@ class ConnectionPathsE2ETest {
 
         val logCountBeforeRoam = h.debugLog.entries.value.size
         h.transport.onNetworkAvailable(machineId)
+        runCurrent()
 
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(h.stateManager.queuedPromptsForMachine(machineId).isEmpty())

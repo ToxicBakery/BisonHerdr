@@ -21,7 +21,10 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -56,7 +59,8 @@ import kotlinx.coroutines.withContext
  * stops for the user, the manager puts the cause in [SshStateManager.needsUser] and marks the machine disconnected.
  *
  * [timeSource] measures the interval between two network checks of a machine. A test gives a source with virtual
- * time.
+ * time. [promptScope] sends the queued prompts after a network check, so that a slow prompt does not stop the next
+ * network event. A test gives a scope with virtual time.
  */
 class SshTransportManager(
     private val backend: SshBackend,
@@ -66,6 +70,7 @@ class SshTransportManager(
     private val paneSurfaceBus: PaneSurfaceBus,
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
     private val timeSource: TimeSource = TimeSource.Monotonic,
+    private val promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
@@ -75,6 +80,9 @@ class SshTransportManager(
 
     /** The time of the last network check of each machine. See [onNetworkAvailable]. */
     private val lastNetworkChecks = ConcurrentHashMap<String, TimeMark>()
+
+    /** Lets one prompt flush at a time run for each machine, so that the prompts go out in order. */
+    private val flushLocks = ConcurrentHashMap<String, Mutex>()
 
     /** Receives the events of the reconnect loop of [backend]. */
     private val reconnectEvents = object : SessionEvents {
@@ -541,7 +549,8 @@ class SshTransportManager(
      * - When the check fails, it sets [RoamingStatus.RoamingReconnect] and asks the backend to reconnect now, with
      *   no delay. It gives the session of the check, so that the backend keeps a newer session. After the
      *   reconnect, the reconnect events restore the status and send the queued prompts.
-     * - When the check passes, it restores the status and sends the queued prompts.
+     * - When the check passes, it restores the status and sends the queued prompts in [promptScope]. A command can
+     *   wait for a long time on a slow session, and the next network event must not wait for it.
      */
     suspend fun onNetworkAvailable(machineId: String? = null) {
         val targets = if (machineId != null) {
@@ -577,7 +586,7 @@ class SshTransportManager(
                 if (sshStateManager.roamingState.value[machineId] == RoamingStatus.RoamingReconnect) {
                     sshStateManager.setRoamingStatus(machineId, statusAfterRoam(machineId))
                 }
-                flushOfflinePrompts(machineId)
+                launchPromptFlush(machineId)
             }
 
             is LivenessResult.Dead -> {
@@ -746,17 +755,40 @@ class SshTransportManager(
     private fun detailOf(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error::class.simpleName ?: "Unknown error"
 
-    private suspend fun flushOfflinePrompts(machineId: String) {
-        val pending = sshStateManager.flushQueuedPrompts(machineId)
-        for (item in pending) {
-            submitAgentPrompt(
-                machineId = item.machineId,
-                paneId = item.paneId,
-                agentName = item.agentName,
-                prompt = item.prompt,
-            )
+    /** Sends the queued prompts of [machineId] in [promptScope], and does not wait for them. */
+    private fun launchPromptFlush(machineId: String) {
+        promptScope.launch {
+            try {
+                flushOfflinePrompts(machineId)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                sshDebugLog.record(
+                    machineId = machineId,
+                    tag = "PromptQueue",
+                    message = "Could not send the queued prompts: ${detailOf(error)}",
+                    isError = true,
+                )
+            }
         }
     }
+
+    /**
+     * Sends the queued prompts of [machineId]. Only one flush runs at a time for a machine. Each flush removes its
+     * prompts from the queue before it sends them, so two flushes cannot send the same prompt.
+     */
+    private suspend fun flushOfflinePrompts(machineId: String) =
+        flushLocks.computeIfAbsent(machineId) { Mutex() }.withLock {
+            val pending = sshStateManager.flushQueuedPrompts(machineId)
+            for (item in pending) {
+                submitAgentPrompt(
+                    machineId = item.machineId,
+                    paneId = item.paneId,
+                    agentName = item.agentName,
+                    prompt = item.prompt,
+                )
+            }
+        }
 
     companion object {
         const val MOSH_UDP_HANDSHAKE_TIMEOUT_MS: Long = 1_500L

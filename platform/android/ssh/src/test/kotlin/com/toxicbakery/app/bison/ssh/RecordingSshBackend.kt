@@ -12,14 +12,16 @@ import kotlinx.coroutines.delay
  * An [SshBackend] that records each call and opens no connection. [authenticate] returns [authResult].
  * A test can change [authResult] between two calls.
  *
- * [checkLiveness] waits for [livenessDelay] and then returns [liveness]. [openSurface] runs [onOpenSurface], so that a test can make the step throw or
- * wait. [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
+ * [checkLiveness] waits for [livenessDelay] and then returns [liveness]. [openSurface] runs [onOpenSurface], and
+ * [sendEndpointCommand] runs [onSendEndpointCommand], so that a test can make the step throw or wait.
+ * [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
  * reconnect loop.
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
     @Volatile var liveness: LivenessResult = LivenessResult.Live,
     private val onOpenSurface: (suspend () -> Unit)? = null,
+    private val onSendEndpointCommand: (suspend () -> Unit)? = null,
 ) : SshBackend {
 
     /** One entry for each call: the method name and the machine id, for example `resize workbox`. */
@@ -61,6 +63,7 @@ internal class RecordingSshBackend(
         isMoshActive: Boolean,
     ): String? {
         calls += "sendEndpointCommand ${machine.id}"
+        onSendEndpointCommand?.invoke()
         return null
     }
 

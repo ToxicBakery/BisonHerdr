@@ -20,6 +20,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 
@@ -35,7 +37,11 @@ class SshTransportManagerTest {
     private val lanBox = HostMachine(id = "lan-box", name = "lan-box", hostname = "192.168.1.42", username = "ian")
     private val gpuRig = HostMachine(id = "gpu-rig", name = "gpu-rig", hostname = "192.168.1.44", username = "ian")
 
-    private fun manager(backend: SshBackend, timeSource: TimeSource = TimeSource.Monotonic): SshTransportManager {
+    /** Returns a manager that sends the queued prompts of a network check in the background scope of the test. */
+    private fun TestScope.manager(
+        backend: SshBackend,
+        timeSource: TimeSource = TimeSource.Monotonic,
+    ): SshTransportManager {
         val surfaceBus = PaneSurfaceBus()
         return SshTransportManager(
             backend = backend,
@@ -44,6 +50,7 @@ class SshTransportManagerTest {
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
             timeSource = timeSource,
+            promptScope = backgroundScope,
         )
     }
 
@@ -322,9 +329,40 @@ class SshTransportManagerTest {
         assertFalse(queuePrompt(manager), "The prompt was not queued")
 
         manager.onNetworkAvailable(lanBox.id)
+        runCurrent()
 
         assertEquals(listOf("checkLiveness lan-box", "sendEndpointCommand lan-box"), backend.calls)
         assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value[lanBox.id])
+        assertTrue(stateManager.queuedPromptsForMachine(lanBox.id).isEmpty())
+    }
+
+    @Test
+    fun aSlowPromptAfterACheckDoesNotStopTheNextNetworkEvent() = runTest {
+        val promptSent = CompletableDeferred<Unit>()
+        val timeSource = TestTimeSource()
+        val backend = RecordingSshBackend(onSendEndpointCommand = { promptSent.await() })
+        val manager = manager(backend, timeSource)
+        connectAll(manager, backend, lanBox)
+        stateManager.setRoamingStatus(lanBox.id, RoamingStatus.RoamingReconnect)
+        assertFalse(queuePrompt(manager), "The prompt was not queued")
+
+        // The check passes, and the prompt waits for a slow session.
+        manager.onNetworkAvailable()
+        runCurrent()
+        assertEquals(listOf("checkLiveness lan-box", "sendEndpointCommand lan-box"), backend.calls)
+
+        // The network goes away while the prompt waits. The event does not wait for the prompt.
+        manager.onNetworkLost()
+        assertEquals("closeSockets lan-box", backend.calls.last())
+
+        // A second check comes. The prompt is already out of the queue, so it goes out one time.
+        stateManager.setRoamingStatus(lanBox.id, RoamingStatus.Healthy)
+        timeSource += SshTransportManager.NETWORK_CHECK_INTERVAL
+        manager.onNetworkAvailable()
+        promptSent.complete(Unit)
+        runCurrent()
+
+        assertEquals(1, backend.calls.count { it == "sendEndpointCommand lan-box" }, backend.calls.toString())
         assertTrue(stateManager.queuedPromptsForMachine(lanBox.id).isEmpty())
     }
 

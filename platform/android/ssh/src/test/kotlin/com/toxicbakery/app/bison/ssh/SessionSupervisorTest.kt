@@ -181,6 +181,37 @@ class SessionSupervisorTest {
     }
 
     @Test
+    fun aSuccessAfterALostNetworkClearsTheHoldAndANewLossSetsItAgain() = runTest {
+        val gate = CompletableDeferred<SshAuthResult>()
+        val times = mutableListOf<Long>()
+        val supervisor = supervisor {
+            times += testScheduler.currentTime
+            if (times.size == 1) gate.await() else SshAuthResult.Success
+        }
+        supervisor.sessionLost()
+        runCurrent()
+
+        // The network goes away while an attempt runs, but the attempt passes.
+        supervisor.networkLost()
+        gate.complete(SshAuthResult.Success)
+        runCurrent()
+        assertEquals(SessionSupervisor.State.Live, supervisor.state.value)
+
+        // The next loss of the session tries at once, because the session showed a network.
+        supervisor.sessionLost()
+        runCurrent()
+        assertEquals(listOf(0L, 0L), times)
+        assertEquals(SessionSupervisor.State.Live, supervisor.state.value)
+
+        // A new loss of the network holds the loop again.
+        supervisor.networkLost()
+        advanceTimeBy(10.minutes)
+        runCurrent()
+        assertEquals(2, times.size)
+        assertEquals(SessionSupervisor.State.Reconnecting(failures = 0, attemptRunning = false), supervisor.state.value)
+    }
+
+    @Test
     fun aLostNetworkDuringTheLoopHoldsItAfterTheCurrentDelay() = runTest {
         val attempts = ScriptedAttempts(this, emptyList())
         val supervisor = supervisor(attempts)
