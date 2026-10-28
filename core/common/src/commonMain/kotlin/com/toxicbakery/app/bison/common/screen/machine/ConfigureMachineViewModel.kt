@@ -124,8 +124,15 @@ class ConfigureMachineViewModel(
         val parsedPort: Int?
             get() = portText.trim().toIntOrNull()?.takeIf { it in 1..65535 }
 
+        /**
+         * False when [herdrSessionName] has text that Herdr does not accept. An empty field is valid: the machine
+         * then uses the default session. See [HostMachine.isValidHerdrSessionName].
+         */
+        val isHerdrSessionNameValid: Boolean
+            get() = herdrSessionName.trim().let { it.isEmpty() || HostMachine.isValidHerdrSessionName(it) }
+
         val canSave: Boolean
-            get() = hostname.isNotBlank() && username.isNotBlank() && parsedPort != null
+            get() = hostname.isNotBlank() && username.isNotBlank() && parsedPort != null && isHerdrSessionNameValid
 
         /** The login methods that the screen offers. */
         val authChoices: List<AuthType>
@@ -464,6 +471,9 @@ class ConfigureMachineViewModel(
             updateState { it.copy(validationError = UNSUPPORTED_AUTH_ERROR) }
             return
         }
+        // The session name field shows the error. This check comes before the check of canConnect, because
+        // canConnect is also false for a session name that Herdr does not accept.
+        if (!current.isHerdrSessionNameValid) return
         if (connectImmediately && !current.canConnect) {
             updateState { it.copy(validationError = HARDWARE_KEY_NOT_ENROLLED_ERROR) }
             return

@@ -76,6 +76,7 @@ import com.toxicbakery.app.bison.resources.machine_auth_keystore
 import com.toxicbakery.app.bison.resources.machine_auth_password
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
 import com.toxicbakery.app.bison.resources.machine_bastion_host_name_hint
+import com.toxicbakery.app.bison.resources.machine_field_herdr_session_invalid
 import com.toxicbakery.app.bison.resources.machine_field_mosh_ports_label
 import com.toxicbakery.app.bison.resources.machine_field_transport_mode_label
 import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
@@ -203,7 +204,7 @@ fun ConfigureMachineScreen(
                 }
 
                 // 1. Host & Connection Identity
-                SectionCard(title = "Host Identity & SSH Endpoint") {
+                SectionCard(title = "Host Identity & SSH Address") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -301,6 +302,12 @@ fun ConfigureMachineScreen(
                             },
                             label = { Text("Herdr Session Name (optional)") },
                             placeholder = { Text("default") },
+                            isError = !state.isHerdrSessionNameValid,
+                            supportingText = if (state.isHerdrSessionNameValid) {
+                                null
+                            } else {
+                                { Text(stringResource(Res.string.machine_field_herdr_session_invalid)) }
+                            },
                             singleLine = true,
                             modifier = Modifier.weight(1f),
                         )

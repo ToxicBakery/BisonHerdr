@@ -344,7 +344,7 @@ All messages on `herdr-client.sock` (and `herdr remote-client-bridge`) use `[u32
 
 ## Part III: Android & Tablet Client UX Design — "Zen Canvas" (Design 2)
 
-> **Status: target design.** Part III describes the target UX. **This version:** the workspace screen is a column. The top HUD has two rows, and the split-thumb bar is at the bottom when the setting is on. The panes use all of the area between them, and the HUD and the bar do not cover the panes. The app sets no frame rate.
+> **Status: target design.** Part III describes the target UX. **This version:** the workspace screen is a column. The top HUD has two rows, and the split-thumb bar is at the bottom when the setting "Split-Thumb Left/Right Ergonomic Bottom Bar" (`splitThumbLayoutEnabled`) is on (the default). The panes use all of the area between them, and the HUD and the bar do not cover the panes. The app sets no frame rate.
 
 ### 1. Edge-to-Edge "Zen Canvas" Layout with Floating HUDs (Jetpack Compose)
 
@@ -596,7 +596,7 @@ The Android/KMP client (**BisonHerdr**, package namespace `com.toxicbakery.app.b
 
 ### 1. Layered Module Graph & Directory Structure
 
-Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")`), the root of `/home/ian/workspace/herdr-tablet` hosts the Gradle multi-module project (`composite/`, `app/android/`, `core/*`, `platform/android/*`) and the standalone Rust reference workspace (`rust/`):
+Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")`), the root of `/home/ian/workspace/bison-herdr` hosts the Gradle multi-module project (`composite/`, `app/android/`, `core/*`, `platform/android/*`) and the standalone Rust reference workspace (`rust/`):
 
 - **App Target Strategy:** `:app:android` (`applicationId = "com.toxicbakery.app.bison"`, `minSdk = 31`, `compileSdk = 37`, `targetSdk = 37`, plus `:app:android:baseline`) is the sole `app/` target built right now, while **all `:core:*` modules use `kotlinMultiplatform` (`commonMain` / `commonTest`)** under `com.toxicbakery.app.bison.*` so the vast majority of the codebase remains 100% platform-agnostic and portable to Desktop, iOS, or Web later without refactoring.
 - **Local Network Permission (Android 17):** With `targetSdk = 37`, a TCP or UDP connection to the local network needs the `ACCESS_LOCAL_NETWORK` runtime permission. Without it, Android drops the packets, and a TCP connect fails after its timeout. Android 17 (`ConnectivityService` at `android-17.0.0_r1`) makes a list for each interface. The list has the on-link prefix of each address of the interface. An IPv4 prefix must be in the five private and CGNAT ranges. An IPv6 prefix must have a length that is more than 0. It also has multicast and broadcast. Android drops a packet only when its address is in the list of the interface that sends it.
@@ -607,7 +607,7 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 - **No Upstream `herdr` Submodule:** The temporary `herdr/` checkout used for protocol discovery is removed completely. The one Rust crate in `rust/` (`herdr-protocol`) is a standalone Apache-2.0 reference crate owned by this repository. It describes the wire types of **unmodified upstream Herdr servers**. Gradle does not build it, and the app does not use it.
 
 ```text
-/home/ian/workspace/herdr-tablet/
+/home/ian/workspace/bison-herdr/
 ├── settings.gradle.kts               # Root Gradle settings (TYPESAFE_PROJECT_ACCESSORS)
 ├── build.gradle.kts                  # Root plugin declarations & Git-derived projectVersion
 ├── gradle/libs.versions.toml         # Version catalog (Kotlin, Compose Multiplatform, Kodein, Nav3)
@@ -1023,7 +1023,7 @@ data class ScreenKeyMachineConfigure(
 ### Phase 1: Standalone Rust Protocol & VT Crates (`vendor/libghostty-vt`, `rust/`), Remove Reference `herdr/` Checkout, & KMP Multi-Module Scaffold
 - Extract `vendor/libghostty-vt`, `rust/ghostty-vt` (with Android NDK `aarch64-linux-android` / `x86_64-linux-android` target mappings in `build.rs`), and the standalone pure `rust/herdr-protocol` crate into the root repository, then remove the temporary `herdr/` submodule and `.gitmodules`.
 - **Status:** done. Later, item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) deleted `vendor/libghostty-vt` and `rust/ghostty-vt`. Only `rust/herdr-protocol` stays, as a reference crate.
-- Scaffold the KMP Gradle root in `/home/ian/workspace/herdr-tablet` (`settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml`, and `composite/` build-logic plugin under `com.toxicbakery.app.bison`).
+- Scaffold the KMP Gradle root in `/home/ian/workspace/bison-herdr` (`settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml`, and `composite/` build-logic plugin under `com.toxicbakery.app.bison`).
 - Scaffold KMP `:core:*` modules (`:core:model`, `:core:store` with `MachineStore` + `AppSettingsStore` defaulting to `Gruvbox Dark`, `:core:ssh`, `:core:protocol`, `:core:debug-server`, `:core:fake-server`, `:core:resources`, `:core:common`, `:core:di`) and Android modules (`:platform:android:store`, `:platform:android:ssh`, `:platform:android:di`, `:app:android`, `:app:android:baseline`).
 
 ### Phase 2: Hybrid Rust JNI Core (`rust/herdr-mobile-core`), Mosh UDP Backbone & SSH Auth Suite

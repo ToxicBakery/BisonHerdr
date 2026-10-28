@@ -96,8 +96,8 @@ internal class TestSshServer(
 
     /**
      * The `HOME` of each `exec` command. The default is a new empty directory. The workers of the client put
-     * `$HOME/.local/bin` first on the `PATH`. Thus a test that sets this directory finds a program in its own
-     * `.local/bin` before a program of the same name on the test machine, for example `herdr`.
+     * `$HOME/.local/bin` first on the `PATH`. Thus a command finds a program in the `.local/bin` of this directory
+     * first. A program of the same name on the test machine, for example `herdr`, comes after it.
      */
     @Volatile
     var homeDirectory: File = File(serverDirectory, "home").apply { mkdirs() }
