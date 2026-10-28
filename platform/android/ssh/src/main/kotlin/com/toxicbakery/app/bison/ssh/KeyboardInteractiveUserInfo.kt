@@ -11,11 +11,17 @@ import kotlinx.coroutines.runBlocking
  * The JSch [UserInfo] of one session of [machineId]: the bastion session or the target session. [hostPort] is the
  * `host:port` of that session.
  *
- * JSch calls [promptKeyboardInteractive] on the thread of `Session.connect` for each set of questions of the
- * `keyboard-interactive` method. The function blocks that thread until it has the answers:
+ * JSch answers one set of questions on its own before it calls this class. In each start of the
+ * `keyboard-interactive` method, it gives the session password (`Session.setPassword`) one time to a set with exactly
+ * one hidden question that contains "password:" (in any letter case). This also occurs for a question such as
+ * "New password:". The password goes only to the host of the session. This class cannot stop it.
+ *
+ * JSch calls [promptKeyboardInteractive] on the thread of `Session.connect` for each other set of questions. The
+ * function blocks that thread until it has the answers:
  * 1. A set with no questions gets no answers. The user sees no prompt.
- * 2. When [password] is not null, the first set with exactly one hidden question that contains "password" (in any
- *    letter case) gets [password]. The user sees no prompt. A question that asks for a new password does not get it.
+ * 2. When [password] is not null, the first set that gets to this class with exactly one hidden question that contains
+ *    "password" (in any letter case) gets [password]. This occurs one time for each session. The user sees no
+ *    prompt. A question with the word "new" does not get [password].
  * 3. Each other set goes to [ask] as a [KeyboardInteractivePrompt] for [hostPort]. The answers of the user go to the
  *    host. A prompt with no answers throws a [UserInputException], and the login stops at once.
  *
@@ -40,7 +46,7 @@ internal class KeyboardInteractiveUserInfo(
     private val ask: suspend (KeyboardInteractivePrompt) -> KeyboardInteractiveOutcome,
 ) : UserInfo, UIKeyboardInteractive {
 
-    /** True after step 2 gave [password] one time. A second password question goes to the user. */
+    /** True after step 2 gave [password] one time. A second password question that gets here goes to the user. */
     @Volatile
     private var passwordUsed = false
 

@@ -40,7 +40,7 @@ import kotlinx.coroutines.test.runTest
  * Tests the `keyboard-interactive` questions and the prompt for a missing password of [RealSshBackend] against real
  * SSH servers ([TestSshServer]).
  *
- * [startUi] acts as the UI: it runs [SshStateManager.hostKeyboardInteractivePrompts], records each prompt in
+ * [startUi] acts as the UI: it runs [SshStateManager.hostUserAuthPrompts], records each prompt in
  * [prompts], and answers it. A test with no [startUi] has no UI.
  */
 class KeyboardInteractiveTest {
@@ -254,6 +254,74 @@ class KeyboardInteractiveTest {
     }
 
     @Test
+    fun aWrongTypedPasswordIsNotSavedWhenALaterAnswerOfTheUserPassesTheLogin() = runTest {
+        server.interactivePrompts = listOf(TestSshServer.InteractivePrompt("Password: ", TestSshServer.PASSWORD))
+        startUi { prompt ->
+            if (prompt.passwordMissing) {
+                answered(WRONG_PASSWORD, savePassword = true)
+            } else {
+                answered(TestSshServer.PASSWORD)
+            }
+        }
+        val machine = server.machine(
+            id = "typed-then-asked",
+            username = TestSshServer.INTERACTIVE_USER,
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(ABSENT_REF)),
+        ).also { machines += it }
+
+        assertEquals(SshAuthResult.Success, authenticate(machine), debugLogDump())
+
+        assertTrue(prompts.any { !it.passwordMissing }, "The host did not ask the user")
+        assertNull(secretStore.get(ABSENT_REF), "The client saved the wrong typed password")
+        assertTrue(
+            debugLog.entries.value.any { it.message.contains("did not save the typed password") },
+            debugLogDump(),
+        )
+        assertTrue(debugLog.entries.value.none { WRONG_PASSWORD in it.message }, debugLogDump())
+    }
+
+    @Test
+    fun jschGivesTheSessionPasswordToANewPasswordQuestionBeforeTheUserInfo() = runTest {
+        // This test documents a JSch behavior that the user info cannot stop. JSch gives the session password to a
+        // single hidden question that contains "password:", also when the question asks for a new password.
+        server.offerPasswordMethod = false
+        server.stop()
+        server.start()
+        server.interactivePrompts = listOf(TestSshServer.InteractivePrompt("New password: ", TestSshServer.PASSWORD))
+        var asked = 0
+        startUi {
+            asked++
+            cancelled()
+        }
+        val machine = interactiveMachine("jsch-new-password")
+
+        assertEquals(SshAuthResult.Success, authenticate(machine), debugLogDump())
+
+        assertEquals(0, asked, "The question went to the user")
+        assertTrue(
+            debugLog.entries.value.none { it.message.contains("gave the password of the machine") },
+            debugLogDump(),
+        )
+    }
+
+    @Test
+    fun aSavedPasswordOfAMachineThatChangedDuringTheLoginIsRemoved() = runTest {
+        val machine = passwordMachine("changed-during-login", passwordValue = "")
+        machineStore.upsertMachine(machine)
+        startUi {
+            // The user removes the machine while the login waits for the password.
+            machineStore.removeMachine(machine.id)
+            answered(TestSshServer.PASSWORD, savePassword = true)
+        }
+
+        assertEquals(SshAuthResult.Success, authenticate(machine), debugLogDump())
+
+        assertNull(machineStore.getMachine(machine.id), "The save added the removed machine again")
+        assertEquals(setOf(PASSWORD_REF), secretStore.refs, "A secret with no machine stays in the store")
+        assertTrue(debugLog.entries.value.any { it.message.contains("did not save the password") }, debugLogDump())
+    }
+
+    @Test
     fun aCancelOfTheMissingPasswordOpensNoConnection() = runTest {
         startUi { cancelled() }
         val machine = passwordMachine("missing-password-cancelled", SecretRef.format(ABSENT_REF))
@@ -321,7 +389,7 @@ class KeyboardInteractiveTest {
     }
 
     /** Acts as the UI: it hosts the prompts, records each new prompt in [prompts], and answers it with [answer]. */
-    private fun startUi(answer: (KeyboardInteractivePrompt) -> KeyboardInteractiveOutcome) {
+    private fun startUi(answer: suspend (KeyboardInteractivePrompt) -> KeyboardInteractiveOutcome) {
         ui.launch(start = CoroutineStart.UNDISPATCHED) {
             stateManager.hostUserAuthPrompts { UserAuthOutcome.Cancelled }
         }
@@ -383,6 +451,7 @@ class KeyboardInteractiveTest {
         /** A reference that the secret store does not have, for example after a restore. */
         const val ABSENT_REF = "password-absent"
         const val ONE_TIME_CODE = "246810"
+        const val WRONG_PASSWORD = "wrong-typed"
         const val CONNECT_TIMEOUT_MS = 10_000
 
         /** A login with no UI must end much faster than this. */

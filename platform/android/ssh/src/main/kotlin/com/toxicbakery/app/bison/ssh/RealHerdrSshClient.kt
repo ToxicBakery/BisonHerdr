@@ -99,8 +99,8 @@ import kotlinx.serialization.json.put
  * A password machine keeps a [SecretRef] value. The client reads the password from [secretStore] before each
  * connection, and clears its copy after the connection. When the store has no password, the client asks the user for
  * it through [userPrompter] before it opens a connection. With no UI, the session stops with a
- * [MissingSecretException]. When the user wants to save the typed password, the client saves it after the login
- * passes. See [savePassword].
+ * [MissingSecretException]. When the user wants to save the typed password, the client saves it after a login that
+ * passes with no more questions to the user. See [openSessionLocked] and [savePassword].
  *
  * Each session has a [KeyboardInteractiveUserInfo]. It answers the `keyboard-interactive` questions of the host with
  * the password of the machine or through [userPrompter], and it never accepts a host key.
@@ -1710,7 +1710,9 @@ internal class RealHerdrSshClient(
      * function returns that session and opens nothing.
      *
      * A password machine with no stored password gets the password from the user first ([loginPassword]). When the
-     * user wants to save it, the function saves it after the login passes ([savePassword]).
+     * user wants to save it, the function saves it after the login passes ([savePassword]). When a
+     * `keyboard-interactive` question went to the user during the login, the function does not save it, because the
+     * login can have passed with a later answer and not with the typed password.
      */
     private suspend fun openSessionLocked(
         machine: HostMachine,
@@ -1767,7 +1769,18 @@ internal class RealHerdrSshClient(
                 sessionIds[session] = sessionIdCounter.getAndIncrement()
                 sessions[machine.id] = session
                 if (passwordAuth != null && loginPassword?.save == true) {
-                    savePassword(machine, passwordAuth, loginPassword.bytes)
+                    if (logins.askedUser) {
+                        // A later answer of the user can be the correct password. Then the typed password can be
+                        // wrong, and the app must not keep it.
+                        sshDebugLog.record(
+                            machineId = machine.id,
+                            tag = "RealSSH",
+                            message = "The login asked the user more questions, so the app did not save the " +
+                                "typed password of ${machine.name}. Edit the machine to save the password.",
+                        )
+                    } else {
+                        savePassword(machine, passwordAuth, loginPassword.bytes)
+                    }
                 }
                 session
             } finally {
@@ -1805,7 +1818,14 @@ internal class RealHerdrSshClient(
         val password: ByteArray?,
         val preferredAuths: String,
         val callerJob: Job?,
-    )
+    ) {
+        /**
+         * True after a `keyboard-interactive` question of the bastion or the target went to the user. Then the login
+         * did not pass with the password alone, so the client does not save a typed password.
+         */
+        @Volatile
+        var askedUser: Boolean = false
+    }
 
     /**
      * Returns a new session as [username] to [host] and [port], with the settings that the bastion session and the
@@ -1826,7 +1846,10 @@ internal class RealHerdrSshClient(
             password = logins.password,
             callerJob = logins.callerJob,
             sshDebugLog = sshDebugLog,
-            ask = userPrompter,
+            ask = { prompt ->
+                logins.askedUser = true
+                userPrompter(prompt)
+            },
         )
         val props = Properties().apply {
             put("PreferredAuthentications", logins.preferredAuths)
@@ -1936,7 +1959,8 @@ internal class RealHerdrSshClient(
         val error = when (outcome) {
             KeyboardInteractiveOutcome.NoUi -> MissingSecretException(machine.name)
             // An answer with a different number of answers is an error of the UI.
-            is KeyboardInteractiveOutcome.Answered -> UserInputException.of(hostPort, KeyboardInteractiveOutcome.Cancelled)
+            is KeyboardInteractiveOutcome.Answered ->
+                UserInputException.of(hostPort, KeyboardInteractiveOutcome.Cancelled)
             else -> UserInputException.of(hostPort, outcome)
         }
         sshDebugLog.record(machineId = machine.id, tag = "RealSSH", message = error.message.orEmpty(), isError = true)
@@ -1969,9 +1993,11 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Keeps the typed [password] of [machine] in [secretStore] after a login that passed. The secret uses the
-     * reference of [auth] when it is valid. Else it gets a new reference, and [machineStore] gets the new reference
-     * for the machine. An error does not stop the session. The debug log tells it, and the next connect asks again.
+     * Keeps the typed [password] of [machine] in [secretStore] after a login that passed with that password. The
+     * secret uses the reference of [auth] when it is valid. Else it gets a new reference, and [machineStore] gets the
+     * new reference for the machine. When the user changed or removed the machine during the login, the function
+     * removes the new secret again. An error does not stop the session. The debug log tells it, and the next connect
+     * asks again.
      */
     private suspend fun savePassword(machine: HostMachine, auth: SshAuthMethod.Password, password: ByteArray) {
         val oldValue = auth.encryptedPasswordRef
@@ -1981,8 +2007,17 @@ internal class RealHerdrSshClient(
             secretStore.put(ref, password)
             if (existingRef == null) {
                 val newValue = SecretRef.format(ref)
+                if (!updatePasswordRef(machine.id, oldValue, newValue)) {
+                    // No machine refers to the new secret, so remove it.
+                    secretStore.remove(ref)
+                    sshDebugLog.record(
+                        machineId = machine.id,
+                        tag = "RealSSH",
+                        message = "${machine.name} changed during the login, so the app did not save the password.",
+                    )
+                    return
+                }
                 savedPasswordRefs[machine.id] = oldValue to newValue
-                updatePasswordRef(machine.id, oldValue, newValue)
             }
             sshDebugLog.record(
                 machineId = machine.id,
@@ -2005,13 +2040,17 @@ internal class RealHerdrSshClient(
     /**
      * Puts the password reference [newValue] into the machine [machineId] of [machineStore]. It changes the machine
      * only while the machine still has [oldValue], so that a newer edit of the user stays.
+     *
+     * Returns false when the machine is gone or has a different password value. With no [machineStore], it returns
+     * true, and only [savedPasswordRefs] keeps the new reference.
      */
-    private suspend fun updatePasswordRef(machineId: String, oldValue: String, newValue: String) {
-        val store = machineStore ?: return
-        val current = store.getMachine(machineId) ?: return
-        val auth = current.authMethod as? SshAuthMethod.Password ?: return
-        if (auth.encryptedPasswordRef != oldValue) return
+    private suspend fun updatePasswordRef(machineId: String, oldValue: String, newValue: String): Boolean {
+        val store = machineStore ?: return true
+        val current = store.getMachine(machineId) ?: return false
+        val auth = current.authMethod as? SshAuthMethod.Password ?: return false
+        if (auth.encryptedPasswordRef != oldValue) return false
         store.upsertMachine(current.copy(authMethod = auth.copy(encryptedPasswordRef = newValue)))
+        return true
     }
 
     /** Returns the name of [machine] that the prompts show. */
