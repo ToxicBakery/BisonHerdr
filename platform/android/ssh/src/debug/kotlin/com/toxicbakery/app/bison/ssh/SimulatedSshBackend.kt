@@ -136,8 +136,8 @@ class SimulatedSshBackend(
 
     /**
      * Returns the SSH endpoint bridge with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
-     * transport (issue #22). When the mode permits Mosh and the simulated host has `mosh-server` ([moshServerProbe]),
-     * the backbone gets [MoshSessionEngine.MOSH_SERVER_FOUND] as its fallback reason.
+     * transport (issue #22). [moshServerProbe] tells if the simulated host has `mosh-server`. The fallback reason
+     * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
      */
     override suspend fun negotiateBackbone(
         machine: HostMachine,
@@ -147,13 +147,8 @@ class SimulatedSshBackend(
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
         val hasMoshServer = machine.transportMode != TransportMode.SshEndpointOnly &&
             (moshServerProbe?.invoke(machine) ?: true)
-        if (hasMoshServer) {
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "Transport",
-                message = MoshSessionEngine.MOSH_SERVER_FOUND,
-            )
-        }
+        val reason = MoshSessionEngine.fallbackReasonFor(machine.transportMode, hasMoshServer)
+        reason?.let { sshDebugLog.record(machineId = machineId, tag = "Transport", message = it) }
 
         // SSH Endpoint Generation 1 (`herdr remote-client-bridge --idle-timeout-v1`)
         val hello = EndpointClientHello(
@@ -167,7 +162,7 @@ class SimulatedSshBackend(
         )
         return ActiveBackbone.SshEndpoint(
             rttMs = SIMULATED_RTT_MS,
-            fallbackReason = if (hasMoshServer) MoshSessionEngine.MOSH_SERVER_FOUND else null,
+            fallbackReason = reason,
         )
     }
 

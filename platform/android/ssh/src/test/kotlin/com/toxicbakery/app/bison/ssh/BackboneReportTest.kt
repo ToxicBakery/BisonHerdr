@@ -12,13 +12,18 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TestTimeSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /**
  * Tests the backbone that [RealSshBackend] reports. This version has no Mosh transport (issue #22), so the backbone
@@ -75,7 +80,7 @@ class BackboneReportTest {
     private fun connectBackbone() {
         stateManager.markMachineConnected(
             machine.id,
-            ActiveBackbone.SshEndpoint(rttMs = RealSshBackend.UNMEASURED_RTT_MS, fallbackReason = REASON),
+            ActiveBackbone.SshEndpoint(rttMs = ActiveBackbone.UNMEASURED_RTT_MS, fallbackReason = REASON),
         )
     }
 
@@ -93,7 +98,7 @@ class BackboneReportTest {
     fun theBackboneGetsTheAverageOfTheMeasuredRoundTrips() = runTest {
         val backend = backend(client())
         connectBackbone()
-        assertEquals(RealSshBackend.UNMEASURED_RTT_MS, shownRttMs())
+        assertEquals(ActiveBackbone.UNMEASURED_RTT_MS, shownRttMs())
 
         // The first round trip sets the average.
         backend.poll(40.milliseconds)
@@ -198,66 +203,107 @@ class BackboneReportTest {
     @Test
     fun theRealPathReportsTheSshEndpointWithAReasonWhenTheHostHasMoshServer() = runTest {
         val binDirectory = createTempDirectory("bison-mosh-bin").toFile()
-        File(binDirectory, "mosh-server").apply {
-            writeText("#!/bin/sh\nexit 0\n")
-            setExecutable(true)
-        }
-        TestSshServer().start().use { server ->
-            server.binDirectory = binDirectory
-            val backend = realBackend(server)
-            for (mode in listOf(TransportMode.AutoPreferMosh, TransportMode.MoshOnly)) {
-                val machine = server.machine(
-                    id = "mosh-host-$mode",
-                    username = TestSshServer.KEY_USER,
-                    authMethod = server.keyAuthMethod,
-                    transportMode = mode,
-                )
-                val route = ProxyJumpTunnel().resolveRoute(machine)
-                try {
-                    assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
-                    assertEquals(
-                        ActiveBackbone.SshEndpoint(
-                            rttMs = RealSshBackend.UNMEASURED_RTT_MS,
-                            fallbackReason = MoshSessionEngine.MOSH_SERVER_FOUND,
-                        ),
-                        backend.negotiateBackbone(machine, route),
-                        "Mode $mode",
-                    )
-                } finally {
-                    backend.disconnect(machine.id)
+        try {
+            File(binDirectory, "mosh-server").apply {
+                writeText("#!/bin/sh\nexit 0\n")
+                setExecutable(true)
+            }
+            TestSshServer().start().use { server ->
+                server.binDirectory = binDirectory
+                for (mode in listOf(TransportMode.AutoPreferMosh, TransportMode.MoshOnly)) {
+                    assertBackboneReason(server, mode, moshServerPath = null, MoshSessionEngine.MOSH_SERVER_FOUND)
                 }
             }
+        } finally {
+            binDirectory.deleteRecursively()
         }
-        binDirectory.deleteRecursively()
     }
 
     @Test
-    fun theRealPathReportsTheSshEndpointWithNoReasonWhenTheHostHasNoMoshServer() = runTest {
+    fun theRealPathReportsTheSshEndpointWhenTheHostHasNoMoshServer() = runTest {
         TestSshServer().start().use { server ->
-            val backend = realBackend(server)
+            // An automatic mode needs no reason. A MoshOnly machine asks for Mosh, so it always gets a reason.
+            assertBackboneReason(server, TransportMode.AutoPreferMosh, NO_MOSH_SERVER, expectedReason = null)
+            assertBackboneReason(server, TransportMode.MoshOnly, NO_MOSH_SERVER, MoshSessionEngine.NOT_AVAILABLE)
+        }
+    }
+
+    @Test
+    fun theFirstBatchOfANewWorkerIsNotCounted() = runTest {
+        TestSshServer().start().use { server ->
+            val backend = realBackend(server, SshDebugLog())
+            val client = backend.client
             val machine = server.machine(
-                id = "no-mosh-host",
+                id = "new-worker",
                 username = TestSshServer.KEY_USER,
                 authMethod = server.keyAuthMethod,
-                transportMode = TransportMode.AutoPreferMosh,
-            ).copy(moshServerPath = "bison-test-no-such-mosh-server")
+            )
             val route = ProxyJumpTunnel().resolveRoute(machine)
             try {
                 assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
-                assertEquals(
-                    ActiveBackbone.SshEndpoint(rttMs = RealSshBackend.UNMEASURED_RTT_MS, fallbackReason = null),
-                    backend.negotiateBackbone(machine, route),
-                )
+
+                // The worker of the login ran a batch already, so its next batch counts.
+                client.refreshSnapshotAndSurface(machine, route)
+                assertNotNull(client.averageRoundTripMs(machine.id))
+
+                // A new login starts a new average. Then the server closes the session, so the next batch opens a new
+                // session and a new worker.
+                assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
+                assertNull(client.averageRoundTripMs(machine.id))
+                server.closeSessions()
+                withContext(Dispatchers.IO) {
+                    withTimeout(SESSION_CLOSE_TIMEOUT) {
+                        while (client.hasLiveSession(machine.id)) delay(10.milliseconds)
+                    }
+                }
+                client.refreshSnapshotAndSurface(machine, route)
+                assertNull(client.averageRoundTripMs(machine.id), "The first batch of the new worker counted")
+
+                client.refreshSnapshotAndSurface(machine, route)
+                assertNotNull(client.averageRoundTripMs(machine.id))
             } finally {
                 backend.disconnect(machine.id)
             }
         }
     }
 
-    /** Returns a [RealSshBackend] that knows the host key of [server] and logs in with its key. */
-    private fun realBackend(server: TestSshServer) = RealSshBackend(
+    /**
+     * Connects to [server] with a machine in [mode], and asserts the backbone that the real path returns. When
+     * [moshServerPath] is not null, the host has no program of that name. A reason must also be in the debug log.
+     */
+    private suspend fun assertBackboneReason(
+        server: TestSshServer,
+        mode: TransportMode,
+        moshServerPath: String?,
+        expectedReason: String?,
+    ) {
+        val debugLog = SshDebugLog()
+        val backend = realBackend(server, debugLog)
+        val machine = server.machine(
+            id = "host-$mode",
+            username = TestSshServer.KEY_USER,
+            authMethod = server.keyAuthMethod,
+            transportMode = mode,
+        ).copy(moshServerPath = moshServerPath)
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+        try {
+            assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
+            assertEquals(
+                ActiveBackbone.SshEndpoint(rttMs = ActiveBackbone.UNMEASURED_RTT_MS, fallbackReason = expectedReason),
+                backend.negotiateBackbone(machine, route),
+                "Mode $mode",
+            )
+            val transportLog = debugLog.entries.value.filter { it.tag == RealHerdrSshClient.TRANSPORT_LOG_TAG }
+            assertEquals(listOfNotNull(expectedReason), transportLog.map { it.message }, "Mode $mode")
+        } finally {
+            backend.disconnect(machine.id)
+        }
+    }
+
+    /** Returns a [RealSshBackend] that knows the host key of [server], logs in with its key, and logs to [debugLog]. */
+    private fun realBackend(server: TestSshServer, debugLog: SshDebugLog) = RealSshBackend(
         sshStateManager = SshStateManager(),
-        sshDebugLog = SshDebugLog(),
+        sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = PaneSurfaceBus(),
         semanticNotificationBus = SemanticNotificationBus(),
@@ -268,6 +314,12 @@ class BackboneReportTest {
 
     private companion object {
         const val REASON = MoshSessionEngine.MOSH_SERVER_FOUND
+
+        /** A program that the test machine does not have. */
+        const val NO_MOSH_SERVER = "bison-test-no-such-mosh-server"
+
+        /** The maximum time for the client to see a session that the server closed. */
+        val SESSION_CLOSE_TIMEOUT = 10.seconds
 
         const val SNAPSHOT_JSON =
             """{"id":"snap","result":{"type":"session_snapshot","snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"w1:p1",""" +

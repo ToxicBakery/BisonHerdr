@@ -336,7 +336,8 @@ class SshTransportManager(
     }
 
     /**
-     * Disconnects [machineId], stopping any active Mosh UDP session and clearing cached control streams.
+     * Disconnects [machineId] and clears its cached control streams. It also stops the Mosh session of the machine,
+     * but this version starts no Mosh session (issue #22).
      */
     suspend fun disconnect(machineId: String) {
         releaseConnection(machineId)

@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.ssh
 
+import com.toxicbakery.app.bison.model.TransportMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -113,6 +114,18 @@ interface MoshSessionEngine {
 
         /** The fallback reason of the SSH endpoint backbone when the host has `mosh-server`. */
         const val MOSH_SERVER_FOUND: String = "The host has mosh-server, but Mosh is not available in this version"
+
+        /**
+         * Returns the fallback reason of the SSH endpoint backbone of a machine with [mode], or null. [hasMoshServer]
+         * is true when the host has `mosh-server`. A [TransportMode.MoshOnly] machine always gets a reason, because
+         * it asks for Mosh.
+         */
+        fun fallbackReasonFor(mode: TransportMode, hasMoshServer: Boolean): String? =
+            when {
+                hasMoshServer -> MOSH_SERVER_FOUND
+                mode == TransportMode.MoshOnly -> NOT_AVAILABLE
+                else -> null
+            }
     }
 }
 

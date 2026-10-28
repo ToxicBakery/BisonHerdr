@@ -209,7 +209,8 @@ class ConnectionPathsE2ETest {
         assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, withServer.fallbackReason)
         assertFalse(hWithServer.moshEngine.isSessionActive("mosh-2a"))
 
-        // Path 2B: The host has no mosh-server. The machine still connects over the SSH endpoint.
+        // Path 2B: The host has no mosh-server. The machine still connects over the SSH endpoint, and the backbone
+        // tells that Mosh is not available, because the machine asks for Mosh only.
         val hMissing = Harness()
         hMissing.backend.moshServerProbe = { false }
         val missingHost = moshOnlyHost.copy(id = "mosh-2b-missing")
@@ -218,7 +219,12 @@ class ConnectionPathsE2ETest {
         val missing = assertIs<ActiveBackbone.SshEndpoint>(
             hMissing.stateManager.activeTransportBackbone.value["mosh-2b-missing"],
         )
-        assertNull(missing.fallbackReason)
+        assertEquals(MoshSessionEngine.NOT_AVAILABLE, missing.fallbackReason)
+        assertTrue(
+            hMissing.debugLog.entries.value.any {
+                it.machineId == "mosh-2b-missing" && it.message == MoshSessionEngine.NOT_AVAILABLE
+            },
+        )
     }
 
     @Test

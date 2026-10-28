@@ -116,8 +116,9 @@ import kotlinx.serialization.json.put
  * [reconnectScope] with the delays from [reconnectDelays]. It sends its events to [sessionEvents]. A command that
  * finds a closed session waits only for the attempt that runs now, and then fails.
  *
- * [refreshSnapshotAndSurface] measures the time of its first command batch with [timeSource]. A [RoundTripMeter]
- * keeps the average for each machine, and gives it to [roundTripListener] at most one time each second.
+ * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
+ * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
+ * second.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -148,7 +149,7 @@ internal class RealHerdrSshClient(
         { KeyboardInteractiveOutcome.NoUi },
     /** Gets the new password reference of a machine when the user saves a typed password. See [savePassword]. */
     private val machineStore: MachineStore? = null,
-    /** Measures the round trips of the poll. A test gives a source with virtual time. */
+    /** Measures the poll time. A test gives a source with virtual time. */
     private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     internal enum class WorkerLane {
@@ -218,6 +219,9 @@ internal class RealHerdrSshClient(
         val isAlive: Boolean
             get() = !channel.isClosed && channel.isConnected
 
+        /** True after the first batch. Only the holder of the lane lock reads and writes it. */
+        var ranBatch: Boolean = false
+
         fun close() {
             runCatching { stdin.close() }
             runCatching { stdout.close() }
@@ -282,13 +286,13 @@ internal class RealHerdrSshClient(
     internal var sessionEvents: SessionEvents? = null
 
     /**
-     * Receives the average round trip time of a machine in whole milliseconds. It returns true when it changed the
+     * Receives the average poll time of a machine in whole milliseconds. It returns true when it changed the
      * value that the app shows. [RealSshBackend] sets it.
      */
     @Volatile
     internal var roundTripListener: ((machineId: String, rttMs: Int) -> Boolean)? = null
 
-    /** Keeps the average round trip time of each machine. See [refreshSnapshotAndSurface]. */
+    /** Keeps the average poll time of each machine. See [refreshSnapshotAndSurface]. */
     private val roundTripMeter = RoundTripMeter(timeSource)
 
     /** Sends the events of each supervisor to [sessionEvents] when it is set. */
@@ -424,6 +428,11 @@ internal class RealHerdrSshClient(
             lane = WorkerLane.Poll,
             commands = listOf(RemoteShellCommand.Exec(command)),
         )
+    }
+
+    /** Writes [message] about the transport of [machineId] to the debug log. */
+    internal fun recordTransport(machineId: String, message: String) {
+        sshDebugLog.record(machineId = machineId, tag = TRANSPORT_LOG_TAG, message = message)
     }
 
     /**
@@ -586,7 +595,7 @@ internal class RealHerdrSshClient(
     /** Returns the state of the supervisor of [machineId], or null when the machine has no supervisor. */
     internal fun reconnectState(machineId: String): SessionSupervisor.State? = supervisors[machineId]?.state?.value
 
-    /** Returns the average round trip time of [machineId] in whole milliseconds, or null before the first sample. */
+    /** Returns the average poll time of [machineId] in whole milliseconds, or null before the first sample. */
     internal fun averageRoundTripMs(machineId: String): Int? = roundTripMeter.averageMs(machineId)
 
     /**
@@ -653,8 +662,11 @@ internal class RealHerdrSshClient(
      * Reads the snapshot and the visible panes of [machine], and publishes them. Returns false when the output has
      * no snapshot.
      *
-     * The first command batch is the round trip that the app shows as the round trip time of the machine. The
-     * client gives its time to [roundTripMeter]. A batch that fails or that runs during a reconnect gives no time.
+     * The time of the first command batch is the poll time of the machine (`ActiveBackbone.rttMs`). It is one
+     * round trip on the SSH session, plus the run time of `herdr api snapshot` and of one `herdr remote-api-bridge`
+     * for each visible pane. Thus it is more than the network round trip time. The client gives the time to
+     * [roundTripMeter]. A batch that fails, that runs during a reconnect, or that is the first batch of a new worker
+     * gives no time.
      */
     suspend fun refreshSnapshotAndSurface(
         machine: HostMachine,
@@ -800,7 +812,7 @@ internal class RealHerdrSshClient(
         true
     }
 
-    /** Adds the round trip time [elapsed] of [machineId] to [roundTripMeter], which gives it to [roundTripListener]. */
+    /** Adds the poll time [elapsed] of [machineId] to [roundTripMeter], which gives it to [roundTripListener]. */
     private fun recordRoundTrip(machineId: String, elapsed: Duration) {
         roundTripMeter.record(machineId, elapsed) { rttMs -> roundTripListener?.invoke(machineId, rttMs) == true }
     }
@@ -2132,9 +2144,10 @@ internal class RealHerdrSshClient(
     /**
      * Runs [commands] on the worker of [lane] and returns their output.
      *
-     * [onRoundTrip] gets the time of the round trip on a worker that is open already. The time does not include the
-     * wait for the lane lock, for a reconnect, or for a new worker. A batch that needs a new worker after a failure
-     * gives no time. See [timeRoundTrip].
+     * [onRoundTrip] gets the time of the batch on a worker that ran a batch already. The time does not include the
+     * wait for the lane lock, for a reconnect, or for a new worker. The first batch of a new worker gives no time,
+     * because it can include the start of the remote shell. A batch that needs a new worker after a failure gives no
+     * time. See [timeRoundTrip].
      */
     private suspend fun executeBatchOnLane(
         machine: HostMachine,
@@ -2155,14 +2168,16 @@ internal class RealHerdrSshClient(
             val session = getOrOpenSession(machine, route)
             runCatching {
                 val worker = getOrOpenWorkerLocked(machine.id, lane, session)
-                timeRoundTrip(machine.id, onRoundTrip) { runCommandsOnWorker(worker, commands) }
+                val timing = onRoundTrip.takeIf { worker.ranBatch }
+                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands) }
+                    .also { worker.ranBatch = true }
             }.recoverCatching {
                 // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
                 workerMapFor(lane).remove(machine.id)?.close()
                 val freshSession = getOrOpenSession(machine, route)
                 runCatching {
                     val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
-                    runCommandsOnWorker(freshWorker, commands)
+                    runCommandsOnWorker(freshWorker, commands).also { freshWorker.ranBatch = true }
                 }.getOrElse {
                     execBatchOneShot(freshSession, commands)
                 }
@@ -2973,6 +2988,9 @@ internal class RealHerdrSshClient(
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
         private const val IPTOS_LOWDELAY = 0x10
         private const val LIVE_POLL_INTERVAL_MS = 400L
+
+        /** The debug log tag of [recordTransport]. */
+        internal const val TRANSPORT_LOG_TAG = "Transport"
         private const val LIVENESS_POLL_INTERVAL_MS = 10L
         private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
