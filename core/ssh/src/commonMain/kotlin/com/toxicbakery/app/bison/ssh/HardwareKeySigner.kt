@@ -32,14 +32,25 @@ interface HardwareKeySigner {
     ): SshAuthMethod.HardwareSecurityKey
 
     /**
+     * Returns the cancel mark of [machineId] now: its count in [SshStateManager.userAuthCancelCounts]. A login takes
+     * the mark at its start and gives it to [sign].
+     */
+    fun cancelMark(machineId: String): Long
+
+    /**
      * Signs [data] with the credential of [key] and returns the OpenSSH `PROTOCOL.u2f` signature blob:
      * `string` key type, `string` signature, `byte` flags, and `uint32` counter. Throws a [HardwareKeyException]
      * when the key cannot sign.
+     *
+     * [cancelMark] is the [cancelMark] of [machineId] at the start of the login, or null for the mark at the start of
+     * this call. When the user cancelled the login after the mark, for example with a disconnect before JSch asks for
+     * the signature, the call stops with [HardwareKeyException.Reason.Cancelled] and shows no prompt.
      */
     suspend fun sign(
         machineId: String,
         key: SshAuthMethod.HardwareSecurityKey,
         data: ByteArray,
+        cancelMark: Long? = null,
     ): ByteArray
 }
 

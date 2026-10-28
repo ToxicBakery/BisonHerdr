@@ -8,6 +8,7 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import com.yubico.yubikit.core.Transport
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -44,6 +45,7 @@ class HardwareKeyLoginTest {
     private val hub = SecurityKeyHub()
     private val key = FakeSecurityKey()
     private val signer = YubiKeyFido2Signer(hub = hub, sshStateManager = stateManager, sshDebugLog = debugLog)
+    private val checkingSigner = CheckingSigner(signer)
     private val backend = RealSshBackend(
         sshStateManager = stateManager,
         sshDebugLog = debugLog,
@@ -53,7 +55,7 @@ class HardwareKeyLoginTest {
         keystoreKeyManager = server.keyManager,
         knownHostsStore = knownHostsStore,
         secretStore = softwareKeySecretStore(),
-        hardwareKeySigner = signer,
+        hardwareKeySigner = checkingSigner,
     )
     private val hostScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val machines = mutableListOf<HostMachine>()
@@ -151,7 +153,9 @@ class HardwareKeyLoginTest {
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
         repeat(LOGIN_COUNT) { index ->
-            assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), "login $index\n${debugLogDump()}")
+            val result = backend.authenticate(machine, route)
+            assertTrue(checkingSigner.errors.isEmpty(), "login $index: ${checkingSigner.errors}")
+            assertEquals(SshAuthResult.Success, result, "login $index\n${debugLogDump()}")
             assertEquals("sk login ok", backend.client.runCommand(machine, route, "echo sk login ok").trim())
             backend.disconnect(machine.id)
         }
@@ -169,6 +173,30 @@ class HardwareKeyLoginTest {
             override fun stop() = Unit
         }
         return hostScope.launch(start = CoroutineStart.UNDISPATCHED) { hub.hostDiscovery(discovery) }
+    }
+
+    /**
+     * Checks each blob of [delegate] as an OpenSSH server does ([OpenSshSkSignatureCheck]), before JSch sends it.
+     * MINA SSHD accepts some blobs that OpenSSH refuses, for example a negative `mpint`.
+     */
+    private class CheckingSigner(private val delegate: HardwareKeySigner) : HardwareKeySigner by delegate {
+        val errors: MutableList<AssertionError> = CopyOnWriteArrayList()
+
+        override suspend fun sign(
+            machineId: String,
+            key: SshAuthMethod.HardwareSecurityKey,
+            data: ByteArray,
+            cancelMark: Long?,
+        ): ByteArray {
+            val blob = delegate.sign(machineId, key, data, cancelMark)
+            try {
+                OpenSshSkSignatureCheck.check(key, data, blob)
+            } catch (error: AssertionError) {
+                errors += error
+                throw HardwareKeyException(HardwareKeyException.Reason.Failed, error.message, error)
+            }
+            return blob
+        }
     }
 
     private fun machine(id: String, authMethod: SshAuthMethod): HostMachine =

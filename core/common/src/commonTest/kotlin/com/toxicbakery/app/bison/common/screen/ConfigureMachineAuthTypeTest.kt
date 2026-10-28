@@ -360,10 +360,13 @@ class ConfigureMachineAuthTypeTest {
             return result()
         }
 
+        override fun cancelMark(machineId: String): Long = 0
+
         override suspend fun sign(
             machineId: String,
             key: SshAuthMethod.HardwareSecurityKey,
             data: ByteArray,
+            cancelMark: Long?,
         ): ByteArray = error("The view model does not sign")
     }
 

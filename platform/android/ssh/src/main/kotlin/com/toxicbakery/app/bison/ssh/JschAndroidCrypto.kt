@@ -257,6 +257,10 @@ internal class AndroidKeystoreJschIdentity(
  *
  * A [HardwareKeyException] from [signer] goes through `Session.connect`, because it is a [RuntimeException]. The wait
  * is a child of [callerJob], so a cancel of the login stops it with a [kotlinx.coroutines.CancellationException].
+ *
+ * The client makes the identity at the start of the login, before the TCP connection. The identity takes the cancel
+ * mark of the machine then ([HardwareKeySigner.cancelMark]). When the user disconnects the machine before JSch asks for
+ * the signature, [getSignature] thus stops with [HardwareKeyException.Reason.Cancelled] and shows no prompt.
  */
 internal class HardwareKeyJschIdentity(
     private val machineId: String,
@@ -264,6 +268,8 @@ internal class HardwareKeyJschIdentity(
     private val signer: HardwareKeySigner,
     private val callerJob: Job?,
 ) : Identity {
+
+    private val cancelMark: Long = signer.cancelMark(machineId)
 
     override fun setPassphrase(passphrase: ByteArray?): Boolean = true
 
@@ -277,7 +283,7 @@ internal class HardwareKeyJschIdentity(
         // An error of the child must not fail the caller job, so the child returns it as a value.
         val result = runBlocking(callerJob ?: EmptyCoroutineContext) {
             try {
-                Result.success(signer.sign(machineId, key, data))
+                Result.success(signer.sign(machineId, key, data, cancelMark))
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {

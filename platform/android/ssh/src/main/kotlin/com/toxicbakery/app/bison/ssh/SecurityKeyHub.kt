@@ -4,8 +4,10 @@ import com.toxicbakery.app.bison.model.HardwareKeyTransport
 import com.yubico.yubikit.core.Transport
 import com.yubico.yubikit.core.YubiKeyDevice
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.getAndUpdate
@@ -107,14 +109,18 @@ class SecurityKeyHub {
 
     /**
      * Returns the USB key at once, or waits for a USB key or an NFC tap. [transport] limits the keys that the call
-     * accepts. The caller sets the time limit.
+     * accepts. The caller sets the time limit. When no host is left, for example because the activity stopped, the
+     * function throws [HardwareKeyException.Reason.NoUi], because no discovery can find a key.
      */
     suspend fun awaitDevice(transport: HardwareKeyTransport): YubiKeyDevice {
-        val sources = buildList {
+        val sources = buildList<Flow<YubiKeyDevice?>> {
             if (transport != HardwareKeyTransport.NfcOnly) add(usbDevice.filterNotNull())
             if (transport != HardwareKeyTransport.UsbOnly) add(nfcDevices.receiveAsFlow())
+            // Null tells that no host is left.
+            add(hostCount.filter { it == 0 }.map { null })
         }
         return merge(*sources.toTypedArray()).first()
+            ?: throw HardwareKeyException(HardwareKeyException.Reason.NoUi)
     }
 
     private fun forgetDevices(transport: Transport) {

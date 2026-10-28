@@ -5,11 +5,8 @@ import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.RoamingStatus
 import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -54,13 +51,14 @@ class SshStateManager {
     private val _hardwareKeyTouchPrompt = MutableStateFlow<SshRequest.PromptHardwareKeyTouch?>(null)
     val hardwareKeyTouchPrompt: StateFlow<SshRequest.PromptHardwareKeyTouch?> = _hardwareKeyTouchPrompt.asStateFlow()
 
-    private val _hardwareKeyCancels = MutableSharedFlow<String?>(extraBufferCapacity = HARDWARE_KEY_CANCEL_CAPACITY)
+    private val _userAuthCancelCounts = MutableStateFlow(UserAuthCancelCounts())
 
     /**
-     * The machine ID of each [cancelUserAuth] call, or null for each [cancelAllUserAuth] call. A [HardwareKeySigner]
-     * call that waits for its turn stops when its machine gets a cancel. The flow keeps no old cancels.
+     * The number of [cancelUserAuth] calls of each machine and of [cancelAllUserAuth] calls. A login takes the count
+     * of its machine ([UserAuthCancelCounts.of]) at its start. When the count changes later, the user cancelled the
+     * login, also when the login did not ask anything yet. A [HardwareKeySigner] call then stops.
      */
-    val hardwareKeyCancels: SharedFlow<String?> = _hardwareKeyCancels.asSharedFlow()
+    val userAuthCancelCounts: StateFlow<UserAuthCancelCounts> = _userAuthCancelCounts.asStateFlow()
 
     private val _hostKeyPrompts = MutableStateFlow<Map<String, HostKeyPrompt>>(emptyMap())
 
@@ -277,8 +275,9 @@ class SshStateManager {
      * [requestKeyboardInteractive] then ends at once. A disconnect calls it before its request goes into a queue,
      * because the connect that waits for the prompt can hold that queue.
      *
-     * It also removes the touch prompt of [machineId] and sends [machineId] to [hardwareKeyCancels], so that the
-     * [HardwareKeySigner] call of the connect stops, also when it waits for its turn.
+     * It also removes the touch prompt of [machineId] and adds one to the count of [machineId] in
+     * [userAuthCancelCounts], so that the [HardwareKeySigner] call of the connect stops, also when it did not start yet
+     * or waits for its turn.
      */
     fun cancelUserAuth(machineId: String) {
         _userAuthPrompts.value
@@ -288,18 +287,18 @@ class SshStateManager {
             .filter { it.machineId == machineId }
             .forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
         _hardwareKeyTouchPrompt.update { current -> if (current?.machineId == machineId) null else current }
-        _hardwareKeyCancels.tryEmit(machineId)
+        _userAuthCancelCounts.update { counts -> counts.plusMachine(machineId) }
     }
 
     /**
      * Cancels all open prompts: the user authentication prompts, the keyboard-interactive prompts, and the touch
-     * prompt. It also sends null to [hardwareKeyCancels], so that each [HardwareKeySigner] call stops.
+     * prompt. It also adds one to [UserAuthCancelCounts.all], so that each [HardwareKeySigner] call stops.
      */
     fun cancelAllUserAuth() {
         _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
         _keyboardInteractivePrompts.value.forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
         _hardwareKeyTouchPrompt.value = null
-        _hardwareKeyCancels.tryEmit(null)
+        _userAuthCancelCounts.update { counts -> counts.copy(all = counts.all + 1) }
     }
 
     /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */
@@ -413,9 +412,22 @@ class SshStateManager {
     }
 
     companion object {
-        /** The number of cancels that [hardwareKeyCancels] keeps for a slow collector. */
-        private const val HARDWARE_KEY_CANCEL_CAPACITY = 16
-
         fun promptQueueKey(machineId: String, paneId: String): String = "$machineId:$paneId"
     }
+}
+
+/**
+ * The cancel counts of [SshStateManager.userAuthCancelCounts]: [all] counts the calls of
+ * [SshStateManager.cancelAllUserAuth], and [machines] counts the calls of [SshStateManager.cancelUserAuth] for each
+ * machine ID.
+ */
+data class UserAuthCancelCounts(
+    val all: Long = 0,
+    val machines: Map<String, Long> = emptyMap(),
+) {
+    /** Returns the cancel count that applies to [machineId]: its own cancels and the cancels of all machines. */
+    fun of(machineId: String): Long = all + (machines[machineId] ?: 0)
+
+    internal fun plusMachine(machineId: String): UserAuthCancelCounts =
+        copy(machines = machines + (machineId to (machines[machineId] ?: 0) + 1))
 }

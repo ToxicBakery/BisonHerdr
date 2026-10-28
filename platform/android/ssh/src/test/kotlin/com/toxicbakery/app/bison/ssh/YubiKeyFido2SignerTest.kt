@@ -5,15 +5,6 @@ import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.yubico.yubikit.core.Transport
 import com.yubico.yubikit.core.YubiKeyDevice
-import java.io.DataInputStream
-import java.math.BigInteger
-import java.security.AlgorithmParameters
-import java.security.KeyFactory
-import java.security.Signature
-import java.security.spec.ECGenParameterSpec
-import java.security.spec.ECParameterSpec
-import java.security.spec.ECPoint
-import java.security.spec.ECPublicKeySpec
 import kotlin.io.encoding.Base64
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -23,19 +14,17 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import org.bouncycastle.asn1.ASN1Integer
-import org.bouncycastle.asn1.DERSequence
-import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
 
 /**
  * Tests [YubiKeyFido2Signer] with a software FIDO2 key behind a fake CTAPHID `FidoConnection` ([FakeSecurityKey]).
@@ -135,6 +124,138 @@ class YubiKeyFido2SignerTest {
 
         assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, call.await())
         assertTrue(key.cancelReceived)
+    }
+
+    @Test
+    fun aCancelBeforeTheCallStopsItWithNoPrompt() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        runCurrent()
+        val eventsAfterEnroll = discovery.events.toList()
+        // The login takes the mark at its start. The user then disconnects while JSch makes the TCP connection.
+        val mark = signer.cancelMark(MACHINE_ID)
+        stateManager.cancelUserAuth(MACHINE_ID)
+
+        val result = runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1), mark) }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, result)
+        runCurrent()
+        // The call showed no prompt, so it did not start the discovery, and the key got no request.
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+        assertEquals(eventsAfterEnroll, discovery.events)
+        assertTrue(key.commands.none { it == CTAP_GET_ASSERTION }, "The key got a request: ${key.commands}")
+
+        // A different machine, and a new login of the same machine, still sign.
+        signer.sign(OTHER_MACHINE_ID, enrolled, byteArrayOf(2), signer.cancelMark(OTHER_MACHINE_ID))
+        signer.sign(MACHINE_ID, enrolled, byteArrayOf(3), signer.cancelMark(MACHINE_ID))
+
+        // A cancel of all prompts also stops a login that started before it.
+        val otherMark = signer.cancelMark(OTHER_MACHINE_ID)
+        stateManager.cancelAllUserAuth()
+        val all = runCatching { signer.sign(OTHER_MACHINE_ID, enrolled, byteArrayOf(4), otherMark) }
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, all)
+    }
+
+    @Test
+    fun theIdentityTakesTheCancelMarkWhenTheLoginStarts() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        // The client makes the identity before the TCP connection. The user then disconnects.
+        val identity = HardwareKeyJschIdentity(MACHINE_ID, enrolled, signer, callerJob = null)
+        stateManager.cancelUserAuth(MACHINE_ID)
+
+        val error = assertFailsWith<HardwareKeyException> { identity.getSignature(byteArrayOf(1), null) }
+
+        assertEquals(HardwareKeyException.Reason.Cancelled, error.reason)
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+    }
+
+    @Test
+    fun aCancelOfOneMachineDoesNotStopTheOtherWaitingCalls() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        key.touch = FakeSecurityKey.Touch.UntilCancel
+        val first = async { runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1)) } }
+        key.waitingForTouch.await()
+        key.touch = FakeSecurityKey.Touch.Immediate
+
+        // Two more machines wait for their turn. The user disconnects only the second machine.
+        val second = async { runCatching { signer.sign(OTHER_MACHINE_ID, enrolled, byteArrayOf(2)) } }
+        val third = async { runCatching { signer.sign(THIRD_MACHINE_ID, enrolled, byteArrayOf(3)) } }
+        runCurrent()
+        stateManager.cancelUserAuth(OTHER_MACHINE_ID)
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, second.await())
+        runCurrent()
+        assertFalse(third.isCompleted, "The cancel of the second machine stopped the third machine")
+        assertEquals(MACHINE_ID, stateManager.hardwareKeyTouchPrompt.value?.machineId)
+
+        // The user closes the touch sheet of the first machine. The third machine then gets the key.
+        stateManager.dismissHardwareKeyTouchPrompt()
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, first.await())
+        val blob = third.await().getOrThrow()
+        assertSignatureVerifies(enrolled, byteArrayOf(3), blob, expectedCounter = FakeSecurityKey.INITIAL_COUNTER + 1)
+    }
+
+    @Test
+    fun aKeyThatDoesNotAnswerStopsAtTheTimeLimit() = runTest {
+        val shortSigner = YubiKeyFido2Signer(
+            hub = hub,
+            sshStateManager = stateManager,
+            sshDebugLog = debugLog,
+            keyWaitTimeout = KEY_WAIT_TIMEOUT,
+            operationTimeout = SHORT_OPERATION_TIMEOUT,
+        )
+        hostWithUsbKey()
+        val enrolled = shortSigner.enroll(
+            MACHINE_ID,
+            HardwareKeyType.SkSshEd25519,
+            HardwareKeyTransport.UsbAndNfc,
+            "ssh:",
+        )
+        key.touch = FakeSecurityKey.Touch.UntilCancel
+
+        val result = runCatching { shortSigner.sign(MACHINE_ID, enrolled, byteArrayOf(1)) }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.NotTouched, result)
+        assertTrue(key.cancelReceived, "The signer did not cancel the request on the key")
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+    }
+
+    @Test
+    fun theWaitForAKeyStopsWithNoUiWhenTheActivityStops() = runTest {
+        val host = startHost(device = null)
+        val call = async {
+            runCatching {
+                signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+            }
+        }
+        runCurrent()
+        assertNotNull(stateManager.hardwareKeyTouchPrompt.value)
+
+        // The activity stops before the user connects a key.
+        host.cancel()
+
+        assertHardwareKeyError(HardwareKeyException.Reason.NoUi, call.await())
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+    }
+
+    @Test
+    fun anApplicationWithNoSshPrefixIsRefused() = runTest {
+        hostWithUsbKey()
+
+        val enroll = runCatching {
+            signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "web:example")
+        }
+        val sign = runCatching {
+            val key = SshAuthMethod.HardwareSecurityKey(credentialId = "AAEC", publicKey = "AwQF", applicationId = "x")
+            signer.sign(MACHINE_ID, key, byteArrayOf(1))
+        }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.NotSupported, enroll)
+        assertHardwareKeyError(HardwareKeyException.Reason.NotSupported, sign)
+        assertTrue(discovery.events.isEmpty(), "The signer started the discovery: ${discovery.events}")
+        assertTrue(key.commands.isEmpty())
     }
 
     @Test
@@ -302,12 +423,12 @@ class YubiKeyFido2SignerTest {
     }
 
     /** Starts a host whose discovery gives the USB key of [key] at the start. */
-    private fun TestScope.hostWithUsbKey() = startHost(key.device(Transport.USB))
+    private fun TestScope.hostWithUsbKey(): Job = startHost(key.device(Transport.USB))
 
-    /** Starts a host of [hub], as the activity does in the foreground. [device] comes at each start of the discovery. */
-    private fun TestScope.startHost(device: YubiKeyDevice?) {
+    /** Starts a host of [hub], as the visible activity does. [device] comes at each start of the discovery. */
+    private fun TestScope.startHost(device: YubiKeyDevice?): Job {
         discovery.device = device
-        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { hub.hostDiscovery(discovery) }
+        return backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { hub.hostDiscovery(discovery) }
     }
 
     private fun assertMakeCredentialRequest(expectedAlgorithm: Int, applicationId: String = "ssh:") {
@@ -345,58 +466,14 @@ class YubiKeyFido2SignerTest {
         return error
     }
 
-    /**
-     * Checks [blob] the same way as OpenSSH: the signed message is `SHA256(application) || flags || counter ||
-     * SHA256(data)`, and the user presence flag is set.
-     */
+    /** Checks [blob] as OpenSSH does ([OpenSshSkSignatureCheck]), and checks the counter. */
     private fun assertSignatureVerifies(
         key: SshAuthMethod.HardwareSecurityKey,
         data: ByteArray,
         blob: ByteArray,
         expectedCounter: Int,
     ) {
-        val input = DataInputStream(blob.inputStream())
-        val type = String(ByteArray(input.readInt()).also(input::readFully))
-        val signature = ByteArray(input.readInt()).also(input::readFully)
-        val flags = input.readByte()
-        val counter = input.readInt()
-        assertEquals(0, input.available(), "The blob has extra bytes")
-        assertEquals(key.keyType.opensshKeyType, type)
-        assertEquals(1, flags.toInt() and 0x01, "The user presence flag is not set")
-        assertEquals(expectedCounter, counter)
-
-        val message = SecurityKeyWireFormat.sha256(key.applicationId.toByteArray()) + byteArrayOf(flags) +
-            java.nio.ByteBuffer.allocate(4).putInt(counter).array() + SecurityKeyWireFormat.sha256(data)
-        val publicKey = Base64.decode(assertNotNull(key.publicKey))
-        val verified = when (key.keyType) {
-            HardwareKeyType.SkSshEd25519 -> Ed25519Signer().run {
-                init(false, Ed25519PublicKeyParameters(publicKey, 0))
-                update(message, 0, message.size)
-                verifySignature(signature)
-            }
-            else -> {
-                val mpints = DataInputStream(signature.inputStream())
-                val r = BigInteger(ByteArray(mpints.readInt()).also(mpints::readFully))
-                val s = BigInteger(ByteArray(mpints.readInt()).also(mpints::readFully))
-                assertEquals(0, mpints.available(), "The ECDSA signature has extra bytes")
-                val der = DERSequence(arrayOf(ASN1Integer(r), ASN1Integer(s))).encoded
-                Signature.getInstance("SHA256withECDSA").run {
-                    initVerify(p256PublicKey(publicKey))
-                    update(message)
-                    verify(der)
-                }
-            }
-        }
-        assertTrue(verified, "The ${key.keyType} signature does not verify")
-    }
-
-    private fun p256PublicKey(point: ByteArray): java.security.PublicKey {
-        val parameters = AlgorithmParameters.getInstance("EC").apply { init(ECGenParameterSpec("secp256r1")) }
-        val spec = ECPublicKeySpec(
-            ECPoint(BigInteger(1, point.copyOfRange(1, 33)), BigInteger(1, point.copyOfRange(33, 65))),
-            parameters.getParameterSpec(ECParameterSpec::class.java),
-        )
-        return KeyFactory.getInstance("EC").generatePublic(spec)
+        assertEquals(expectedCounter, OpenSshSkSignatureCheck.check(key, data, blob).counter)
     }
 
     /** Enrolls a credential on [fakeKey] with a separate signer and hub. */
@@ -436,6 +513,8 @@ class YubiKeyFido2SignerTest {
     private companion object {
         const val MACHINE_ID = "yubikey-box"
         const val OTHER_MACHINE_ID = "second-box"
+        const val THIRD_MACHINE_ID = "third-box"
+        val SHORT_OPERATION_TIMEOUT = 300.milliseconds
         const val SIGNATURE_COUNT = 24
         const val CTAP_GET_ASSERTION = 0x02
         val KEY_WAIT_TIMEOUT = 5.seconds
