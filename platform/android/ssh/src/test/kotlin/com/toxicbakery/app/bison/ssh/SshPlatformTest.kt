@@ -261,7 +261,8 @@ class SshPlatformTest {
 
         synchronized(recordedBatches) { recordedBatches.clear() }
 
-        // 2. Verify buildCoalescedInputCommands merges consecutive TextCommit + Key into single pane.send_input
+        // 2. Verify buildCoalescedInputCommands merges typed text into one pane.send_text, and sends the key after it.
+        // Typed text never goes in pane.send_input, because Herdr can put that text in a bracketed paste.
         val coalesced = client.buildCoalescedInputCommands(
             listOf(
                 RealHerdrSshClient.PendingPaneInput(1L, "%1", ClientPaneInputEvent.TextCommit("l")),
@@ -273,10 +274,11 @@ class SshPlatformTest {
                 ),
             )
         )
-        assertEquals(1, coalesced.size)
-        assertTrue(coalesced.single().ndjsonLine.contains("\"method\":\"pane.send_input\""))
-        assertTrue(coalesced.single().ndjsonLine.contains("\"text\":\"ls\""))
-        assertTrue(coalesced.single().ndjsonLine.contains("\"keys\":[\"Enter\"]"))
+        assertEquals(2, coalesced.size)
+        assertTrue(coalesced[0].ndjsonLine.contains("\"method\":\"pane.send_text\""))
+        assertTrue(coalesced[0].ndjsonLine.contains("\"text\":\"ls\""))
+        assertTrue(coalesced[1].ndjsonLine.contains("\"method\":\"pane.send_keys\""))
+        assertTrue(coalesced[1].ndjsonLine.contains("\"keys\":[\"Enter\"]"))
 
         // 3. Send "l" and "s" and verify instant optimistic local echo on PaneSurfaceBus
         assertTrue(client.sendPaneInput(machine, route, "%1", ClientPaneInputEvent.TextCommit("l")))

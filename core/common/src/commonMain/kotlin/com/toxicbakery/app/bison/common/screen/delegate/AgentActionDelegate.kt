@@ -51,14 +51,24 @@ interface AgentActionDelegate {
         agentName: String? = null,
         agentStatus: AgentStatus = AgentStatus.Working,
     )
+    /**
+     * Sends the [prompt] of the composer as a paste, and then the Enter key: `agent.prompt` for an agent, or
+     * `pane.send_input` with the Enter key.
+     */
     suspend fun submitPrompt(
         machineId: String,
         paneId: String,
         agentName: String?,
         prompt: String,
     )
+
+    /** Sends one key, with `pane.send_keys` or as the terminal bytes of the key. */
     suspend fun sendKeyEvent(machineId: String, paneId: String, keyEvent: ClientKeyEvent)
+
+    /** Sends the Herdr key name [chord], for example `ctrl+c`, with `pane.send_keys`. */
     suspend fun sendKeyChord(machineId: String, paneId: String, chord: String)
+
+    /** Sends [text] as typed input. See [ClientPaneInputEvent.TextCommit]. */
     suspend fun sendLiteralText(machineId: String, paneId: String, text: String)
 }
 

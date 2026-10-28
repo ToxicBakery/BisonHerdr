@@ -40,6 +40,16 @@ class ModifierKeyStateTest {
     }
 
     @Test
+    fun theSpaceTabAndPlusKeysGetTheirHerdrNamesInAChord() {
+        val ctrl = ModifierKeyState().onSingleTap(TerminalModifierKey.Ctrl)
+        assertEquals("ctrl+space", ctrl.formatKeyChord(" "))
+        assertEquals("ctrl+tab", ctrl.formatKeyChord("\t"))
+        assertEquals("ctrl+plus", ctrl.formatKeyChord("+"))
+        val ctrlAlt = ctrl.onSingleTap(TerminalModifierKey.Alt)
+        assertEquals("ctrl+alt+space", ctrlAlt.formatKeyChord(" "))
+    }
+
+    @Test
     fun snapSplitRatioSnapsToCanonicalStopsAndClampsBounds() {
         assertEquals(0.25f, snapSplitRatio(0.26f))
         assertEquals(0.3333f, snapSplitRatio(0.32f))
