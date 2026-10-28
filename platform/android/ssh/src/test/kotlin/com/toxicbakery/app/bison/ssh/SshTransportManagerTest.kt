@@ -7,6 +7,8 @@ import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import java.net.ConnectException
 import kotlin.test.Test
@@ -80,7 +82,7 @@ class SshTransportManagerTest {
 
     @Test
     fun anRpcWithNoResponseFromTheBackendGivesAnErrorResponse() = runTest {
-        // The recording backend gives no response, as the real backend does after an error.
+        // The recording backend gives no response and writes no log entry.
         val backend = RecordingSshBackend()
         val manager = manager(backend)
         connectAll(manager, backend, lanBox)
@@ -91,8 +93,33 @@ class SshTransportManagerTest {
         assertTrue(response.contains("\"error\""), response)
         assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
         assertFalse(response.contains("\"ok\""), response)
-        // The backend writes the cause of its error, so the manager writes no second error.
+        // The manager writes no error of its own for a backend with no response.
         assertTrue(debugLog.entries.value.none { it.isError }, debugLogDump())
+    }
+
+    @Test
+    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLine() = runTest {
+        // Each command batch fails, as on a broken SSH channel.
+        val client = RealHerdrSshClient(
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = PaneSurfaceBus(),
+            semanticNotificationBus = SemanticNotificationBus(),
+            knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+            secretStore = InMemorySecretStore(),
+            remoteBatchExecutor = { _, _, _, _ -> throw IOException("Broken pipe") },
+        )
+        val backend = RealSshBackend(client, stateManager, AndroidKeystoreKeyManager(allowSoftwareKeys = true))
+        val manager = manager(backend)
+        // A resize gives the profile of the machine to the manager, with no command on the host.
+        manager.handleRequest(SshRequest.ResizeShell(lanBox.id, cols = 80u, rows = 24u), lanBox)
+
+        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
+
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        val errors = debugLog.entries.value.filter { it.isError }
+        assertEquals(1, errors.size, debugLogDump())
+        assertTrue(errors.single().message.startsWith("RPC pane.layout error: Broken pipe"), debugLogDump())
     }
 
     @Test

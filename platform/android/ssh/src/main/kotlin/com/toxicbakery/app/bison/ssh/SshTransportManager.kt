@@ -428,10 +428,10 @@ class SshTransportManager(
                 message = "No machine profile for $machineId; did not send ${request.method}",
                 isError = true,
             )
-            return noResponseError(request)
+            return noResponseError(request, "The machine has no profile, so the app did not send ${request.method}")
         }
         return backend.sendEndpointCommand(machine, proxyJumpTunnel.resolveRoute(machine), request, isMoshActive)
-            ?: noResponseError(request)
+            ?: noResponseError(request, "The backend gave no response for ${request.method}")
     }
 
     suspend fun sendEndpointCommand(
@@ -820,7 +820,10 @@ class SshTransportManager(
 
     companion object {
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
-        /** The error code of the response of [sendEndpointCommand] when the backend gives no response. */
+        /**
+         * The error code of the response of [sendEndpointCommand] when the machine has no profile, or when the backend
+         * gives no response.
+         */
         const val NO_RESPONSE_CODE: String = "no_response"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
@@ -862,13 +865,13 @@ class SshTransportManager(
                 "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
         }
 
-        /** Returns the error response line of [request] for a backend that gave no response. */
-        internal fun noResponseError(request: ClientShellEndpointRequest): String =
+        /** Returns the error response line of [request] with the code [NO_RESPONSE_CODE] and [message]. */
+        internal fun noResponseError(request: ClientShellEndpointRequest, message: String): String =
             buildJsonObject {
                 put("id", request.id)
                 putJsonObject("error") {
                     put("code", NO_RESPONSE_CODE)
-                    put("message", "The backend gave no response for ${request.method}")
+                    put("message", message)
                 }
             }.toString()
 

@@ -460,7 +460,7 @@ class SimulatedSshBackend(
          * real backend of this version sends each request over `herdr remote-api-bridge`.
          *
          * The target design also sends each request over `herdr.sock` while the surface lease is off. The simulation
-         * does not apply this rule, because [SshBackend.sendEndpointCommand] does not get the state of the lease.
+         * does not apply this rule.
          */
         internal fun designLaneOf(request: ClientShellEndpointRequest, isMoshActive: Boolean): String {
             val useApiBridge = (isMoshActive && MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode(request.method)) ||
