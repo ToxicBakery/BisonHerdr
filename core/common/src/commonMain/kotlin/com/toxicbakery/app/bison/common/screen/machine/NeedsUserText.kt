@@ -12,6 +12,7 @@ import com.toxicbakery.app.bison.resources.needs_user_input_required
 import com.toxicbakery.app.bison.resources.needs_user_input_timed_out
 import com.toxicbakery.app.bison.resources.needs_user_key_missing
 import com.toxicbakery.app.bison.resources.needs_user_local_network
+import com.toxicbakery.app.bison.resources.needs_user_local_network_timed_out
 import com.toxicbakery.app.bison.resources.needs_user_login_refused
 import com.toxicbakery.app.bison.resources.needs_user_other
 import com.toxicbakery.app.bison.resources.needs_user_password_missing
@@ -37,7 +38,10 @@ fun needsUserText(cause: NeedsUserCause): String =
         is NeedsUserCause.InputTimedOut -> stringResource(Res.string.needs_user_input_timed_out, cause.hostPort)
         is NeedsUserCause.InputCancelled -> stringResource(Res.string.needs_user_input_cancelled, cause.hostPort)
         is NeedsUserCause.Unreachable -> stringResource(Res.string.needs_user_unreachable, cause.detail)
-        is NeedsUserCause.LocalNetworkPermission ->
+        is NeedsUserCause.LocalNetworkPermission -> if (cause.timedOut) {
+            stringResource(Res.string.needs_user_local_network_timed_out, cause.hostPort)
+        } else {
             stringResource(Res.string.needs_user_local_network, cause.hostPort)
+        }
         is NeedsUserCause.Other -> stringResource(Res.string.needs_user_other, cause.detail)
     }
