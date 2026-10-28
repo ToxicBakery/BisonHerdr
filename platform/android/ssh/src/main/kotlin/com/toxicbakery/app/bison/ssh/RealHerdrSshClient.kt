@@ -2981,6 +2981,11 @@ internal class RealHerdrSshClient(
 
         val wrappedRows = ArrayList<List<CellData>>(rawLines.size + 16)
 
+        // For each row of wrappedRows, the number of blank cells that the trim below removed from its end. Herdr keeps
+        // the spaces that a program wrote, for example the space at the end of the prompt "$ ". The cursor of such a
+        // prompt is after these spaces. See the cursor at the end of this function.
+        val trimmedBlanks = ArrayList<Int>(rawLines.size + 16)
+
         for (line in rawLines) {
             val lineCells = ArrayList<CellData>(min(line.length.coerceAtLeast(16), 256))
             var col = 0
@@ -3112,10 +3117,12 @@ internal class RealHerdrSshClient(
             }
 
             // Trim trailing unstyled spaces so padding doesn't wrap into blank rows
+            var trimmed = 0
             while (lineCells.isNotEmpty()) {
                 val tail = lineCells.last()
                 if ((tail.symbol.isEmpty() || tail.symbol == " ") && tail.bg == 0u && tail.modifier == 0u.toUShort()) {
                     lineCells.removeAt(lineCells.lastIndex)
+                    trimmed++
                 } else {
                     break
                 }
@@ -3123,6 +3130,7 @@ internal class RealHerdrSshClient(
 
             if (lineCells.size <= usableW) {
                 wrappedRows.add(lineCells)
+                trimmedBlanks.add(trimmed)
             } else {
                 // Check if this row is predominantly a horizontal rule (──────)
                 var nonSpaceCount = 0
@@ -3140,11 +3148,14 @@ internal class RealHerdrSshClient(
                 val isHorizontalDivider = nonSpaceCount >= 8 && hLineCount * 4 >= nonSpaceCount * 3
                 if (isHorizontalDivider) {
                     wrappedRows.add(lineCells.subList(0, usableW))
+                    trimmedBlanks.add(0)
                 } else {
                     var offset = 0
                     while (offset < lineCells.size) {
                         val end = min(lineCells.size, offset + usableW)
                         wrappedRows.add(lineCells.subList(offset, end))
+                        // Only the last row of the line has the trimmed blanks at its end.
+                        trimmedBlanks.add(if (end == lineCells.size) trimmed else 0)
                         offset = end
                     }
                 }
@@ -3154,15 +3165,18 @@ internal class RealHerdrSshClient(
         // Trim trailing empty rows at the very bottom if they exceed usableH, then take the last usableH rows
         while (wrappedRows.size > usableH && wrappedRows.last().isEmpty()) {
             wrappedRows.removeAt(wrappedRows.lastIndex)
+            trimmedBlanks.removeAt(trimmedBlanks.lastIndex)
         }
         val visibleRows = if (wrappedRows.size > usableH) {
             wrappedRows.takeLast(usableH)
         } else {
             wrappedRows
         }
+        val visibleTrimmedBlanks = trimmedBlanks.takeLast(visibleRows.size)
 
         var lastCol = startX
         var lastRow = startY
+        var lastRowIndex = -1
 
         for (rowIdx in visibleRows.indices) {
             val row = startY + rowIdx
@@ -3176,10 +3190,19 @@ internal class RealHerdrSshClient(
                 if (cell.symbol.isNotEmpty() && cell.symbol != " ") {
                     lastCol = col
                     lastRow = row
+                    lastRowIndex = rowIdx
                 }
             }
         }
-        return min(endX - 1, lastCol + 1) to lastRow
+        // The cursor is after the last text of the last row with text. When the host wrote blanks after that text, for
+        // example after the prompt "$ ", the cursor is after these blanks too. Herdr gives no cursor position.
+        val blanksAfterText = visibleTrimmedBlanks.getOrElse(lastRowIndex) { 0 }
+        val cursorCol = if (blanksAfterText > 0) {
+            startX + visibleRows[lastRowIndex].size + blanksAfterText
+        } else {
+            lastCol + 1
+        }
+        return min(endX - 1, cursorCol) to lastRow
     }
 
     private fun codepointToSymbol(cp: Int): String =
