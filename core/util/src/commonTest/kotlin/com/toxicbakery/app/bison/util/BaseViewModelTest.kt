@@ -55,4 +55,14 @@ class BaseViewModelTest {
         val action = deferredAction.await()
         assertEquals(CounterAction.Done(7), action)
     }
+
+    @Test
+    fun `an action before the first collector is not lost`() = runTest {
+        val viewModel = CounterViewModel()
+        viewModel.onEvent(CounterEvent.Add(3))
+        viewModel.onEvent(CounterEvent.NotifyDone)
+
+        // For example, the screen starts to collect after the view model sent the action.
+        assertEquals(CounterAction.Done(3), viewModel.actions.first())
+    }
 }

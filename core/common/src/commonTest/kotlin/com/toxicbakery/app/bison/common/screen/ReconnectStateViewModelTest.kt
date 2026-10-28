@@ -116,6 +116,17 @@ class ReconnectStateViewModelTest {
     }
 
     @Test
+    fun anActionBeforeTheScreenCollectsIsNotLost() = testScope.runTest {
+        // The reconnect loop of the active machine stopped for the user before the terminal screen started.
+        stateManager.setNeedsUser(WORKBOX, NeedsUserCause.LoginRefused("Auth fail"))
+        val viewModel = workspaceViewModel()
+
+        val action = withTimeoutOrNull(1_000) { viewModel.actions.first() }
+
+        assertEquals(WorkspaceTerminalViewModel.Action.OpenConnectingMachine(WORKBOX), action)
+    }
+
+    @Test
     fun aHostKeyPromptAfterTheSwitchOpensTheConnectingScreen() = testScope.runTest {
         stateManager.markMachineConnected(WORKBOX, ActiveBackbone.SshEndpoint(rttMs = 10))
         val viewModel = workspaceViewModel()
