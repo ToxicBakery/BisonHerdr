@@ -127,4 +127,36 @@ class ConfigureMachineAuthTypeTest {
             Dispatchers.resetMain()
         }
     }
+
+    @Test
+    fun saveKeepsACustomApplicationIdOfALoadedHardwareKey() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        try {
+            val customKey = SshAuthMethod.HardwareSecurityKey(
+                keyType = HardwareKeyType.PivSmartCard,
+                transport = HardwareKeyTransport.UsbOnly,
+                applicationId = "ssh:bison-custom",
+            )
+            val machine = hardwareKeyMachine.copy(authMethod = customKey)
+            val machineStore = MachineStore(InMemoryStoreIOProvider(), dispatcher = dispatcher)
+            machineStore.awaitLoaded()
+            machineStore.upsertMachine(machine)
+            val viewModel = ConfigureMachineViewModel(
+                machineId = machine.id,
+                machineStore = machineStore,
+                machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, SshRequestManager(), EndpointSnapshotBus()),
+            )
+            assertEquals(customKey, viewModel.state.value.hardwareKey)
+
+            viewModel.onEvent(ConfigureMachineViewModel.Event.UpdatePort("2222"))
+            viewModel.onEvent(ConfigureMachineViewModel.Event.SaveMachine)
+
+            val saved = machineStore.getMachine(machine.id)
+            assertEquals(2222, saved?.port)
+            assertEquals(customKey, saved?.authMethod)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
 }

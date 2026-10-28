@@ -2,8 +2,6 @@ package com.toxicbakery.app.bison.common.screen.machine
 
 import androidx.lifecycle.viewModelScope
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
-import com.toxicbakery.app.bison.model.HardwareKeyTransport
-import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
@@ -62,8 +60,11 @@ class ConfigureMachineViewModel(
         val isLoadingPublicKey: Boolean = false,
         val publicKeyError: String? = null,
         val passwordRef: String = "",
-        val hardwareKeyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
-        val hardwareKeyTransport: HardwareKeyTransport = HardwareKeyTransport.UsbAndNfc,
+        /**
+         * The hardware security key of a loaded machine. The screen cannot change it, so "Save Host" keeps
+         * it with all of its fields. This version does not support the method (issue #23).
+         */
+        val hardwareKey: SshAuthMethod.HardwareSecurityKey? = null,
         val proxyJumpEnabled: Boolean = false,
         val bastionHost: String = "",
         val bastionPortText: String = "22",
@@ -224,10 +225,8 @@ class ConfigureMachineViewModel(
             AuthType.Password -> SshAuthMethod.Password(
                 encryptedPasswordRef = current.passwordRef,
             )
-            AuthType.HardwareSecurityKey -> SshAuthMethod.HardwareSecurityKey(
-                keyType = current.hardwareKeyType,
-                transport = current.hardwareKeyTransport,
-            )
+            // The view model does not select this method, so it is the method of the loaded machine.
+            AuthType.HardwareSecurityKey -> current.hardwareKey ?: SshAuthMethod.HardwareSecurityKey()
         }
 
         val proxyJump = if (current.proxyJumpEnabled && current.bastionHost.isNotBlank()) {
@@ -309,7 +308,6 @@ class ConfigureMachineViewModel(
             }
             val keystoreAuth = existing.authMethod as? SshAuthMethod.KeystoreKey
             val passwordAuth = existing.authMethod as? SshAuthMethod.Password
-            val hwAuth = existing.authMethod as? SshAuthMethod.HardwareSecurityKey
             // A key type that this device cannot create changes to the default type. Such a key
             // was never created on this device, so no working key is lost.
             val storedAlgorithm = keystoreAuth?.algorithm ?: keystoreKeySupport.defaultAlgorithm
@@ -337,8 +335,7 @@ class ConfigureMachineViewModel(
                 availableKeyAlgorithms = available,
                 requireBiometric = keystoreAuth?.requireBiometric ?: false,
                 passwordRef = passwordAuth?.encryptedPasswordRef.orEmpty(),
-                hardwareKeyType = hwAuth?.keyType ?: HardwareKeyType.SkSshEd25519,
-                hardwareKeyTransport = hwAuth?.transport ?: HardwareKeyTransport.UsbAndNfc,
+                hardwareKey = existing.authMethod as? SshAuthMethod.HardwareSecurityKey,
                 proxyJumpEnabled = pj != null,
                 bastionHost = pj?.bastionHost.orEmpty(),
                 bastionPortText = (pj?.bastionPort ?: 22).toString(),
