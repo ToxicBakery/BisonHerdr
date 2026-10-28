@@ -93,18 +93,24 @@ class SshTransportManager(
     }
 
     /**
-     * Connects to [machineId] using [machine] (or a synthesized fallback profile if not provided).
+     * Connects to [machineId] using [machine], or the last profile of [machineId] when [machine] is null.
+     * Returns false and writes a debug log entry when no profile is available.
      */
     suspend fun connect(
         machineId: String,
         machine: HostMachine? = null,
     ): Boolean {
-        val resolvedMachine = machine ?: activeMachines[machineId] ?: HostMachine(
-            id = machineId,
-            name = machineId,
-            hostname = "$machineId.local",
-            username = "herdr",
-        )
+        val resolvedMachine = machine ?: activeMachines[machineId]
+        if (resolvedMachine == null) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "Transport",
+                message = "No machine profile for $machineId; did not connect",
+                isError = true,
+            )
+            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            return false
+        }
         return connect(resolvedMachine)
     }
 

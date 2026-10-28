@@ -29,6 +29,21 @@ class SshTransportManagerTest {
     }
 
     @Test
+    fun connectWithoutAProfileFailsAndDoesNotCallTheBackend() = runTest {
+        val backend = RecordingSshBackend()
+
+        assertFalse(manager(backend).connect("unknown-box"))
+
+        assertTrue(backend.calls.isEmpty(), "The backend got ${backend.calls}")
+        assertEquals(ConnectionProgress.Failed, stateManager.connectionProgress.value["unknown-box"])
+        assertTrue(
+            debugLog.entries.value.any {
+                it.isError && it.machineId == "unknown-box" && it.message.contains("No machine profile")
+            },
+        )
+    }
+
+    @Test
     fun failedLoginLogsTheKindOfTheFailure() = runTest {
         val backend = RecordingSshBackend(
             authResult = SshAuthResult.NetworkError(IOException("Connection refused")),
