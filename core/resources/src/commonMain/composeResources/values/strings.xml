@@ -186,6 +186,12 @@
     <string name="notification_permission_rationale_body">BisonHerdr uses a notification to show the SSH sessions that stay open in the background. Agent alerts also use notifications.</string>
     <string name="notification_permission_rationale_continue">Continue</string>
     <string name="notification_permission_rationale_dismiss">Not now</string>
+    <string name="local_network_permission_title">Local network permission</string>
+    <string name="local_network_permission_rationale_body">BisonHerdr connects to %1$s on your local network. Android permits this connection only when the app has the Nearby devices permission. Allow the permission in the next dialog.</string>
+    <string name="local_network_permission_rationale_continue">Continue</string>
+    <string name="local_network_permission_settings_body">Android does not show the permission request again. To connect to %1$s on your local network, allow Nearby devices in the app settings.</string>
+    <string name="local_network_permission_settings_open">Open settings</string>
+    <string name="local_network_permission_dismiss">Not now</string>
     <string name="agent_alert_channel_name">Coding Agent Alerts</string>
     <string name="agent_alert_blocked_title">Agent Blocked on %1$s (%2$s)</string>
     <string name="agent_alert_done_title">Agent Finished on %1$s (%2$s)</string>
