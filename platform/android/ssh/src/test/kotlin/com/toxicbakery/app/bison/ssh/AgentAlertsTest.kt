@@ -176,13 +176,13 @@ class AgentAlertsTest {
         }
     }
 
-    /** The fake `herdr` of [server] and its state. See the resource `fake-herdr.sh`. */
+    /** The fake `herdr` of [server] and its state. See the resource `fake-herdr-agents.sh`. */
     private class FakeHerdrHost(server: TestSshServer) {
         private val state = File(server.homeDirectory, "state").apply { mkdirs() }
         private val events = File(state, "events").apply { mkdirs() }
 
         init {
-            val script = assertNotNull(javaClass.getResource("/fake-herdr.sh")).readText()
+            val script = assertNotNull(javaClass.getResource("/fake-herdr-agents.sh")).readText()
             server.installHerdr(script)
         }
 

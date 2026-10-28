@@ -162,8 +162,8 @@ internal class TestSshServer(
     }
 
     private fun writeHerdr(directory: File, script: String) {
+        directory.mkdirs()
         File(directory, "herdr").apply {
-            parentFile.mkdirs()
             writeText(script)
             setExecutable(true)
         }
