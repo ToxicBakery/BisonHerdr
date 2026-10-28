@@ -1,13 +1,16 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.net.InetSocketAddress
 
 /**
- * Resolved SSH connection route (either direct/Tailscale or via an SSH bastion `direct-tcpip` tunnel).
+ * The SSH route to a machine: a direct connection, or a connection through an SSH bastion (`ProxyJump`).
+ *
+ * For a direct route, the entry fields and the target fields are the same. For a bastion route ([viaBastion] is
+ * true), the entry fields are the bastion. The client logs in to the bastion first, and then logs in to the target
+ * over a `direct-tcpip` channel of the bastion session. All commands run on the target.
  */
 data class ResolvedSshRoute(
     val entryHost: String,
@@ -18,34 +21,14 @@ data class ResolvedSshRoute(
     val targetUsername: String,
     val viaBastion: Boolean,
     val isTailscaleMesh: Boolean,
-    val directTcpIpPayload: ByteArray? = null,
 ) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is ResolvedSshRoute) return false
-        return entryHost == other.entryHost &&
-            entryPort == other.entryPort &&
-            entryUsername == other.entryUsername &&
-            targetHost == other.targetHost &&
-            targetPort == other.targetPort &&
-            targetUsername == other.targetUsername &&
-            viaBastion == other.viaBastion &&
-            isTailscaleMesh == other.isTailscaleMesh &&
-            (directTcpIpPayload contentEquals other.directTcpIpPayload)
-    }
+    /** The `user@host:port` text of the bastion, for log lines and errors. Use it only when [viaBastion] is true. */
+    val bastionAddress: String
+        get() = "$entryUsername@${KnownHost.formatHostPort(entryHost, entryPort)}"
 
-    override fun hashCode(): Int {
-        var result = entryHost.hashCode()
-        result = 31 * result + entryPort
-        result = 31 * result + entryUsername.hashCode()
-        result = 31 * result + targetHost.hashCode()
-        result = 31 * result + targetPort
-        result = 31 * result + targetUsername.hashCode()
-        result = 31 * result + viaBastion.hashCode()
-        result = 31 * result + isTailscaleMesh.hashCode()
-        result = 31 * result + (directTcpIpPayload?.contentHashCode() ?: 0)
-        return result
-    }
+    /** The `host:port` text of the target, for log lines and errors. */
+    val targetAddress: String
+        get() = KnownHost.formatHostPort(targetHost, targetPort)
 }
 
 /**
@@ -57,8 +40,9 @@ class ProxyJumpTunnel(
 ) {
 
     /**
-     * Resolves the SSH transport route for [machine], including Tailscale CGNAT/MagicDNS detection
-     * and RFC 4254 `direct-tcpip` channel open payload construction when [HostMachine.proxyJump] is configured.
+     * Resolves the SSH transport route for [machine], including Tailscale CGNAT/MagicDNS detection.
+     * When [HostMachine.proxyJump] has a bastion host, the entry fields of the route are the bastion. A blank
+     * bastion user gives the user of [machine].
      */
     fun resolveRoute(machine: HostMachine): ResolvedSshRoute {
         val proxy = machine.proxyJump
@@ -67,28 +51,22 @@ class ProxyJumpTunnel(
             (proxy != null && isTailscaleAddress(proxy.bastionHost))
 
         return if (proxy != null && proxy.bastionHost.isNotBlank()) {
-            val payload = buildDirectTcpIpChannelPayload(
-                targetHost = normalizedTargetHost,
-                targetPort = machine.port,
-                originatorAddress = "127.0.0.1",
-                originatorPort = 0,
-            )
+            val bastionUser = proxy.bastionUser.trim().ifBlank { machine.username }
             sshDebugLog?.record(
                 machineId = machine.id,
                 tag = "ProxyJump",
                 message = "Routing ${machine.username}@$normalizedTargetHost:${machine.port} via bastion " +
-                    "${proxy.bastionUser}@${proxy.bastionHost}:${proxy.bastionPort}",
+                    "$bastionUser@${proxy.bastionHost}:${proxy.bastionPort}",
             )
             ResolvedSshRoute(
                 entryHost = proxy.bastionHost.trim(),
                 entryPort = proxy.bastionPort,
-                entryUsername = proxy.bastionUser.trim(),
+                entryUsername = bastionUser,
                 targetHost = normalizedTargetHost,
                 targetPort = machine.port,
                 targetUsername = machine.username,
                 viaBastion = true,
                 isTailscaleMesh = isTailscale,
-                directTcpIpPayload = payload,
             )
         } else {
             if (isTailscale) {
@@ -107,7 +85,6 @@ class ProxyJumpTunnel(
                 targetUsername = machine.username,
                 viaBastion = false,
                 isTailscaleMesh = isTailscale,
-                directTcpIpPayload = null,
             )
         }
     }
@@ -130,33 +107,6 @@ class ProxyJumpTunnel(
             }
         }
         return false
-    }
-
-    /**
-     * Encodes the RFC 4254 Section 7.2 `SSH_MSG_CHANNEL_OPEN` (`direct-tcpip`) channel-specific payload:
-     * - `string`: host to connect
-     * - `uint32`: port to connect
-     * - `string`: originator IP address
-     * - `uint32`: originator port
-     */
-    fun buildDirectTcpIpChannelPayload(
-        targetHost: String,
-        targetPort: Int,
-        originatorAddress: String = "127.0.0.1",
-        originatorPort: Int = 0,
-    ): ByteArray {
-        val out = ByteArrayOutputStream()
-        DataOutputStream(out).use { dos ->
-            val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            dos.writeInt(hostBytes.size)
-            dos.write(hostBytes)
-            dos.writeInt(targetPort)
-            val origBytes = originatorAddress.toByteArray(Charsets.UTF_8)
-            dos.writeInt(origBytes.size)
-            dos.write(origBytes)
-            dos.writeInt(originatorPort)
-        }
-        return out.toByteArray()
     }
 
     fun toSocketAddress(route: ResolvedSshRoute): InetSocketAddress =

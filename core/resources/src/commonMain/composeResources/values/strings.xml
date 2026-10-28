@@ -103,6 +103,7 @@
     <string name="machine_key_error_other">The device key store did not make the key: %1$s</string>
     <string name="machine_auth_password">Password / Keyboard-Interactive</string>
     <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
+    <string name="machine_bastion_credentials_hint">The app also uses the password or key of this machine for the bastion.</string>
     <string name="machine_connecting_title">Connecting to %1$s</string>
     <string name="machine_connecting_step_ssh">1. Authenticating SSH &amp; verifying host key&#8230;</string>
     <string name="machine_connecting_step_mosh">2. Probing mosh-server &amp; bootstrapping Herdr session&#8230;</string>

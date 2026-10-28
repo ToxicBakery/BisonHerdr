@@ -18,6 +18,10 @@ import java.util.Base64
  * key exchange, before the client sends credentials. JSch does not ask the user on its own thread, and it
  * never adds a key.
  *
+ * [connect] also sets `prefer_known_host_key_types=yes`. Thus JSch puts the key type of the saved entry first in
+ * its list of host key types. A server that adds a key of a new type then does not cause a false "changed host key"
+ * error.
+ *
  * The repository does not change [knownHostsStore]. JSch calls [add] and [remove] only when it asks the
  * user itself, and `StrictHostKeyChecking=yes` prevents that. The user accepts or removes a key in the UI,
  * and the UI writes the change to [knownHostsStore].
@@ -39,6 +43,8 @@ class KnownHostsRepository(
     fun connect(session: Session, timeoutMs: Int) {
         session.hostKeyRepository = this
         session.setConfig(STRICT_HOST_KEY_CHECKING, STRICT_HOST_KEY_CHECKING_VALUE)
+        // The JSch default is "yes", but the system property jsch.prefer_known_host_key_types can change it.
+        session.setConfig(PREFER_KNOWN_HOST_KEY_TYPES, PREFER_KNOWN_HOST_KEY_TYPES_VALUE)
         try {
             session.connect(timeoutMs)
         } catch (error: JSchHostKeyException) {
@@ -111,6 +117,8 @@ class KnownHostsRepository(
     companion object {
         private const val STRICT_HOST_KEY_CHECKING = "StrictHostKeyChecking"
         private const val STRICT_HOST_KEY_CHECKING_VALUE = "yes"
+        private const val PREFER_KNOWN_HOST_KEY_TYPES = "prefer_known_host_key_types"
+        private const val PREFER_KNOWN_HOST_KEY_TYPES_VALUE = "yes"
         private const val DEFAULT_SSH_PORT = 22
         private const val FINGERPRINT_PREFIX = "SHA256:"
 

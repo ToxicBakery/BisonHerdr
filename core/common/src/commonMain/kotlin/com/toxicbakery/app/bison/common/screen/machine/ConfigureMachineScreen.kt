@@ -68,6 +68,7 @@ import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
 import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
 import com.toxicbakery.app.bison.resources.machine_key_error_no_secure_lock_screen
 import com.toxicbakery.app.bison.resources.machine_key_error_other
@@ -483,6 +484,11 @@ fun ConfigureMachineScreen(
                                 modifier = Modifier.weight(1f),
                             )
                         }
+                        Text(
+                            text = stringResource(Res.string.machine_bastion_credentials_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,

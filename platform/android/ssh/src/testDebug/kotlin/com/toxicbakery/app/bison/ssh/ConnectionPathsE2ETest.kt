@@ -376,7 +376,8 @@ class ConnectionPathsE2ETest {
         val directRoute = hDirect.transport.proxyJumpTunnel.resolveRoute(directHost)
         assertFalse(directRoute.viaBastion)
         assertFalse(directRoute.isTailscaleMesh)
-        assertNull(directRoute.directTcpIpPayload)
+        assertEquals(directRoute.targetHost, directRoute.entryHost)
+        assertEquals(directRoute.targetPort, directRoute.entryPort)
         assertTrue(hDirect.transport.connect(directHost))
         assertEquals(ConnectionProgress.Connected, hDirect.stateManager.connectionProgress.value["route-direct"])
 
@@ -402,7 +403,7 @@ class ConnectionPathsE2ETest {
         assertEquals(2222, bastionRoute.entryPort)
         assertEquals("jump", bastionRoute.entryUsername)
         assertEquals("10.20.30.40", bastionRoute.targetHost)
-        assertNotNull(bastionRoute.directTcpIpPayload)
+        assertEquals(22, bastionRoute.targetPort)
         assertTrue(hBastion.transport.connect(bastionHost))
         assertEquals(ConnectionProgress.Connected, hBastion.stateManager.connectionProgress.value["route-bastion"])
 
