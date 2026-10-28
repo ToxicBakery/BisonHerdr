@@ -60,7 +60,7 @@ import org.kodein.di.instance
  *
  * The service posts an alert with actions for each `Blocked` or `Done` event of [SemanticNotificationBus]. In this
  * version, only the demo server sends these events, so a real host gives no agent alert. Agent alerts for real hosts
- * are planned.
+ * are planned. Issue #53 (https://github.com/ToxicBakery/BisonHerdr/issues/53) holds the work.
  *
  * The service stops itself when [ServiceStopPolicy] finds no connected machine, no connection in
  * progress, and no started activity for 30 s. [MainActivity] starts the service again in `onStart`.
