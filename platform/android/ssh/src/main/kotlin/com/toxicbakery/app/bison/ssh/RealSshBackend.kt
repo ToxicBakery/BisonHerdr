@@ -5,6 +5,7 @@ import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
@@ -44,6 +45,19 @@ import kotlinx.coroutines.withContext
  * [USER_AUTH_TIMEOUT_MS] at most. The bastion of a ProxyJump machine logs in with the same key, so the one
  * prompt also unlocks the bastion login.
  *
+ * Before all other steps, [authenticate] checks the local network permission of Android 17 for the first host of the
+ * route ([LocalNetworkGuard.needsPermission]). When Android stops that connection, [authenticate] asks the user
+ * through [LocalNetworkAccess.request]. With no UI or with no permission, it returns
+ * [SshAuthResult.LocalNetworkBlocked] and opens no socket. When the connect to a private address times out with no
+ * permission, [authenticate] also asks, and it tries one more time after a grant. A reconnect does not call
+ * [authenticate], so it never asks. The socket of the client throws a [LocalNetworkPermissionException], and the
+ * reconnect loop stops for the user.
+ *
+ * A machine with a FIDO2 security key logs in through [HardwareKeySigner]. The signer asks the user to touch the key
+ * for each new session, also for a reconnect. In the background, the signer cannot ask, so the login fails with a
+ * [HardwareKeyException] and the reconnect loop stops for the user. Without a signer, [authenticate] refuses such a
+ * machine before the network connection.
+ *
  * The backbone is always [ActiveBackbone.SshEndpoint], because this version has no Mosh transport (issue #22). The
  * client measures the poll time, and the backend puts its average in the backbone with
  * [SshStateManager.setRoundTripTime]. See [RealHerdrSshClient.refreshSnapshotAndSurface].
@@ -52,6 +66,7 @@ class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
     private val sshStateManager: SshStateManager,
     private val keystoreKeyManager: AndroidKeystoreKeyManager,
+    private val localNetworkAccess: LocalNetworkAccess = LocalNetworkAccess(),
 ) : SshBackend {
 
     constructor(
@@ -65,6 +80,9 @@ class RealSshBackend internal constructor(
         secretStore: SecretStore,
         machineStore: MachineStore? = null,
         keyboardInteractiveTimeout: Duration = KEYBOARD_INTERACTIVE_TIMEOUT,
+        localNetworkGuard: LocalNetworkGuard,
+        localNetworkAccess: LocalNetworkAccess = LocalNetworkAccess(),
+        hardwareKeySigner: HardwareKeySigner? = null,
     ) : this(
         client = RealHerdrSshClient(
             sshDebugLog = sshDebugLog,
@@ -76,9 +94,12 @@ class RealSshBackend internal constructor(
             secretStore = secretStore,
             userPrompter = { prompt -> sshStateManager.requestKeyboardInteractive(prompt, keyboardInteractiveTimeout) },
             machineStore = machineStore,
+            localNetworkGuard = localNetworkGuard,
+            hardwareKeySigner = hardwareKeySigner,
         ),
         sshStateManager = sshStateManager,
         keystoreKeyManager = keystoreKeyManager,
+        localNetworkAccess = localNetworkAccess,
     )
 
     init {
@@ -86,6 +107,8 @@ class RealSshBackend internal constructor(
     }
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
+        // A connection that Android stops cannot use the key, so check the network before the key prompt.
+        localNetworkBlock(machine, route)?.let { return it }
         val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
         var promptOutcome: UserAuthOutcome? = null
         if (keyAuth != null) {
@@ -112,7 +135,24 @@ class RealSshBackend internal constructor(
                 promptOutcome = outcome
             }
         }
-        return client.connectAndVerify(machine, route).fold(
+        val result = connectAndVerify(machine, route, keyAuth, promptOutcome)
+        // A connect to a private address can time out because Android stops it. Ask, and try one more time.
+        if (result is SshAuthResult.LocalNetworkBlocked && result.timedOut &&
+            askForLocalNetwork(machine, result.hostPort) == LocalNetworkOutcome.Granted
+        ) {
+            return connectAndVerify(machine, route, keyAuth, promptOutcome)
+        }
+        return result
+    }
+
+    /** Opens the session of [machine] over [route], and returns the kind of the result. */
+    private suspend fun connectAndVerify(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        keyAuth: SshAuthMethod.KeystoreKey?,
+        promptOutcome: UserAuthOutcome?,
+    ): SshAuthResult =
+        client.connectAndVerify(machine, route).fold(
             onSuccess = { SshAuthResult.Success },
             onFailure = { error ->
                 when (val result = toAuthResult(error)) {
@@ -122,6 +162,25 @@ class RealSshBackend internal constructor(
                 }
             },
         )
+
+    /**
+     * Asks the user for the local network permission when the first host of [route] needs it. Returns
+     * [SshAuthResult.LocalNetworkBlocked] when the app does not get the permission, or null when the login can
+     * continue.
+     */
+    private suspend fun localNetworkBlock(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult? {
+        val guard = client.localNetworkGuard
+        if (!withContext(Dispatchers.IO) { guard.needsPermission(route.entryHost) }) return null
+        val hostPort = KnownHost.formatHostPort(route.entryHost, route.entryPort)
+        val outcome = askForLocalNetwork(machine, hostPort)
+        return if (outcome == LocalNetworkOutcome.Granted) null else SshAuthResult.LocalNetworkBlocked(hostPort)
+    }
+
+    /** Asks the user for the local network permission for [hostPort] of [machine], and writes the answer to the log. */
+    private suspend fun askForLocalNetwork(machine: HostMachine, hostPort: String): LocalNetworkOutcome {
+        val outcome = localNetworkAccess.request(machine.id, hostPort, LOCAL_NETWORK_TIMEOUT)
+        client.recordTransport(machine.id, "The request for the local network permission for $hostPort: $outcome")
+        return outcome
     }
 
     /**
@@ -197,6 +256,9 @@ class RealSshBackend internal constructor(
         /** The maximum time that [authenticate] waits for the answer of the user to a user authentication prompt. */
         const val USER_AUTH_TIMEOUT_MS: Long = 60_000L
 
+        /** The maximum time that [authenticate] waits for the answer of the user to the local network request. */
+        val LOCAL_NETWORK_TIMEOUT: Duration = 60.seconds
+
         /**
          * The default time limit for the answers of the user to one prompt. It is shorter than the login time limit
          * of common SSH servers (120 seconds for OpenSSH), so that the server has not closed the connection yet.
@@ -224,7 +286,9 @@ class RealSshBackend internal constructor(
          * [SshAuthResult.HostKeyRejected] kind. A [MissingKeyException] at any level of the cause chain is
          * [SshAuthResult.KeyMissing]. A [UserAuthRequiredException] or a [UserNotAuthenticatedException] at any
          * level of the cause chain is [SshAuthResult.UserAuthRequired]. A [UserInputException] at any level of the
-         * cause chain gives its [UserInputException.result]. A refused login is [SshAuthResult.AuthFailed]. An
+         * cause chain gives its [UserInputException.result]. A [LocalNetworkPermissionException] at any level of the
+         * cause chain is [SshAuthResult.LocalNetworkBlocked]. A [HardwareKeyException] at any level of the cause
+         * chain is [SshAuthResult.Failed] with that exception. A refused login is [SshAuthResult.AuthFailed]. An
          * [IOException] at any level of the cause chain is [SshAuthResult.NetworkError]. A [JSchException] with a
          * message that starts with a text of [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only
          * the message of [error] counts, because a cause with that text can be in an error that tells a different
@@ -237,6 +301,8 @@ class RealSshBackend internal constructor(
             val missingKey = causes.filterIsInstance<MissingKeyException>().firstOrNull()
             val userAuth = causes.firstOrNull { it is UserAuthRequiredException || it is UserNotAuthenticatedException }
             val userInput = causes.filterIsInstance<UserInputException>().firstOrNull()
+            val localNetwork = causes.filterIsInstance<LocalNetworkPermissionException>().firstOrNull()
+            val hardwareKey = causes.filterIsInstance<HardwareKeyException>().firstOrNull()
             return when {
                 error is HostKeyRejectedException -> error.rejection
 
@@ -245,6 +311,11 @@ class RealSshBackend internal constructor(
                 userAuth != null -> SshAuthResult.UserAuthRequired((userAuth as? UserAuthRequiredException)?.keyAlias)
 
                 userInput != null -> userInput.result
+
+                localNetwork != null -> SshAuthResult.LocalNetworkBlocked(localNetwork.hostPort, localNetwork.timedOut)
+
+                // Only the user can fix a security key error, so it is not a NetworkError, also with an IOException.
+                hardwareKey != null -> SshAuthResult.Failed(hardwareKey)
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)

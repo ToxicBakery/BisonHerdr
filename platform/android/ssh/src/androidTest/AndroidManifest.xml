@@ -3,5 +3,7 @@
 
     <!-- AgyCursorPlacementE2ETest opens a real SSH socket to the host harness. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 10.0.2.2 is on the local network of the emulator. Android 17 needs this permission for it. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
 </manifest>

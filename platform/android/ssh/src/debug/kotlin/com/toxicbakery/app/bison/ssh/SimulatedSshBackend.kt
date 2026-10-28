@@ -129,7 +129,8 @@ class SimulatedSshBackend(
                 SshAuthResult.Success
             }
 
-            // SshTransportManager refuses this method before it calls a backend (issue #23).
+            // The simulated server has no security key. Without the flag, SshTransportManager refuses this method
+            // before it calls a backend (issue #23).
             is SshAuthMethod.HardwareSecurityKey ->
                 SshAuthResult.Failed(UnsupportedOperationException(HARDWARE_KEY_NOT_SUPPORTED))
         }
@@ -322,9 +323,6 @@ class SimulatedSshBackend(
     }
 
     /**
-     * Applies a focus RPC to the simulated snapshot and surface. Returns null, because no host answers.
-     */
-    /**
      * Applies a focus RPC to the simulated snapshot, and returns a simulated success. The response names the lane
      * that the target design gives the request ([designLaneOf]), so that a test can check the lane rules.
      */
@@ -461,6 +459,9 @@ class SimulatedSshBackend(
          * `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]). A method that is not a
          * `client_shell` method also goes over `herdr.sock`. Each other request goes over `herdr-client.sock`. The
          * real backend of this version sends each request over `herdr remote-api-bridge`.
+         *
+         * The target design also sends each request over `herdr.sock` while the surface lease is off. The simulation
+         * does not apply this rule.
          */
         internal fun designLaneOf(request: ClientShellEndpointRequest, isMoshActive: Boolean): String {
             val useApiBridge = (isMoshActive && MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode(request.method)) ||

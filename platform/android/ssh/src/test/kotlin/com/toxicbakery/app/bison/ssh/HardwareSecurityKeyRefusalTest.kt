@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
@@ -17,8 +18,9 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
 /**
- * Tests that the app does not connect a machine with [SshAuthMethod.HardwareSecurityKey]. This version does
- * not support that method. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+ * Tests that the app does not connect a machine with [SshAuthMethod.HardwareSecurityKey] when
+ * [FeatureFlags.hardwareSecurityKeys] is false, the default. Issue #23
+ * (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys behind the flag.
  */
 class HardwareSecurityKeyRefusalTest {
 
@@ -53,10 +55,32 @@ class HardwareSecurityKeyRefusalTest {
     }
 
     @Test
+    fun withTheFlagTheManagerGivesTheMachineToTheBackend() = runTest {
+        val backend = RecordingSshBackend(authResult = SshAuthResult.AuthFailed("refused"))
+        val surfaceBus = PaneSurfaceBus()
+        val manager = SshTransportManager(
+            backend = backend,
+            moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
+            sshStateManager = stateManager,
+            sshDebugLog = debugLog,
+            paneSurfaceBus = surfaceBus,
+            featureFlags = FeatureFlags(hardwareSecurityKeys = true),
+        )
+        val machine = hardwareKeyMachine(port = 22)
+
+        assertFalse(manager.connect(machine))
+
+        // The backend got the machine. The failed login then disconnects it.
+        assertEquals("authenticate ${machine.id}", backend.calls.first(), "${backend.calls}")
+        assertTrue(debugLog.entries.value.none { it.message.contains(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED) })
+    }
+
+    @Test
     fun realBackendFailsWithoutANetworkConnection() = runTest {
         // The socket gets the connection in its backlog, also when the test does not call accept.
         ServerSocket(0, 1, InetAddress.getByName(TestSshServer.HOST)).use { listener ->
             val backend = RealSshBackend(
+                localNetworkGuard = permittedLocalNetwork(),
                 sshStateManager = stateManager,
                 sshDebugLog = debugLog,
                 endpointSnapshotBus = EndpointSnapshotBus(),

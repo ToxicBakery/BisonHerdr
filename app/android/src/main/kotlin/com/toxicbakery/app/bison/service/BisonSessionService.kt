@@ -28,6 +28,7 @@ import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.service_notification_action_disconnect_all
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
@@ -60,7 +61,7 @@ import org.kodein.di.instance
  *
  * The service posts an alert with actions for each `Blocked` or `Done` event of [SemanticNotificationBus]. In this
  * version, only the demo server sends these events, so a real host gives no agent alert. Agent alerts for real hosts
- * are planned.
+ * are planned. Issue #53 (https://github.com/ToxicBakery/BisonHerdr/issues/53) holds the work.
  *
  * The service stops itself when [ServiceStopPolicy] finds no connected machine, no connection in
  * progress, and no started activity for 30 s. [MainActivity] starts the service again in `onStart`.
@@ -70,6 +71,7 @@ class BisonSessionService : Service(), DIAware {
     override val di: DI by closestDI()
 
     private val debugServer: DebugServer by instance()
+    private val localNetworkAccess: LocalNetworkAccess by instance()
     private val machineStore: MachineStore by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
@@ -225,6 +227,7 @@ class BisonSessionService : Service(), DIAware {
                     is SshRequest.ResizeShell -> fastInteractiveQueue.trySend(request)
                     else -> {
                         sshStateManager.cancelUserAuthBeforeQueue(request)
+                        localNetworkAccess.cancelRequestBeforeQueue(request)
                         controlQueue.trySend(request)
                     }
                 }
@@ -401,9 +404,10 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun disconnectAllMachines() {
-        // A connect that waits for a user authentication or for keyboard-interactive answers holds the control
-        // queue. End the wait first.
+        // A connect that waits for a user authentication, for keyboard-interactive answers, or for the local network
+        // permission holds the control queue. End the wait first.
         sshStateManager.cancelAllUserAuth()
+        localNetworkAccess.cancelAll()
         val machineIds = sshStateManager.connectedMachines.value
         log.d { "Disconnect All: send Disconnect for ${machineIds.size} machines" }
         serviceScope.launch {
@@ -416,7 +420,7 @@ class BisonSessionService : Service(), DIAware {
     private fun resolveTransportSummary(backbones: Map<String, ActiveBackbone>): String {
         if (backbones.isEmpty()) return "Idle"
         val hasMosh = backbones.values.any { it is ActiveBackbone.MoshUdp }
-        return if (hasMosh) "Mosh UDP" else "SSH Endpoint"
+        return if (hasMosh) "Mosh UDP" else "SSH"
     }
 
     private fun promoteToForeground(

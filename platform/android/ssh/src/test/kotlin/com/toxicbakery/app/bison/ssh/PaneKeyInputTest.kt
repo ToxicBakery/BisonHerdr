@@ -260,6 +260,7 @@ class PaneKeyInputTest {
             semanticNotificationBus = SemanticNotificationBus(),
             knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
             secretStore = InMemorySecretStore(),
+            localNetworkGuard = permittedLocalNetwork(),
             remoteBatchExecutor = { _, _, _, _ ->
                 batches++
                 ""
@@ -385,6 +386,7 @@ class PaneKeyInputTest {
         semanticNotificationBus = SemanticNotificationBus(),
         knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
         secretStore = InMemorySecretStore(),
+        localNetworkGuard = permittedLocalNetwork(),
         remoteBatchExecutor = { _, _, _, commands -> fake.execute(commands) },
     )
 
@@ -398,6 +400,7 @@ class PaneKeyInputTest {
         keystoreKeyManager = server.keyManager,
         knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply { runBlocking { put(server.knownHost()) } },
         secretStore = InMemorySecretStore(),
+        localNetworkGuard = permittedLocalNetwork(),
     )
 
     /** Waits in real time, for [TIMEOUT] at most, until [condition] is true. */

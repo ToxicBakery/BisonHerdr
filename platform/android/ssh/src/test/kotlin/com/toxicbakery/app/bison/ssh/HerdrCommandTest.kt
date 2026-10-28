@@ -131,6 +131,7 @@ class HerdrCommandTest {
     private fun client(
         execute: (List<RealHerdrSshClient.RemoteShellCommand>) -> String = { "" },
     ) = RealHerdrSshClient(
+        localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = SshDebugLog(),
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = PaneSurfaceBus(),

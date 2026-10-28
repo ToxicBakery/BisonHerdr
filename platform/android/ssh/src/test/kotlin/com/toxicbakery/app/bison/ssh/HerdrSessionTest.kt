@@ -31,6 +31,7 @@ class HerdrSessionTest {
     }
     private val debugLog = SshDebugLog()
     private val backend = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = SshStateManager(),
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

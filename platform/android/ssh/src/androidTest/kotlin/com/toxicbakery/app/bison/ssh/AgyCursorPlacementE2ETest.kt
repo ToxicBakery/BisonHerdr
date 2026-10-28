@@ -84,6 +84,11 @@ class AgyCursorPlacementE2ETest {
                 keystoreKeyManager = AndroidKeystoreKeyManager(),
                 knownHostsStore = knownHostsStore,
                 secretStore = InMemorySecretStore(),
+                // The host loopback 10.0.2.2 is on the local network of the emulator. The script grants the
+                // permission at the install.
+                localNetworkGuard = androidLocalNetworkGuard(
+                    InstrumentationRegistry.getInstrumentation().targetContext,
+                ),
             ),
             moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
             sshStateManager = stateManager,

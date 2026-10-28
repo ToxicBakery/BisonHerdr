@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -37,8 +38,9 @@ import kotlinx.serialization.json.putJsonObject
  * Android SSH transport coordinator for Herdr hosts.
  *
  * Runs the connect steps of a machine (`Part IV.2` of `01-core-app-design.md` gives the target design):
- * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
- *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
+ * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager], `Password`, or a FIDO2 security key, optionally via
+ *    [ProxyJumpTunnel]). A machine with an [SshAuthMethod] that [featureFlags] does not support fails before this
+ *    phase (issue #23).
  * 2. `BootstrappingMoshOrBridge`: The backend selects the backbone ([SshBackend.negotiateBackbone]). This version
  *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]: the SSH session of
  *    the machine.
@@ -49,7 +51,7 @@ import kotlinx.serialization.json.putJsonObject
  *    and others) on persistent `sh` channels of the SSH session. This version does not run
  *    `herdr remote-client-bridge`.
  * 5. Background parking ([setSurfaceLease]) and the session checks after a network change ([onNetworkAvailable]
- *    and [onNetworkLost]). The surface lease only pauses the pane reads of the poll.
+ *    and [onNetworkLost]). While the surface lease is off, the poll reads no snapshot and no panes.
  *
  * The code for a Mosh backbone ([ActiveBackbone.MoshUdp] and [moshUdpEngine]) stays for issue #22, but the
  * backends never select it, and [MoshUdpEngine] starts no session.
@@ -74,6 +76,8 @@ class SshTransportManager(
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
     private val timeSource: TimeSource = TimeSource.Monotonic,
     private val promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** Decides which [SshAuthMethod] values the manager connects. See [SshAuthMethod.isSupported]. */
+    private val featureFlags: FeatureFlags = FeatureFlags(),
 ) {
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
@@ -168,7 +172,13 @@ class SshTransportManager(
             )
 
             is SshRequest.TriggerNetworkRoam -> onNetworkAvailable(request.machineId)
-            is SshRequest.PromptHardwareKeyTouch -> sshStateManager.setHardwareKeyTouchPrompt(request)
+            // Only a HardwareKeySigner call puts a touch prompt, because only the call can stop when the user closes
+            // the prompt. A prompt from a request has no owner, so the manager ignores it.
+            is SshRequest.PromptHardwareKeyTouch -> sshDebugLog.record(
+                machineId = request.machineId,
+                tag = "FIDO2",
+                message = "Ignored a touch prompt request with no security key call",
+            )
         }
     }
 
@@ -214,7 +224,7 @@ class SshTransportManager(
         // A connect from the user removes the cause of an earlier stop.
         sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.clearNeedsUser(machineId)
-        if (!machine.authMethod.isSupported) {
+        if (!machine.authMethod.isSupported(featureFlags)) {
             // The backend does not get the machine, so the app makes no network connection.
             sshDebugLog.record(
                 machineId = machineId,
@@ -338,8 +348,8 @@ class SshTransportManager(
     }
 
     /**
-     * Disconnects [machineId] and clears its cached control streams. It also stops the Mosh session of the machine,
-     * but this version starts no Mosh session (issue #22).
+     * Disconnects [machineId] and clears its session state in the manager. It also stops the Mosh session of the
+     * machine, but this version starts no Mosh session (issue #22).
      */
     suspend fun disconnect(machineId: String) {
         releaseConnection(machineId)
@@ -359,8 +369,8 @@ class SshTransportManager(
      * Turns the surface lease of [machineId] on or off (`onStart()` -> `active = true`, `onStop()` -> `active = false`).
      *
      * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
-     * - While the lease is off, the poll of the backend reads no panes. Thus the SSH session stays open with no
-     *   terminal traffic. This version does not send `client_shell.surface.set` to the Herdr server.
+     * - While the lease is off, the poll of the backend reads no snapshot and no panes. Thus the SSH session stays
+     *   open with no terminal traffic. This version does not send `client_shell.surface.set` to the Herdr server.
      * - When the lease comes on (`active == true`), the manager publishes the last [PaneSurfaceFrame] again with a
      *   new presentation epoch, and the next poll reads the new state. The app does not send
      *   `endpoint.presentation.ready.v1` in this version.
@@ -369,11 +379,15 @@ class SshTransportManager(
         surfaceLeaseActive[machineId] = active
         moshUdpEngine.setParked(machineId, parked = !active)
         val leaseRequest = HerdrRpcBuilder.clientShellSurfaceSet(active = active)
+        val leaseText = if (active) {
+            "on: the poll reads the snapshot and the panes"
+        } else {
+            "off: the poll reads no snapshot and no panes"
+        }
         sshDebugLog.record(
             machineId = machineId,
             tag = "SurfaceLease",
-            message = "Surface lease ${if (active) "on: the poll reads the panes" else "off: the poll reads no panes"}. " +
-                "The app does not send ${leaseRequest.method} in this version.",
+            message = "Surface lease $leaseText. The app does not send ${leaseRequest.method} in this version.",
         )
 
         if (!active) {
@@ -406,14 +420,14 @@ class SshTransportManager(
      * Sends a Herdr RPC to the backend of [machineId], and returns the response line of the backend. The real backend
      * sends each request as a `herdr remote-api-bridge` line.
      *
-     * When the machine has no profile, or when the backend gives no response, the manager writes an error to the
-     * debug log and returns an error response with the code [NO_RESPONSE_CODE]. Thus a caller cannot take a failed
-     * RPC for a success.
+     * When the machine has no profile, or when the backend gives no response, the manager returns an error response
+     * with the code [NO_RESPONSE_CODE]. Thus a caller cannot take a failed RPC for a success. A backend writes the
+     * cause of its error to the debug log, so the manager writes an error only for a machine with no profile.
      */
     suspend fun sendEndpointCommand(
         machineId: String,
         request: ClientShellEndpointRequest,
-    ): String? {
+    ): String {
         val isMoshActive = sshStateManager.activeTransportBackbone.value[machineId] is ActiveBackbone.MoshUdp
         sshDebugLog.record(
             machineId = machineId,
@@ -421,24 +435,24 @@ class SshTransportManager(
             message = HerdrRpcBuilder.toNdjsonLine(request).trim(),
         )
         val machine = activeMachines[machineId]
-        val response = machine?.let {
-            backend.sendEndpointCommand(it, proxyJumpTunnel.resolveRoute(it), request, isMoshActive)
+        if (machine == null) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "RPC",
+                message = "No machine profile for $machineId; did not send ${request.method}",
+                isError = true,
+            )
+            return noResponseError(request, "The machine has no profile, so the app did not send ${request.method}")
         }
-        if (response != null) return response
-        sshDebugLog.record(
-            machineId = machineId,
-            tag = "RPC",
-            message = "No response for ${request.method}",
-            isError = true,
-        )
-        return noResponseError(request)
+        return backend.sendEndpointCommand(machine, proxyJumpTunnel.resolveRoute(machine), request, isMoshActive)
+            ?: noResponseError(request, "The backend gave no response for ${request.method}")
     }
 
     suspend fun sendEndpointCommand(
         machineId: String,
         method: String,
         paramsJson: String = "{}",
-    ): String? = sendEndpointCommand(
+    ): String = sendEndpointCommand(
         machineId = machineId,
         request = ClientShellEndpointRequest(
             id = "rpc_${presentationEpochCounter.getAndIncrement()}",
@@ -721,6 +735,8 @@ class SshTransportManager(
                 "InputRequired (${result.hostPort}, ${if (result.timedOut) "time limit" else "no UI"})"
 
             is SshAuthResult.InputCancelled -> "InputCancelled (${result.hostPort})"
+            is SshAuthResult.LocalNetworkBlocked ->
+                "LocalNetworkBlocked (${result.hostPort}${if (result.timedOut) ", time limit" else ""})"
         }
 
     /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */
@@ -753,6 +769,8 @@ class SshTransportManager(
             }
             is SshAuthResult.InputRequired -> causeOf(result)
             is SshAuthResult.InputCancelled -> NeedsUserCause.InputCancelled(result.hostPort)
+            is SshAuthResult.LocalNetworkBlocked ->
+                NeedsUserCause.LocalNetworkPermission(result.hostPort, result.timedOut)
             is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
             is SshAuthResult.Failed -> causeOf(result.cause)
             // A login that passed needs nothing. Only an error in the caller gets here.
@@ -771,9 +789,12 @@ class SshTransportManager(
     private fun causeOf(error: Throwable): NeedsUserCause {
         val chain = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
         val userInput = chain.filterIsInstance<UserInputException>().firstOrNull()
+        val hardwareKey = chain.filterIsInstance<HardwareKeyException>().firstOrNull()
         return when {
             userInput != null -> causeOf(userInput.result)
             chain.any { it is MissingSecretException } -> NeedsUserCause.PasswordMissing
+            // A security key error with an IOException cause is not a network error.
+            hardwareKey != null -> NeedsUserCause.Other(detailOf(hardwareKey))
             chain.any { it is IOException } -> NeedsUserCause.Unreachable(detailOf(error))
             else -> NeedsUserCause.Other(detailOf(error))
         }
@@ -820,7 +841,10 @@ class SshTransportManager(
 
     companion object {
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
-        /** The error code of the response of [sendEndpointCommand] when the backend gives no response. */
+        /**
+         * The error code of the response of [sendEndpointCommand] when the machine has no profile, or when the backend
+         * gives no response.
+         */
         const val NO_RESPONSE_CODE: String = "no_response"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
@@ -842,8 +866,9 @@ class SshTransportManager(
         private const val MAX_CAUSE_DEPTH = 16
 
         /**
-         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey]. This version does not
-         * support that method. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey] when the build does not support
+         * it: [FeatureFlags.hardwareSecurityKeys] is false, or the key type is not FIDO2. Issue #23
+         * (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
          */
         internal const val HARDWARE_KEY_NOT_SUPPORTED: String =
             "This version does not support hardware security keys (issue #23)"
@@ -862,26 +887,15 @@ class SshTransportManager(
                 "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
         }
 
-        /** Returns the error response line of [request] for a backend that gave no response. */
-        internal fun noResponseError(request: ClientShellEndpointRequest): String =
+        /** Returns the error response line of [request] with the code [NO_RESPONSE_CODE] and [message]. */
+        internal fun noResponseError(request: ClientShellEndpointRequest, message: String): String =
             buildJsonObject {
                 put("id", request.id)
                 putJsonObject("error") {
                     put("code", NO_RESPONSE_CODE)
-                    put("message", "The backend gave no response for ${request.method}")
+                    put("message", message)
                 }
             }.toString()
-
-        /**
-         * Builds the command of the Herdr Endpoint Generation 1 bridge of the target design. No code runs this
-         * command in this version: the real backend uses `herdr api snapshot` and [buildSshApiBridgeCommand].
-         */
-        fun buildSshEndpointBridgeCommand(idleTimeoutV1: Boolean = true): String =
-            if (idleTimeoutV1) {
-                "herdr remote-client-bridge --idle-timeout-v1"
-            } else {
-                "herdr remote-client-bridge"
-            }
 
         fun buildSshApiBridgeCommand(): String = "herdr remote-api-bridge"
     }

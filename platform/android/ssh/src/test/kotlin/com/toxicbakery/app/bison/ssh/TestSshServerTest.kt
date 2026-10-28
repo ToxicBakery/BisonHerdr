@@ -98,6 +98,7 @@ class TestSshServerTest {
             keystoreKeyManager = server.keyManager,
             knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply { put(server.knownHost()) },
             secretStore = InMemorySecretStore(),
+            localNetworkGuard = permittedLocalNetwork(),
         )
         val machine = server.machine(
             id = "herdr-guard",

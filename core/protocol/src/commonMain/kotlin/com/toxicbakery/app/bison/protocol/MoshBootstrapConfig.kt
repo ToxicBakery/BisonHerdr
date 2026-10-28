@@ -92,7 +92,8 @@ object MoshBootstrapConfig {
     /**
      * Builds the ephemeral tablet `config.toml` passed via `HERDR_CONFIG_PATH` when launching
      * `herdr` inside `mosh-server` so unmodified `herdr` hides its TUI chrome, sidebar, and
-     * inner ASCII borders while Compose renders them natively at 120Hz.
+     * inner ASCII borders while Compose draws them. The Mosh path is planned (issue #22), and no code uses this
+     * config in this version.
      */
     fun buildTabletHerdrConfigToml(): String =
         """

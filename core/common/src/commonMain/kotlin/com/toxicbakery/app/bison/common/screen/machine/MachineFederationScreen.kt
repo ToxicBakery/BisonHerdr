@@ -75,7 +75,9 @@ import com.toxicbakery.app.bison.common.version.RemoteRelease
 import com.toxicbakery.app.bison.common.version.VersionCheck
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.AppSettings
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.resources.Res
@@ -165,6 +167,9 @@ fun MachineFederationScreen(
     val endpointSnapshotBus: EndpointSnapshotBus by di.instance()
     val appSettingsStore: AppSettingsStore by di.instance()
     val credentialChecker: CredentialChecker? by di.instanceOrNull()
+    // The app binds the flags of the build. When the app binds no flags, each feature flag is off.
+    val boundFeatureFlags: FeatureFlags? by di.instanceOrNull()
+    val featureFlags = boundFeatureFlags ?: FeatureFlags()
 
     val machines by machineStore.knownMachines.collectAsState()
     val restoredFromBackup by machineStore.restoredFromBackup.collectAsState()
@@ -300,9 +305,10 @@ fun MachineFederationScreen(
                         backbone = backbone,
                         snapshot = snapshot,
                         credentialState = credentialState,
+                        isAuthSupported = machine.authMethod.isSupported(featureFlags),
                         needsUserCause = needsUser[machine.id],
                         onPrimaryAction = {
-                            when (machineCardAction(machine, isConnected, credentialState)) {
+                            when (machineCardAction(machine, isConnected, credentialState, featureFlags)) {
                                 MachineCardAction.OpenWorkspace -> onOpenWorkspaceTerminal(machine.id)
                                 MachineCardAction.Configure -> onConfigureMachine(machine.id)
                                 MachineCardAction.Connect -> {
@@ -353,20 +359,25 @@ internal enum class MachineCardAction {
  * - A machine with a missing key opens the editor, which makes the key.
  * - A machine with a missing password connects. The connect asks for the password and offers to save it. The edit
  *   button of the card still opens the editor.
- * - A machine with an authentication method that this version does not support opens the editor, which tells why
+ * - A machine with an authentication method that [featureFlags] does not support opens the editor, which tells why
  *   (issue #23).
+ * - A machine with a security key that has no enrolled credential opens the editor, which enrolls the key.
  */
 internal fun machineCardAction(
     machine: HostMachine,
     isConnected: Boolean,
     credentialState: CredentialState,
-): MachineCardAction =
-    when {
+    featureFlags: FeatureFlags = FeatureFlags(),
+): MachineCardAction {
+    val auth = machine.authMethod
+    return when {
         isConnected -> MachineCardAction.OpenWorkspace
         credentialState is CredentialState.KeyMissing -> MachineCardAction.Configure
-        machine.authMethod.isSupported -> MachineCardAction.Connect
-        else -> MachineCardAction.Configure
+        !auth.isSupported(featureFlags) -> MachineCardAction.Configure
+        auth is SshAuthMethod.HardwareSecurityKey && !auth.isEnrolled -> MachineCardAction.Configure
+        else -> MachineCardAction.Connect
     }
+}
 
 /**
  * Returns the [CredentialState] of each machine in [machines], by machine id. Without a [checker], or when the
@@ -414,6 +425,7 @@ private fun HostMachineCard(
     backbone: ActiveBackbone?,
     snapshot: ClientShellSnapshot?,
     credentialState: CredentialState,
+    isAuthSupported: Boolean,
     needsUserCause: NeedsUserCause?,
     onPrimaryAction: () -> Unit,
     onEdit: () -> Unit,
@@ -425,7 +437,6 @@ private fun HostMachineCard(
     val runningAgentsCount = snapshot?.agents?.count {
         it.agentStatus == AgentStatus.Working
     } ?: 0
-    val isAuthSupported = machine.authMethod.isSupported
     val needsSignIn = !isConnected && credentialState.needsSignIn
 
     Surface(
@@ -492,7 +503,7 @@ private fun HostMachineCard(
             ) {
                 val transportLabel = when (backbone) {
                     is ActiveBackbone.MoshUdp -> "MOSH UDP • ${pollTimeText(backbone)}"
-                    is ActiveBackbone.SshEndpoint -> "SSH BRIDGE • ${pollTimeText(backbone)}"
+                    is ActiveBackbone.SshEndpoint -> "SSH • ${pollTimeText(backbone)}"
                     null -> machine.transportMode.name
                 }
                 TelemetryBadge(
