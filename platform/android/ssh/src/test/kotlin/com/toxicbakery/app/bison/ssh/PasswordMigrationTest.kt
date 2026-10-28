@@ -76,11 +76,41 @@ class PasswordMigrationTest {
         assertEquals(1, secretsIo.files.size)
     }
 
+    @Test
+    fun aLaterMoveAfterAFailedFirstMoveRemovesANewCorruptCopy() = runTest {
+        val oldMachines = listOf(machine("devbox", SshAuthMethod.Password(encryptedPasswordRef = PASSWORD)))
+        val filesIo = InMemoryStoreIOProvider(
+            mapOf(MachineStore.MACHINES_FILE_NAME to appJson.encodeToString(oldMachines)),
+        )
+        val noBackupIo = InMemoryStoreIOProvider()
+        val brokenKeyStore = object : SecretStore by secretStore {
+            override suspend fun put(ref: String, secret: ByteArray) = throw IllegalStateException("no key store")
+        }
+
+        // The first start cannot move the password, but it writes the device marker.
+        machineStore(filesIo, noBackupIo, brokenKeyStore).awaitLoaded()
+        assertTrue(PASSWORD in assertNotNull(filesIo.textAt(MachineStore.MACHINES_FILE_NAME)))
+        assertNotNull(noBackupIo.textAt(MachineStore.DEVICE_MARKER_FILE_NAME))
+
+        // A later quarantine keeps a copy with the plain-text password.
+        val corruptCopy = "${MachineStore.MACHINES_FILE_NAME}.corrupt.1700000000000"
+        filesIo.writeAtomic(corruptCopy, appJson.encodeToString(oldMachines).dropLast(3))
+
+        // A later load moves the password and removes the copy.
+        val store = machineStore(filesIo, noBackupIo)
+        store.awaitLoaded()
+
+        assertFalse(filesIo.files.values.any { PASSWORD in it }, "${filesIo.files.keys}")
+        assertEquals(setOf(MachineStore.MACHINES_FILE_NAME), filesIo.files.keys)
+        assertFalse(store.restoredFromBackup.value)
+    }
+
     private fun TestScope.machineStore(
         filesIo: InMemoryStoreIOProvider,
         noBackupIo: InMemoryStoreIOProvider,
+        store: SecretStore = secretStore,
     ): MachineStore {
-        val migration = PasswordSecretMigration(secretStore)
+        val migration = PasswordSecretMigration(store)
         return MachineStore(
             storeIOProvider = filesIo,
             dispatcher = UnconfinedTestDispatcher(testScheduler),

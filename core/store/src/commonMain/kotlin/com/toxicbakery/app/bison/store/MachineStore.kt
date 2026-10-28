@@ -26,7 +26,8 @@ import kotlinx.serialization.json.Json
  * - Writes atomically via [StoreIOProvider.writeAtomic] and quarantines corrupt JSON files via
  *   [StoreIOProvider.moveCorruptAside] so user data is never silently clobbered.
  * - Gives the loaded machines to [loadMigration] before it publishes them. When the migration changes a machine,
- *   the store writes `machines.json` again. The app uses it to move plain-text passwords into the secret store.
+ *   the store writes `machines.json` again and removes the corrupt copies of `machines.json`, because a copy can
+ *   hold the old values. The app uses it to move plain-text passwords into the secret store.
  * - Keeps a device marker ([DEVICE_MARKER_FILE_NAME]) in [noBackupStoreIOProvider]. A backup does not copy the
  *   marker. When the marker is absent at load, the store does the first-start steps: it removes the corrupt copies
  *   of `machines.json`, because a copy from an earlier version can hold a plain-text password. When
@@ -195,6 +196,8 @@ class MachineStore(
                         }
                         if (migrated != loaded) {
                             writeMigratedMachinesLocked()
+                            // A corrupt copy can hold the old values, for example a plain-text password.
+                            storeIOProvider.deleteCorruptCopies(MACHINES_FILE_NAME)
                         }
                     }
                 }

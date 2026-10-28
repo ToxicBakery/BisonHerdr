@@ -177,6 +177,50 @@ class MachineStoreTest {
     }
 
     @Test
+    fun aLoadMigrationThatChangesAMachineRemovesTheCorruptCopies() = runTest {
+        val corruptName = "${MachineStore.MACHINES_FILE_NAME}.corrupt.1700000000000"
+        val io = InMemoryStoreIOProvider(
+            mapOf(
+                MachineStore.MACHINES_FILE_NAME to appJson.encodeToString(listOf(sampleMachine(name = "old"))),
+                corruptName to "[{\"password\":\"hunter2\"",
+            ),
+        )
+        // The device marker is present, so this is not the first start.
+        val noBackup = InMemoryStoreIOProvider(mapOf(MachineStore.DEVICE_MARKER_FILE_NAME to "0a1b"))
+        val store = MachineStore(
+            storeIOProvider = io,
+            dispatcher = UnconfinedTestDispatcher(testScheduler),
+            noBackupStoreIOProvider = noBackup,
+            loadMigration = { machines -> machines.map { it.copy(name = "migrated") } },
+        )
+
+        store.awaitLoaded()
+
+        assertNull(io.textAt(corruptName))
+        assertEquals(setOf(MachineStore.MACHINES_FILE_NAME), io.files.keys)
+    }
+
+    @Test
+    fun aLoadMigrationWithNoChangeKeepsTheCorruptCopies() = runTest {
+        val corruptName = "${MachineStore.MACHINES_FILE_NAME}.corrupt.1700000000000"
+        val io = InMemoryStoreIOProvider(
+            mapOf(
+                MachineStore.MACHINES_FILE_NAME to appJson.encodeToString(listOf(sampleMachine())),
+                corruptName to "{",
+            ),
+        )
+        val store = MachineStore(
+            storeIOProvider = io,
+            dispatcher = UnconfinedTestDispatcher(testScheduler),
+            loadMigration = { machines -> machines },
+        )
+
+        store.awaitLoaded()
+
+        assertNotNull(io.textAt(corruptName))
+    }
+
+    @Test
     fun aFailedLoadMigrationKeepsTheLoadedMachines() = runTest {
         val original = sampleMachine()
         val originalJson = appJson.encodeToString(listOf(original))
