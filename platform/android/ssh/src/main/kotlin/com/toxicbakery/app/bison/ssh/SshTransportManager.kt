@@ -376,21 +376,22 @@ class SshTransportManager(
         } else {
             val epoch = presentationEpochCounter.getAndIncrement().toULong()
             surfaceDeltaAssembler.onPresentationSync(machineId, epoch)
-            val currentSurface = paneSurfaceBus.surfaceFor(machineId)
-            if (currentSurface != null) {
+            // In the frame lock, a frame of the backend cannot occur between the read and the publish of the copy.
+            val readyControl = backend.withFrameLock(machineId) {
+                val currentSurface = paneSurfaceBus.surfaceFor(machineId) ?: return@withFrameLock null
                 val assembled = surfaceDeltaAssembler.commitFullFrame(
                     machineId = machineId,
                     frame = currentSurface.copy(presentationEpoch = epoch),
                 )
                 paneSurfaceBus.publish(machineId, assembled.frame)
-                val readyControl = assembled.presentationReadyControl
-                if (readyControl != null) {
-                    sshDebugLog.record(
-                        machineId = machineId,
-                        tag = "PresentationFence",
-                        message = "Sent ${readyControl.kind} ${readyControl.dataJson}",
-                    )
-                }
+                assembled.presentationReadyControl
+            }
+            if (readyControl != null) {
+                sshDebugLog.record(
+                    machineId = machineId,
+                    tag = "PresentationFence",
+                    message = "Sent ${readyControl.kind} ${readyControl.dataJson}",
+                )
             }
             sshStateManager.setRoamingStatus(machineId, RoamingStatus.Healthy)
         }

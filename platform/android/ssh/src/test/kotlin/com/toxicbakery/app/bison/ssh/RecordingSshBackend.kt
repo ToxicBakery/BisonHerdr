@@ -15,7 +15,8 @@ import kotlinx.coroutines.delay
  * [checkLiveness] waits for [livenessDelay] and then returns [liveness]. [openSurface] runs [onOpenSurface], and
  * [sendEndpointCommand] runs [onSendEndpointCommand], so that a test can make the step throw or wait.
  * [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
- * reconnect loop.
+ * reconnect loop. [withFrameLock] runs [onFrameLockEnd] after its block, so that a test can read the state at the
+ * end of the lock.
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
@@ -106,4 +107,10 @@ internal class RecordingSshBackend(
     override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) {
         calls += "refreshSurface ${machine.id}"
     }
+
+    /** Runs at the end of each [withFrameLock] call, before the call releases the lock. */
+    @Volatile
+    var onFrameLockEnd: (machineId: String) -> Unit = {}
+
+    override fun <T> withFrameLock(machineId: String, block: () -> T): T = block().also { onFrameLockEnd(machineId) }
 }

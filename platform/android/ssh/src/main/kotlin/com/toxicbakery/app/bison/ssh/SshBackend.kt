@@ -99,4 +99,11 @@ interface SshBackend {
 
     /** Reads the snapshot and the surface of [machine] again, for example after a reconnect. */
     suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) = Unit
+
+    /**
+     * Runs [block] in the frame lock of [machineId]. In [block], the caller reads the frame of the machine from the
+     * surface bus and publishes a changed copy. Thus a frame of the backend cannot occur between these two steps. The
+     * default backend has no lock, and runs [block] at once. Returns the result of [block].
+     */
+    fun <T> withFrameLock(machineId: String, block: () -> T): T = block()
 }
