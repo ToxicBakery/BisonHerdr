@@ -6,9 +6,9 @@ import java.io.OutputStream
 /**
  * Keeps the last [limit] bytes of the standard error of a persistent worker.
  *
- * A worker writes to standard error for each command that fails, for example two lines for each poll when Herdr
- * refuses the session name. Thus a buffer with no limit grows while the host fails. This stream keeps at most two times
- * [limit] bytes. The SSH library writes from its own thread, so each function is synchronized.
+ * A worker writes to standard error for each command that fails, for example for each `herdr remote-api-bridge` call
+ * when the session has no server. Thus a buffer with no limit grows while the host fails. This stream keeps at most two
+ * times [limit] bytes. The SSH library writes from its own thread, so each function is synchronized.
  */
 internal class StderrTail(private val limit: Int) : OutputStream() {
     private val buffer = ByteArrayOutputStream()
@@ -24,10 +24,6 @@ internal class StderrTail(private val limit: Int) : OutputStream() {
         buffer.write(b, off, len)
         trim()
     }
-
-    /** Returns the last line that is not blank, or null when the stream has no text. */
-    @Synchronized
-    fun lastLine(): String? = text().lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }
 
     /** Returns the last [limit] bytes as UTF-8 text. */
     @Synchronized

@@ -2,26 +2,22 @@ package com.toxicbakery.app.bison.ssh
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /** Tests that [StderrTail] keeps only the last bytes of the standard error of a worker. */
 class StderrTailTest {
 
     @Test
-    fun anEmptyStreamHasNoLastLine() {
-        val tail = StderrTail(limit = 16)
-
-        assertEquals("", tail.text())
-        assertNull(tail.lastLine())
+    fun anEmptyStreamHasNoText() {
+        assertEquals("", StderrTail(limit = 16).text())
     }
 
     @Test
-    fun theLastLineIsTheNewestLineWithText() {
+    fun aShortStreamKeepsAllItsText() {
         val tail = StderrTail(limit = 64)
-        tail.write("error: first\nerror: second\n\n".encodeToByteArray())
+        tail.write("error: first\nerror: second\n".encodeToByteArray())
 
-        assertEquals("error: second", tail.lastLine())
+        assertEquals("error: first\nerror: second\n", tail.text())
     }
 
     @Test

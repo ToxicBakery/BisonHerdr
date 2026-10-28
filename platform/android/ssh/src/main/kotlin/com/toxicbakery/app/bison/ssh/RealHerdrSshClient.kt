@@ -229,8 +229,6 @@ internal class RealHerdrSshClient(
         val channel: ChannelExec,
         val stdin: OutputStream,
         val stdout: BufferedReader,
-        /** The last bytes of the standard error of the worker. See [StderrTail]. */
-        val stderr: StderrTail,
     ) {
         val isAlive: Boolean
             get() = !channel.isClosed && channel.isConnected
@@ -480,6 +478,8 @@ internal class RealHerdrSshClient(
     ): Result<Unit> = withContext(Dispatchers.IO) {
         supervisors.remove(machine.id)?.stop()
         roundTripMeter.reset(machine.id)
+        // A new connect starts a new series of polls with no snapshot. See recordMissingSnapshot.
+        machinesWithoutSnapshot.remove(machine.id)
         connectSteps += machine.id
         runCatching {
             val out = executeBatchOnLane(
@@ -797,7 +797,9 @@ internal class RealHerdrSshClient(
         }.orEmpty()
 
         val initialCommands = buildList {
-            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot"))
+            // Herdr writes an error answer only to standard error. The parse below ignores the lines that are not JSON,
+            // for example a warning with a good answer. See recordMissingSnapshot.
+            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot 2>&1"))
             predictedVisiblePanes.forEach { paneId ->
                 add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
             }
@@ -1945,14 +1947,17 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Writes an error to the debug log when the snapshot batch of [machine] gave no snapshot in [output]. The error
-     * tells the first cause that applies:
-     * - a session name that Herdr does not accept. Herdr writes this error only to standard error.
-     * - the error message of Herdr in [output], for example for `server_not_running`.
-     * - the last line of standard error of the Poll worker, for example `herdr: not found`.
+     * Writes an error to the debug log when the snapshot batch of [machine] gave no snapshot in [output].
      *
-     * The client writes only the first error of each series of polls with no snapshot. A poll with a snapshot, or a
-     * [disconnect], ends the series. Thus a host that stays in this state does not fill the debug log.
+     * The snapshot command sends its standard error to [output] (`2>&1`), because Herdr writes each error answer only
+     * to standard error. The error of the log tells the first cause that applies:
+     * - a session name that Herdr does not accept. Herdr then writes a line of text, not a JSON answer.
+     * - the `error.message` of a JSON answer in [output], for example for `server_not_running`.
+     * - the last line of [output] that is not JSON, for example `sh: 1: herdr: not found`.
+     *
+     * The client writes only the first error of each series of polls with no snapshot. A poll with a snapshot, a new
+     * [connectAndVerify], or a [disconnect] ends the series. Thus a host that stays in this state does not fill the
+     * debug log.
      */
     private fun recordMissingSnapshot(machine: HostMachine, output: String) {
         if (!machinesWithoutSnapshot.add(machine.id)) return
@@ -1960,7 +1965,7 @@ internal class RealHerdrSshClient(
         val cause = sessionName?.takeIf { !HostMachine.isValidHerdrSessionName(it) }
             ?.let { "Herdr does not accept the session name \"$it\". Change the name in the machine settings." }
             ?: herdrErrorMessage(output)
-            ?: pollWorkers[machine.id]?.stderr?.lastLine()
+            ?: lastTextLine(output)
             ?: "Herdr gave no output."
         sshDebugLog.record(
             machineId = machine.id,
@@ -1970,7 +1975,10 @@ internal class RealHerdrSshClient(
         )
     }
 
-    /** Returns the `error.message` of the first Herdr answer in [output] that has an error, or null. */
+    /**
+     * Returns the `error.message` of the first Herdr answer in [output] that has an error, or null. The result has at
+     * most [MAX_LOGGED_CAUSE_LENGTH] characters.
+     */
     private fun herdrErrorMessage(output: String): String? =
         output.lineSequence()
             .map { it.trim() }
@@ -1981,6 +1989,17 @@ internal class RealHerdrSshClient(
                     error?.get("message")?.jsonPrimitive?.content
                 }.getOrNull()
             }
+            ?.take(MAX_LOGGED_CAUSE_LENGTH)
+
+    /**
+     * Returns the last line of [output] that has text and is not a JSON object, or null. The result has at most
+     * [MAX_LOGGED_CAUSE_LENGTH] characters.
+     */
+    private fun lastTextLine(output: String): String? =
+        output.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.isNotEmpty() && !(it.startsWith("{") && it.endsWith("}")) }
+            ?.take(MAX_LOGGED_CAUSE_LENGTH)
 
     private fun parsePaneReadLinesInto(
         rawResponse: String,
@@ -2466,14 +2485,13 @@ internal class RealHerdrSshClient(
         channel.setCommand(initCmd)
         val rawIn = channel.inputStream
         val rawOut = channel.outputStream
-        val stderr = StderrTail(WORKER_STDERR_TAIL_BYTES)
-        channel.setErrStream(stderr)
+        // The worker keeps only the last bytes of its standard error. See StderrTail.
+        channel.setErrStream(StderrTail(WORKER_STDERR_TAIL_BYTES))
         channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
         val worker = PersistentShellWorker(
             channel = channel,
             stdin = rawOut,
             stdout = BufferedReader(InputStreamReader(rawIn, Charsets.UTF_8), 32 * 1024),
-            stderr = stderr,
         )
         map[machineId] = worker
         return worker
@@ -3355,6 +3373,9 @@ internal class RealHerdrSshClient(
 
         /** The number of bytes of standard error that each persistent worker keeps. See [StderrTail]. */
         private const val WORKER_STDERR_TAIL_BYTES = 4 * 1024
+
+        /** The maximum length of a cause from the host in the debug log. See [recordMissingSnapshot]. */
+        private const val MAX_LOGGED_CAUSE_LENGTH = 512
         private const val IPTOS_LOWDELAY = 0x10
         private const val LIVE_POLL_INTERVAL_MS = 400L
 

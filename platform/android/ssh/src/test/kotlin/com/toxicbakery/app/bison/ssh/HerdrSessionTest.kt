@@ -136,20 +136,27 @@ class HerdrSessionTest {
     fun theDebugLogShowsTheErrorThatHerdrWritesToStandardError() = runTest {
         val (machine, route) = connect(sessionName = "work")
         val error = File(home, "snapshot-error")
-        error.writeText("error: no server for this test\n")
+        error.writeText(SERVER_NOT_RUNNING_JSON + "\n")
 
         // Herdr fails two polls. The client writes one error for the two polls.
         assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
         assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
-        val expected = "No snapshot from `herdr --session 'work' api snapshot`: error: no server for this test"
-        assertEquals(listOf(expected), snapshotErrors(), debugLogDump())
+        val prefix = "No snapshot from `herdr --session 'work' api snapshot`: "
+        assertEquals(listOf(prefix + "no herdr server is running"), snapshotErrors(), debugLogDump())
 
-        // A poll with a snapshot ends the series. The next poll that fails writes a new error.
+        // A poll with a snapshot ends the series, also with a warning on standard error.
         error.delete()
+        File(home, "snapshot-warning").writeText("warning: unknown key in config\n")
         assertTrue(backend.client.refreshSnapshotAndSurface(machine, route), debugLogDump())
+
+        // The next poll that fails writes a new error. With no JSON answer, the error is the last line of text.
         error.writeText("error: no server for this test\n")
         assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
-        assertEquals(listOf(expected, expected), snapshotErrors(), debugLogDump())
+        assertEquals(
+            listOf(prefix + "no herdr server is running", prefix + "error: no server for this test"),
+            snapshotErrors(),
+            debugLogDump(),
+        )
     }
 
     /**
@@ -213,6 +220,10 @@ class HerdrSessionTest {
         const val PANE_READ_JSON =
             """{"id":"read_w1:p1","result":{"type":"pane_read","read":{"pane_id":"w1:p1","text":"ready"}}}"""
 
+        /** The answer of `herdr api snapshot` when the session has no server. Herdr writes it to standard error. */
+        const val SERVER_NOT_RUNNING_JSON =
+            """{"id":"cli:api:snapshot","error":{"code":"server_not_running","message":"no herdr server is running"}}"""
+
         /** A request that sends Enter to the pane `w1:p1` on the Input lane. */
         val SEND_ENTER = ClientShellEndpointRequest(
             id = "keys",
@@ -224,12 +235,12 @@ class HerdrSessionTest {
          * A fake `herdr` for POSIX `sh`. It writes its arguments to `$HOME/herdr-calls`, one line for each argument.
          * It answers `--version`, `api snapshot`, and one request of `remote-api-bridge`.
          *
-         * Two files change its answers:
-         * - `$HOME/snapshot-error`: `api snapshot` writes this text to standard error and exits with code 2, as Herdr
-         *   does for a session name that it does not accept. It waits before it exits, so that the error gets to the
-         *   client before the next output of the worker.
+         * Three files change its answers:
+         * - `$HOME/snapshot-error`: `api snapshot` writes this text to standard error and exits with code 1, as Herdr
+         *   does for an error answer.
+         * - `$HOME/snapshot-warning`: `api snapshot` writes this text to standard error before a good answer.
          * - `$HOME/kill-workers`: the first N calls of `remote-api-bridge` stop the shell that runs them. The fake
-         *   stops only a shell, never a different process.
+         *   stops only a process with the name `sh`.
          */
         val FAKE_HERDR = """
             #!/bin/sh
@@ -239,8 +250,10 @@ class HerdrSessionTest {
                 *" api snapshot "*)
                     if [ -e "${'$'}HOME/snapshot-error" ]; then
                         cat "${'$'}HOME/snapshot-error" >&2
-                        sleep 0.3
-                        exit 2
+                        exit 1
+                    fi
+                    if [ -e "${'$'}HOME/snapshot-warning" ]; then
+                        cat "${'$'}HOME/snapshot-warning" >&2
                     fi
                     cat "${'$'}HOME/snapshot.json"
                     ;;
@@ -249,7 +262,7 @@ class HerdrSessionTest {
                     echo "${'$'}count" > "${'$'}HOME/bridge-count"
                     if [ "${'$'}count" -le "${'$'}(cat "${'$'}HOME/kill-workers" 2>/dev/null || echo 0)" ]; then
                         case ${'$'}(ps -o comm= -p "${'$'}PPID") in
-                            *sh) kill -KILL "${'$'}PPID" ;;
+                            sh | */sh) kill -KILL "${'$'}PPID" ;;
                         esac
                         exit 1
                     fi
