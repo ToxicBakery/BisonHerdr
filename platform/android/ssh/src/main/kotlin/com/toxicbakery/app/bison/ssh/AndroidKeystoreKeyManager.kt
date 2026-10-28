@@ -4,6 +4,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import com.toxicbakery.app.bison.model.KeyAlgorithm
+import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.logging.Arbor
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -52,11 +53,28 @@ data class ExportedSshPublicKey(
     }
 }
 
+/** Makes a key pair for an alias in AndroidKeyStore. */
+internal fun interface KeystoreKeyGenerator {
+    fun generate(keyAlias: String, algorithm: KeyAlgorithm, requireBiometric: Boolean): KeyPair
+}
+
 /**
  * Manages on-device SSH asymmetric keys (`Ed25519`, `RSA-4096`, `ECDSA-P256`) backed by Android's
- * hardware-backed `AndroidKeyStore`, with automatic JCA fallback for local JVM unit tests.
+ * hardware-backed `AndroidKeyStore`.
+ *
+ * When AndroidKeyStore does not make a key, the manager throws a [KeyCreationException] that names the
+ * cause. When [allowSoftwareKeys] is true, the manager makes a software JCA key in memory instead. Only JVM
+ * tests set it, because the JVM has no AndroidKeyStore. A device must not use a software key.
  */
-class AndroidKeystoreKeyManager : SshPublicKeyProvider {
+class AndroidKeystoreKeyManager(
+    private val allowSoftwareKeys: Boolean = false,
+) : SshPublicKeyProvider {
+
+    /** Makes a key in AndroidKeyStore. A JVM test can set a generator that fails in a known way. */
+    internal var keystoreKeyGenerator: KeystoreKeyGenerator = KeystoreKeyGenerator(::generateInAndroidKeystore)
+
+    /** The key types that AndroidKeyStore supports on this device. A JVM test can set a different list. */
+    internal var keySupport: KeystoreKeySupport = AndroidKeystoreKeySupport
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
     private val exportedPublicKeys = ConcurrentHashMap<String, ExportedSshPublicKey>()
@@ -67,6 +85,8 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
     /**
      * Generates or loads an existing key pair for [keyAlias] using [algorithm] and returns its
      * OpenSSH `authorized_keys` representation. This is the only function that makes a key.
+     *
+     * Throws a [KeyCreationException] when AndroidKeyStore does not make the key.
      */
     fun getOrCreatePublicKey(
         keyAlias: String,
@@ -275,24 +295,29 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
         }.getOrNull()
     }
 
+    /**
+     * Makes a key pair for [keyAlias] in AndroidKeyStore. When AndroidKeyStore fails, it throws a
+     * [KeyCreationException], or it makes a software key if [allowSoftwareKeys] is true.
+     */
     private fun generateKeyPair(
         keyAlias: String,
         algorithm: KeyAlgorithm,
         requireBiometric: Boolean,
     ): KeyPair {
-        val keystoreAttempt = runCatching {
-            generateInAndroidKeystore(keyAlias, algorithm, requireBiometric)
+        val keystoreError = try {
+            return keystoreKeyGenerator.generate(keyAlias, algorithm, requireBiometric)
+        } catch (error: Exception) {
+            error
         }
-        if (keystoreAttempt.isSuccess) {
-            return keystoreAttempt.getOrThrow()
+        if (!allowSoftwareKeys) {
+            val failure = keyCreationFailure(algorithm, requireBiometric, keystoreError)
+            throw KeyCreationException(failure, keyCreationMessage(keyAlias, failure), keystoreError)
         }
         log.d { "AndroidKeyStore unavailable for $keyAlias (${algorithm.name}); using JCA key pair" }
         return fallbackKeyPairs.computeIfAbsent(keyAlias) {
             runCatching { generateStandardJcaKeyPair(algorithm) }.getOrElse { jcaError ->
-                throw UnsupportedOperationException(
-                    unsupportedAlgorithmMessage(algorithm),
-                    keystoreAttempt.exceptionOrNull() ?: jcaError,
-                )
+                throw UnsupportedOperationException(unsupportedAlgorithmMessage(algorithm), keystoreError)
+                    .apply { addSuppressed(jcaError) }
             }
         }
     }
@@ -341,6 +366,32 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
             }
         }
     }
+
+    /**
+     * Returns the cause of the AndroidKeyStore [error]. AndroidKeyStore gives an [IllegalStateException]
+     * when a key needs user authentication and the device has no secure screen lock or no biometric.
+     */
+    private fun keyCreationFailure(
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean,
+        error: Exception,
+    ): KeyCreationFailure =
+        when {
+            !keySupport.isSupported(algorithm) -> KeyCreationFailure.AlgorithmNotSupported(algorithm)
+            requireBiometric && generateSequence<Throwable>(error) { it.cause }
+                .take(MAX_CAUSE_DEPTH)
+                .any { it is IllegalStateException } -> KeyCreationFailure.NoSecureLockScreen
+            else -> KeyCreationFailure.Other(error.message ?: error::class.java.name)
+        }
+
+    private fun keyCreationMessage(keyAlias: String, failure: KeyCreationFailure): String =
+        when (failure) {
+            KeyCreationFailure.NoSecureLockScreen ->
+                "AndroidKeyStore did not make the key $keyAlias. The key needs user authentication, " +
+                    "but the device has no secure screen lock or no biometric."
+            is KeyCreationFailure.AlgorithmNotSupported -> unsupportedAlgorithmMessage(failure.algorithm)
+            is KeyCreationFailure.Other -> "AndroidKeyStore did not make the key $keyAlias: ${failure.detail}"
+        }
 
     private fun unsupportedAlgorithmMessage(algorithm: KeyAlgorithm): String =
         if (algorithm == KeyAlgorithm.Ed25519) {
@@ -507,6 +558,9 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
         private const val ED25519_CURVE = "ed25519"
         private const val ED25519_OID = "1.3.101.112"
         private const val DEFAULT_KEY_COMMENT = "bison-tablet"
+
+        /** The maximum number of causes that [keyCreationFailure] examines. */
+        private const val MAX_CAUSE_DEPTH = 16
         private val log = Arbor.tag("AndroidKeystoreKeyManager")
     }
 }

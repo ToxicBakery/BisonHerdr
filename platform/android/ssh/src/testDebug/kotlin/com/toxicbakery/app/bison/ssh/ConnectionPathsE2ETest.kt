@@ -52,7 +52,7 @@ class ConnectionPathsE2ETest {
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
-            keystoreKeyManager = AndroidKeystoreKeyManager(),
+            keystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
         )
         val transport = SshTransportManager(
             backend = backend,

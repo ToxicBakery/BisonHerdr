@@ -9,7 +9,8 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 interface SshPublicKeyProvider {
     /**
      * Returns the `authorized_keys` line for [keyAlias]. Creates the key if it does not exist.
-     * Throws an exception when the key cannot be created or loaded.
+     * Throws a [KeyCreationException] when the device key store does not make the key. Throws a
+     * different exception when the key cannot be loaded.
      */
     suspend fun authorizedKeyLine(
         keyAlias: String,

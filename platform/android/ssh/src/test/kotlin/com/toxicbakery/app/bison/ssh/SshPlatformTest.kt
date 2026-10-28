@@ -27,7 +27,7 @@ class SshPlatformTest {
 
     @Test
     fun keystoreKeyManagerGeneratesAndSignsEd25519AndEcdsaChallenges() {
-        val manager = AndroidKeystoreKeyManager()
+        val manager = AndroidKeystoreKeyManager(allowSoftwareKeys = true)
         val edKey = manager.getOrCreatePublicKey(
             keyAlias = "test_ed25519",
             algorithm = KeyAlgorithm.Ed25519,

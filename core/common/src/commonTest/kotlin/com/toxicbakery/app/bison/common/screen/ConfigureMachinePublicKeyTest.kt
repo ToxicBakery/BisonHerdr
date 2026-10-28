@@ -4,6 +4,8 @@ import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.KeyCreationException
+import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
@@ -95,6 +97,28 @@ class ConfigureMachinePublicKeyTest {
             assertNull(viewModel.state.value.publicKeyLine)
             assertFalse(viewModel.state.value.isLoadingPublicKey)
             assertEquals("Could not get the public key: The key alias is in use", viewModel.state.value.publicKeyError)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun aKeyCreationFailureShowsItsCauseNextToTheKeyTypes() = runTest {
+        try {
+            val failure = KeyCreationFailure.NoSecureLockScreen
+            val viewModel = viewModel(
+                RecordingProvider { _, _ -> throw KeyCreationException(failure, "The device has no screen lock") },
+            )
+            viewModel.onEvent(ConfigureMachineViewModel.Event.ShowPublicKey)
+
+            assertEquals(failure, viewModel.state.value.keyCreationFailure)
+            assertNull(viewModel.state.value.publicKeyError)
+            assertNull(viewModel.state.value.publicKeyLine)
+            assertFalse(viewModel.state.value.isLoadingPublicKey)
+
+            // The failure is for the old key type, so a different key type removes it.
+            viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateKeyAlgorithm(KeyAlgorithm.EcdsaP256))
+            assertNull(viewModel.state.value.keyCreationFailure)
         } finally {
             Dispatchers.resetMain()
         }

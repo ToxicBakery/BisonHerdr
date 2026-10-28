@@ -109,7 +109,8 @@ class AndroidKeystoreEd25519DeviceTest {
         assertEquals(KeyAlgorithm.EcdsaP256, AndroidKeystoreKeySupport.defaultAlgorithm)
 
         val error = runCatching { keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.Ed25519) }.exceptionOrNull()
-        assertIs<UnsupportedOperationException>(error)
+        assertIs<KeyCreationException>(error)
+        assertEquals(KeyCreationFailure.AlgorithmNotSupported(KeyAlgorithm.Ed25519), error.failure)
         assertTrue(error.message.orEmpty().contains("Android 13"), "Unclear error: ${error.message}")
 
         val exported = keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)

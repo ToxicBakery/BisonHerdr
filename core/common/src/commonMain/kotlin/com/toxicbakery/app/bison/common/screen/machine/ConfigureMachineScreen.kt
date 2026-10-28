@@ -63,7 +63,13 @@ import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
+import com.toxicbakery.app.bison.resources.machine_key_error_no_secure_lock_screen
+import com.toxicbakery.app.bison.resources.machine_key_error_other
+import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import kotlinx.coroutines.launch
+import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.viewmodel.rememberViewModel
 
 @Composable
@@ -328,6 +334,14 @@ fun ConfigureMachineScreen(
                                     )
                                 }
                             }
+                            state.keyCreationFailure?.let { failure ->
+                                Text(
+                                    text = keyCreationFailureText(failure),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.testTag("keyCreationError"),
+                                )
+                            }
                             if (KeyAlgorithm.Ed25519 !in state.availableKeyAlgorithms) {
                                 Text(
                                     text = "Ed25519 keys need Android 13 or later.",
@@ -546,6 +560,16 @@ fun ConfigureMachineScreen(
         }
     }
 }
+
+/** Returns the text that tells the user why the device key store did not make the key. */
+@Composable
+private fun keyCreationFailureText(failure: KeyCreationFailure): String =
+    when (failure) {
+        KeyCreationFailure.NoSecureLockScreen -> stringResource(Res.string.machine_key_error_no_secure_lock_screen)
+        is KeyCreationFailure.AlgorithmNotSupported ->
+            stringResource(Res.string.machine_key_error_algorithm_not_supported, failure.algorithm.sshKeyType)
+        is KeyCreationFailure.Other -> stringResource(Res.string.machine_key_error_other, failure.detail)
+    }
 
 /**
  * Shows the OpenSSH public key of the key store key, with a button that copies it, so that the
