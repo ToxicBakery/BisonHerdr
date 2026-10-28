@@ -55,13 +55,13 @@ class TestSshServerTest {
 
         assertEquals(
             listOf(
-                File(server.home, TestHerdr.HERDR_PATH).absolutePath,
+                File(server.commandHome, TestHerdr.HERDR_PATH).absolutePath,
                 // The herdr of the server acts as a host with no herdr, as on CI.
                 "exit=127",
                 // The command has no HERDR_SOCKET_PATH or other HERDR_ variable of the test machine.
                 "0",
-                "home=${server.home.absolutePath}",
-                "config=${File(server.home, ".config").absolutePath}",
+                "home=${server.commandHome.absolutePath}",
+                "config=${File(server.commandHome, ".config").absolutePath}",
             ),
             lines,
         )

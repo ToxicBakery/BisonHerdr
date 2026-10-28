@@ -340,7 +340,7 @@ class PaneKeyInputTest {
     fun theRealShellPathKeepsTheTypedOrderAndStopsTheBatchAfterAnUnknownKey() = runBlocking {
         TestSshServer().start().use { server ->
             val fakeHerdr = server.installHerdr(TestHerdr.FAKE_HERDR_SCRIPT)
-            val home = server.home
+            val home = server.commandHome
             File(home, "unknown-keys").writeText("Down\n")
             val backend = realBackend(server)
             val machine = server.machine(
