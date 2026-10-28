@@ -2,7 +2,11 @@
 
 This document consolidates the complete reference for **Herdr's Server API & Protocol Surface** and the **Architecture & UX Design Specification** for **BisonHerdr** (`com.toxicbakery.app.bison`), the native Android / Tablet client for Herdr.
 
-> **Status.** This document describes the target design. Some parts do not ship in this version. The Mosh UDP backbone (Part IV), the Rust JNI core, `russh`, and `libghostty-vt` rendering over JNI are planned. The SSH endpoint path over JSch is the only transport, and Compose draws the Herdr `PaneSurfaceFrame` cells. Item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) records this decision, and [issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work for Mosh. Section E of Part V also describes targets that do not work yet: encrypted credential storage (item 2), direct Tailscale hosts (item 4), and ProxyJump over a `direct-tcpip` channel (item 9). [Issue #20](https://github.com/ToxicBakery/BisonHerdr/issues/20) holds these items.
+> **Status.** This document describes the target design. Some parts do not ship in this version. The Mosh UDP backbone (Part IV), the Rust JNI core, `russh`, and `libghostty-vt` rendering over JNI are planned. Item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md) records this decision, and [issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work for Mosh.
+>
+> The SSH path over JSch is the only transport of this version, and Compose draws the Herdr `PaneSurfaceFrame` cells. This path does not run `herdr remote-client-bridge`. Each machine has one JSch session to its host, and a ProxyJump machine also has a session to its bastion. The host session has two persistent `sh` channels that run `herdr api snapshot` and `herdr remote-api-bridge` requests (`pane.read`, `pane.send_input`, and others). The client reads the visible panes each 400 ms while the surface lease is on. The surface lease pauses this poll in the client, and the app does not send `client_shell.surface.set` to the server.
+>
+> Of the SSH features in section E of Part V, only the hardware security keys do not work yet. [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds that work.
 
 ---
 
@@ -12,9 +16,9 @@ Mobile and tablet terminal clients typically fail coding-agent workflows because
 
 | Pain Point in Existing Mobile/Android Apps | Root Cause | BisonHerdr Architecture Solution |
 | :--- | :--- | :--- |
-| **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen in **<50ms with zero SSH reconnect**. |
-| **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Fast-Roam:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` remain rendered on screen with a non-intrusive `"Reconnecting..."` pill. `ConnectivityManager.NetworkCallback` detects interface switches in milliseconds, re-binds the SSH bridge immediately, and resyncs via `surface_reuse` / `surface_delta`. |
-| **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste before atomic submission via `agent.prompt` or `pane.send_input`. |
+| **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen **with no SSH reconnect**. In this version, the lease only pauses the pane reads of the client, and the app does not send `client_shell.surface.set`. |
+| **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Session Check:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` stay on screen with a non-intrusive `"Reconnecting..."` pill. On a new default network, `ConnectivityManager.NetworkCallback` starts a check of each SSH session: a keepalive and `exec true`, with a limit of 3 s. When the check fails, the app connects again at once and reads the surface again. On `onLost`, the app closes the SSH sockets, so that no attempt waits for a TCP timeout. |
+| **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste (planned) before atomic submission via `agent.prompt` or `pane.send_input`. |
 | **Clunky workspace, tab & split-pane navigation** | Desktop keyboard shortcuts (`prefix+w`, `prefix+h/j/k/l`) require awkward multi-key chords on touchscreens. | **Native Compose Shell Chrome + Direct Split Gestures:** Herdr's server renders *only* the pane grid (`PaneSurfaceFrame`). Android renders the Sidebar, Tab Bar, draggable BSP split handles (`layout.set_split_ratio`), and double-tap pane zoom (`pane.zoom`) natively at 120Hz. |
 | **Hard to see or act on `blocked` / `done` coding agents** | Agents are buried across multiple SSH hosts, workspaces, and split panes. | **Unified Multi-Machine Agent Rail + Blocked Action Strip:** Aggregates `ClientShellAgent` states across all connected SSH machines. When viewing a `blocked` agent, a contextual action bar provides 1-tap `Approve (Enter)`, `Cancel (Esc)`, `y`, `n`, and option number buttons. |
 
@@ -372,7 +376,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet 
    - Floating top-And-bottom HUD elements use translucent Material 3 glass surfaces (`backdrop-filter` / `Surface` with alpha + `1.dp` border) that sit over padding zones or auto-fade to 40% opacity while typing.
 2. **Floating Top HUD Islands:**
    - **Left Host & Space Switcher Pill (`● workbox · MOSH UDP :60004 · 11ms › herdr-core (1/3) ▾`):**
-     - Displays the active host, live transport backbone badge (`MOSH · UDP`, `MOSH ROAMED`, or `SSH · TCP`), RTT latency, active workspace/worktree, and tab index.
+     - Displays the active host, live transport backbone badge (`MOSH · UDP`, `MOSH ROAMED`, or `SSH · TCP`), RTT latency, active workspace/worktree, and tab index. In this version, the badge always shows the SSH path. The pill shows the measured poll time: the time of one SSH command batch, which is more than the network round trip. The Mosh badges are planned ([issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22)).
      - Tapping opens a compact floating popover sheet to switch hosts (`workbox`, `gpu-rig`, `cloud-vm`), switch/create workspaces & Git worktrees (`workspace.focus`, `workspace.create`, `worktree.create`), or switch tabs (`tab.focus`, `tab.create`).
    - **Right Agent Attention Pill (`🔴 1 Blocked · 1 Working · ☰ Agents`) & Split Pill (`◫ Splits`):**
      - Pulses when any agent across any federated machine enters `Blocked` or finishes (`Done`).
@@ -385,7 +389,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet 
    - **Center Floating Prompt Composer Pill (`❯ ... [✓ Approve] [Send ⏎]`):**
      - Sits ergonomically between the left and right thumb pads.
      - Shows contextual one-tap **`[ ✓ Approve ]`** / **`[ ✕ Reject ]`** buttons whenever the focused pane's agent is `Blocked`.
-     - Tapping the prompt input expands into a multi-line native Compose `OutlinedTextField` card supporting **Gboard swipe typing, Android Voice Dictation, multi-line editing, image clipboard paste (`ClientMessage::ClipboardImage`), and offline Mosh roaming queue**.
+     - Tapping the prompt input expands into a multi-line native Compose `OutlinedTextField` card supporting **Gboard swipe typing, Android Voice Dictation, multi-line editing, image clipboard paste (`ClientMessage::ClipboardImage`, planned), and an offline prompt queue during a reconnect**.
      - Submitting sends the prompt atomically (`agent.prompt` over a `herdr remote-api-bridge` SSH exec channel or `ClientShellPaneInput` `Paste` + `Enter`, tracking subsequent state transitions reactively via `shell.snapshot.v1`).
 
 ---
@@ -437,11 +441,13 @@ All 18 color palettes from Herdr's `src/app/state.rs` (`Palette`) plus `OLED Pit
 
 ## Part IV: Mosh UDP Connection Backbone, Always-On Backgrounding & Roaming
 
-> **Status: planned.** This version does not include Mosh. The app always uses the SSH Endpoint path (`herdr remote-client-bridge`), and the parts of Part IV that apply to Mosh describe the target design only. The surface lease and the `NetworkCallback` fast-roam (Part I) are the answer to roaming in this version. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work and the acceptance list for a real Mosh path.
+> **Status: target design.** All of Part IV is the target design, and this includes the SSH fallback. This version does not include Mosh. The app always uses the SSH path that the status note at the top of this document describes. The surface lease and the `NetworkCallback` session check are the answer to roaming in this version. The **This version** markers below tell where this version is different. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work and the acceptance list for a real Mosh path.
 
 ### 1. Mosh (`mosh-server` / UDP SSP) as the Primary Connection Backbone
 
 When `mosh-server` is available on the remote machine and UDP is reachable, **Mosh is used as the primary connection backbone**, paired with Herdr's Endpoint & API sideband (`herdr remote-client-bridge` + multiplexed SSH2 `herdr remote-api-bridge` exec channels) against **100% unmodified upstream Herdr servers**. When `mosh-server` is unavailable or UDP is blocked by a captive portal/firewall, the app automatically falls back to Herdr's SSH Endpoint Bridge (`herdr remote-client-bridge` with `surface_active: true`).
+
+**This version:** the SSH path does not run `herdr remote-client-bridge`. It runs `herdr api snapshot` and `herdr remote-api-bridge` requests on persistent `sh` channels, and it polls the visible panes.
 
 ```mermaid
 sequenceDiagram
@@ -494,6 +500,8 @@ Each `HostMachine` profile supports a configurable `TransportMode` (`AutoPreferM
 | **2. UDP Reachability Handshake (`1,500 ms` budget)** | Send initial Mosh SSP heartbeat datagram to `<host>:<udp_port>` and await SSP ack. | If acked within `1.5s`, **lock in `TransportActive.MoshBackbone`** (badge: `MOSH · UDP`). |
 | **3. Automatic SSH Endpoint Fallback** | If `mosh-server` is not installed on the remote host, or if a strict corporate/hotel firewall drops UDP packets on `60000–61000`: | Immediately fall back to **`TransportActive.SshEndpoint`** (`herdr remote-client-bridge` over SSH TCP with `surface_delta` + `NetworkCallback` roaming) and show a non-intrusive status badge (`SSH · TCP (Mosh UDP unavailable)`). |
 
+**This version:** the app only looks for `mosh-server` (step 1, `command -v`), except for an SSH-only machine. It always selects the SSH path, and steps 2 and 3 do not occur.
+
 ---
 
 ### 2. Connection Lifecycle State Machine
@@ -536,6 +544,8 @@ stateDiagram-v2
     RoamingHandoff --> ForegroundActive: Stream Synced
 ```
 
+**This version:** the SSH state does not use Herdr Endpoint Gen 1 or `client_shell.surface.set`. In the background, the surface lease pauses the pane reads of the client. On a resume, the app shows the last frame, and the next poll reads the new state. No code measures a resume time. After a network change, the app checks each session and connects again when the check fails (section 4).
+
 ### 3. Zero-Bandwidth Background Parking (`Mosh Suspend` + `surface_interest`)
 
 Both transport backbones are engineered so backgrounding the tablet app consumes **zero terminal rendering bandwidth** while never losing your session:
@@ -547,25 +557,28 @@ Both transport backbones are engineered so backgrounding the tablet app consumes
 2. **When Connected via SSH Endpoint Fallback (`SshEndpointActive`):**
    - Sends `{"id": "bg_lease", "method": "client_shell.surface.set", "params": {"active": false}}`.
    - On the Herdr server (`src/server/headless/surface_interest.rs`), `set_client_shell_surface_active(client_id, false)` stops all `PaneSurfaceFrame` / `PaneSurfacePatch` rendering traffic while keeping the control socket open.
-   - On `onStart()`, sending `client_shell.surface.set { active: true }` pushes a fresh coherent `PaneSurfaceFrame` in `<50ms` without re-running the SSH handshake, followed by `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }` once the frame is committed to release the server's `presentation_effects_fence`.
+   - **This version:** the app does not send `client_shell.surface.set`. On `onStop()`, the surface lease pauses the pane reads of the client, and the SSH session stays open. On `onStart()`, the app shows the last frame at once, and the next poll reads the new state.
+   - On `onStart()`, sending `client_shell.surface.set { active: true }` pushes a fresh coherent `PaneSurfaceFrame` without re-running the SSH handshake, followed by `ClientMessage::EndpointControl { kind: "endpoint.presentation.ready.v1", data }` once the frame is committed to release the server's `presentation_effects_fence`.
 3. **Actionable Android System Notifications (`BisonSessionService`):**
-   - Runs as a `specialUse` `ForegroundService` (*"BisonHerdr: 2 machines (Mosh UDP) · 1 agent working"*).
-   - When an agent transitions to `Blocked` or `Done` (`SemanticNotification` or `ClientShellSnapshot` agent status change), posts a native Android notification with direct `PendingIntent` actions:
+   - Runs as a `specialUse` `ForegroundService` (*"BisonHerdr: 2 machines (SSH Endpoint)"*). The ongoing notification has a **Disconnect All** action. The service stops itself after 30 s with no connected machine, no connection in progress, and no started activity.
+   - When an agent transitions to `Blocked` or `Done` (`SemanticNotification` or `ClientShellSnapshot` agent status change), posts a native Android notification with direct `PendingIntent` actions. **This version:** only the demo server sends these agent events, so a real host gives no agent alert. Agent alerts for real hosts are planned. The actions:
      - **Approve (`Enter`)** — sends `Enter` to the blocked pane in the background (via `ClientMessage::ClientShellPaneInput` or a `herdr remote-api-bridge` `pane.send_keys` / `agent.send_keys` exec channel).
+     - **Reject (`Esc`)** — sends `Esc` to the blocked pane in the background.
      - **Inline Reply (`RemoteInput`)** — lets the user type or dictate a reply directly from the notification shade or smartwatch.
 
 ### 4. Roaming & Network Handoff Resilience
 
 1. **Instant IP Roaming on Mosh UDP:**
    - Switching from home Wi-Fi to 5G cellular, or toggling a Tailscale/WireGuard tunnel, requires **zero reconnection** on the Mosh UDP backbone. Mosh's SSP layer authenticates each datagram via its AES-128-OCB sequence number and transparently migrates the remote peer endpoint.
-2. **Proactive `ConnectivityManager.NetworkCallback` for Control Sideband & SSH Fallback:**
-   - TCP streams (used by the Herdr control sideband and the SSH Endpoint fallback) normally stall for 30–120 seconds when the tablet's source IP changes.
-   - `BisonSessionService` registers a `ConnectivityManager.NetworkCallback`. Whenever `onAvailable` or `onLinkPropertiesChanged` fires for a new default network:
-     - It immediately sends a Mosh UDP wakeup datagram on the new network interface so `mosh-server` learns the new IP right away.
-     - It proactively recycles the background TCP control sideband (or SSH fallback stream) without waiting for kernel TCP retransmit timeouts.
+2. **Proactive `ConnectivityManager.NetworkCallback` for the SSH Session (this version):**
+   - The SSH session of each machine uses TCP. A TCP stream can stall for 30–120 seconds when the tablet's source IP changes.
+   - `BisonSessionService` registers a `ConnectivityManager.NetworkCallback` for the default network. On `onAvailable` and `onLinkPropertiesChanged`, `SshTransportManager.onNetworkAvailable` checks each connected machine a maximum of one time each second. The check sends an SSH keepalive and runs `exec true`, with a limit of 3 s. When the check fails, the session supervisor connects again at once, with no delay.
+   - On `onLost`, `SshTransportManager.onNetworkLost` sets `RoamingReconnect` and closes the SSH sockets. Thus no attempt waits for a TCP timeout on the old network. The reconnect loop then waits for the next `onAvailable`.
+   - The reconnect loop of `SessionSupervisor` also starts when a session closes. It waits 1, 2, 4, 8, 16, and then 30 s between failed attempts, with a random jitter of up to 25 percent (`ReconnectBackoff`). It tries again only after a network failure. A changed or unknown host key, a failed login, or a missing key stops the loop. The app then shows the cause until the user connects again.
+   - **Planned with Mosh ([issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22)):** a Mosh UDP wakeup datagram on the new network interface. Then `mosh-server` learns the new IP address at once.
 3. **Retained Surface Store & Optimistic Prompt Queueing:**
    - The last terminal frame and `ClientShellSnapshot` remain rendered on screen at all times—never blanked out by a modal disconnect screen.
-   - Prompts submitted in the **Native Prompt Composer** during a network handoff are queued locally per `(machine_id, pane_id)` and flushed automatically as soon as the stream acknowledges.
+   - Prompts submitted in the **Native Prompt Composer** during a network handoff are queued locally with their machine and pane. The app sends them in sequence after the reconnect, or after a network check that passes.
 
 ---
 
@@ -584,7 +597,7 @@ Following `SnapshotPB/settings.gradle.kts` (`enableFeaturePreview("TYPESAFE_PROJ
 /home/ian/workspace/herdr-tablet/
 ├── settings.gradle.kts               # Root Gradle settings (TYPESAFE_PROJECT_ACCESSORS)
 ├── build.gradle.kts                  # Root plugin declarations & Git-derived projectVersion
-├── gradle/libs.versions.toml         # Version catalog (Kotlin 2.3.20, Compose 1.10.3, Kodein 7.31.0, Nav3)
+├── gradle/libs.versions.toml         # Version catalog (Kotlin, Compose Multiplatform, Kodein, Nav3)
 ├── composite/                        # Pre-published build-logic plugin (composite/m2) with SHA-256 source digest version
 │   └── src/main/kotlin/com/toxicbakery/app/bison/composite/
 │       ├── CompositePlugin.kt
@@ -679,7 +692,7 @@ val coreDiModule = DI.Module("coreDiModule") {
     import(viewModelModule)
 
     // App-wide Json singleton configured with ignoreUnknownKeys = true and coerceInputValues = true
-    // so new optional server fields or unknown enum values in Endpoint Gen 1 never fail deserialization.
+    // so new optional server fields or unknown enum values in Herdr JSON payloads never fail deserialization.
     bindSingleton { appJson }
 }
 ```
@@ -807,7 +820,7 @@ val platformModule = DI.Module("platformModule") {
     import(sshModule)
 }
 
-// platform/android/di/src/main/kotlin/com/toxicbakery/app/bison/di/SshModule.kt
+// platform/android/di/src/main/kotlin/com/toxicbakery/app/bison/di/SshModule.kt (shortened)
 internal val sshModule = DI.Module("sshModule") {
     bindSingleton {
         MoshUdpEngine(
@@ -816,14 +829,27 @@ internal val sshModule = DI.Module("sshModule") {
         )
     }
     bindSingleton {
-        SshTransportManager(
-            context = instance<android.app.Application>(),
-            moshUdpEngine = instance(),
+        RealSshBackend(
             sshStateManager = instance(),
             sshDebugLog = instance(),
             endpointSnapshotBus = instance(),
             paneSurfaceBus = instance(),
             semanticNotificationBus = instance(),
+            keystoreKeyManager = instance(),
+            knownHostsStore = instance(),
+            secretStore = instance(),
+            machineStore = instance(),
+        )
+    }
+    // The debugModule of each build type binds SshBackend: release binds RealSshBackend only.
+    bindSingleton {
+        SshTransportManager(
+            backend = instance(),
+            moshUdpEngine = instance(),
+            sshStateManager = instance(),
+            sshDebugLog = instance(),
+            paneSurfaceBus = instance(),
+            proxyJumpTunnel = instance(),
         )
     }
 }
@@ -903,17 +929,17 @@ fun WorkspaceTerminalScreen(
 
 #### A. `SshRequestManager` + `SshStateManager` Cross-Layer Bus Pattern
 Just as `SnapshotPB` isolates BLE behind `BluetoothRequestManager` and `BluetoothStateManager`, shared code in `:core:common` never touches Android services, sockets, or `ConnectivityManager` directly:
-- **`SshRequestManager`** exposes a `SharedFlow<SshRequest>` event bus:
+- **`SshRequestManager`** exposes a `bus: Flow<SshRequest>` from a buffered `Channel` (capacity 64). A request waits in the channel until the collector receives it, and each request goes to one collector only:
   - `SshRequest.Connect(machineId)`
   - `SshRequest.Disconnect(machineId)`
   - `SshRequest.SetSurfaceLease(machineId, active: Boolean)`
   - `SshRequest.SendEndpointCommand(machineId, request: ClientShellEndpointRequest)`
   - `SshRequest.SendPaneInput(machineId, paneId, event: ClientPaneInputEvent)`
   - `SshRequest.ResizeShell(machineId, cols: UShort, rows: UShort)`
-- **`BisonSessionService` / `MainActivity`** collects `sshRequestManager.bus` inside `runCatching` (re-throwing `CancellationException` so one failed request never kills the collector coroutine) and dispatches to `debugServer.handle(request)` or `sshTransportManager`.
+- **`BisonSessionService`** is the only collector of `sshRequestManager.bus`. It collects the bus inside `runCatching` (re-throwing `CancellationException` so one failed request never kills the collector coroutine) and dispatches to `debugServer.handle(request)` or `sshTransportManager`.
 - **`SshStateManager`** exposes reactive `StateFlow`s consumed by ViewModels:
   - `connectedMachines: StateFlow<Set<String>>`
-  - `activeTransportBackbone: StateFlow<Map<String, ActiveBackbone>>` (`MoshUdp(udpPort, rttMs, localEchoEnabled)` primary when `mosh-server` is available, or `SshEndpoint(rttMs)` fallback)
+  - `activeTransportBackbone: StateFlow<Map<String, ActiveBackbone>>` (`SshEndpoint(rttMs, fallbackReason)` for each machine in this version, where `rttMs` is the measured poll time. When the host has `mosh-server`, `fallbackReason` tells that Mosh is not available in this version. `MoshUdp(udpPort, rttMs, localEchoEnabled)` is planned ([issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22)), and no backend makes it.)
   - `connectionProgress: StateFlow<Map<String, ConnectionProgress>>` (4-step progress: `AuthenticatingSsh` → `BootstrappingMoshOrBridge` → `VerifyingUdpOrHello` → `SyncingHerdrSnapshot`, surfaced in `ConnectingMachineScreen`)
   - `roamingState: StateFlow<Map<String, RoamingStatus>>` (`Healthy`, `SurfaceParked`, `RoamingReconnect`)
 
@@ -929,6 +955,9 @@ Modeled on `SnapshotPB`'s `DebugBoard` / `FakeBoard`:
 - `:core:fake-server` implements `FakeHerdrServer`, simulating multiple SSH hosts (`workbox`, `gpu-rig`), workspaces, BSP split layouts, live terminal cell animations, and coding agents (`claude`, `codex`) cycling through `working`, `blocked` (with permission prompts), and `done`.
 - `:app:android` depends on `:core:fake-server` via `debugImplementation(projects.core.fakeServer)`.
 - In debug builds, tapping the **BisonHerdr Demo** launcher icon (`DemoActivity`) launches `MainActivity` with `EXTRA_FAKE_SERVER = true`. Release builds bind `NoDebugServer` in `src/release/kotlin/.../DebugModule.kt`, guaranteeing at compile time that no fake server code ships in production.
+- `SimulatedSshBackend` and `SelectingSshBackend` are in the `src/debug` source set of `:platform:android:ssh`. The debug `DebugModule` uses the simulated backend only for the machines that `FakeHerdrServer` made. The host name has no effect. The release `DebugModule` binds `RealSshBackend` for all machines.
+- `ReleaseDebugModuleTest` in `src/testRelease` of `:app:android` checks that the release `DebugModule` gives `RealSshBackend` as the `SshBackend`, `NoDebugServer` as the `DebugServer`, and `CredentialValidator` as the `CredentialChecker`. The `android` CI target runs `testReleaseUnitTest`.
+- The `:app:android:checkReleaseClasses` task (`CheckReleaseClassesTask` in the composite build logic) reads the R8 mapping file of the release build. It fails when the release build has a class that only a debug build can have, or when it does not have `RealSshBackend` and `NoDebugServer`. Each class that only the debug build has must match a name in the debug-only list of the task. Thus a new debug-only class gets a name. A later move of the class to a main source set fails the check when R8 keeps the class. The `android` CI target runs the task after `assembleRelease`.
 
 #### D. Type-Safe Navigation with `androidx.navigation3`
 Modeled on `SnapshotPB/core/common/.../navigation/Screens.kt` and `Controller.kt`:
@@ -960,15 +989,16 @@ data class ScreenKeyMachineConfigure(
 #### E. Protocol Core, SSH Authentication Suite & Rendering Subsystems
 
 1. **Herdr Protocol Core (`:core:protocol`, Kotlin Multiplatform):**
-   - Implements the zero-drift Endpoint Generation 1 handshake (`endpoint.hello.v1` / `endpoint.welcome.v1`), `ClientShellSnapshot` (`shell.snapshot.v1`), and stateful cell buffer reconstruction (`PaneSurfaceFrame` + `endpoint.surface-delta.v1` / `endpoint.surface-reuse.v1` / `endpoint.surface-scroll.v1`) in pure Kotlin.
+   - Has the pure Kotlin models of the Endpoint Generation 1 handshake (`endpoint.hello.v1` / `endpoint.welcome.v1`) and of `ClientShellSnapshot` (`shell.snapshot.v1`). It also has the stateful cell buffer reconstruction (`PaneSurfaceFrame` + `endpoint.surface-delta.v1` / `endpoint.surface-reuse.v1` / `endpoint.surface-scroll.v1`). No code runs the handshake in this version. The real path puts the data of `herdr api snapshot` and `pane.read` into `ClientShellSnapshot` and `PaneSurfaceFrame`.
    - The standalone **`rust/herdr-protocol`** crate is a tested reference for the same wire types (`wire`, `endpoint`, `surface_delta`, `surface_reuse`, `surface_scroll`, plus `AgentStatus`, `WindowsKeyRecord`, `ToastHerdrPosition`, and `RgbColor`, with zero TUI or OS daemon dependencies). Gradle does not build it, and the app does not link it.
    - **Planned, not in this version:** a Rust JNI core with a **clean-room Apache-2.0 Mosh UDP SSP (`AES-128-OCB`, RFC 7253 + Protobuf `mosh.transport` / `mosh.host` / `mosh.user`) client engine**, client-side predictive echo, instant source-IP roaming, and `PaneSurfaceFrame` synthesis from a VT emulator (`libghostty-vt`) + `pane.layout`. It must use only permissive crates (never link or copy GPLv3 `mosh` code). [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work.
 
 2. **Full v1 SSH Authentication, ProxyJump & Hardware Key Suite (`:core:ssh` + `:platform:android:ssh` + JSch):**
-   - **Android Keystore Private Keys:** On-device generation and PEM/OpenSSH import of `Ed25519`, `RSA` (2048/4096), and `ECDSA` keys backed by hardware `AndroidKeyStore` (with optional biometric prompt unlock), invoked from a custom JSch `Identity` (`AndroidKeystoreJschIdentity`).
-   - **Password & Key Passphrase Authentication:** Encrypted credential storage plus interactive keyboard-interactive / passphrase prompts.
-   - **Tailscale / WireGuard & SSH Jump Hosts (`ProxyJump`):** Direct connection over Tailscale `100.x.y.z` / MagicDNS hostnames, plus multi-hop SSH bastion tunneling (`ProxyJump` over a JSch `direct-tcpip` channel) for both the SSH bootstrap and Herdr Control Sideband.
-   - **Hardware Security Keys (YubiKey / FIDO2 over NFC & USB-C, planned):** [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds the work for OpenSSH FIDO2 resident and non-resident keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) over Android NFC / USB CTAP2 with yubikit-android, bridged into JSch through a custom `Identity`. When a hardware key signature is requested during SSH auth, `SshRequest.PromptHardwareKeyTouch` triggers a floating sheet prompting the user to tap or touch their YubiKey.
+   - **Android Keystore Private Keys:** The app makes `Ed25519` (Android 13 and later), `RSA` 4096, and `ECDSA` P-256 keys in `AndroidKeyStore`. A custom JSch `Identity` (`AndroidKeystoreJschIdentity`) signs with them. The app shows the OpenSSH public key for `authorized_keys`. An optional biometric unlock shows a `BiometricPrompt` before the login. After a strong biometric or the device screen lock, the key can sign for 30 s. This version cannot import a PEM or OpenSSH private key file, and it makes no RSA 2048 key.
+   - **Password & Keyboard-Interactive Authentication:** The app encrypts each password with an `AndroidKeyStore` AES-GCM key (`AndroidKeystoreSecretStore`), and `machines.json` keeps only a `secret:` reference. A `keyboard-interactive` login shows each prompt of the server to the user. This version has no key passphrase, because it has no key files. No code reads `SshAuthMethod.Password.keyPassphraseRef`.
+   - **Known Hosts (Trust on First Use):** The first connection to a `host:port` asks the user to accept its host key. A changed host key stops the connection, and the error names the old and the new fingerprint. The machine settings list the saved host keys, with a delete action.
+   - **Tailscale / WireGuard & SSH Jump Hosts (`ProxyJump`):** The app connects directly to Tailscale `100.x.y.z` and MagicDNS host names as real SSH hosts. It also connects through a multi-hop SSH bastion (`ProxyJump` over a JSch `direct-tcpip` channel) for all SSH channels of the machine. The app sends the target host name as the user typed it, and the bastion resolves it. Thus a bastion that uses Tailscale MagicDNS resolves a MagicDNS short name. The bastion login uses the password or key of the machine.
+   - **Hardware Security Keys (YubiKey / FIDO2 over NFC & USB-C, planned):** This version does not offer the option, and it does not connect a machine that uses it. [Issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23) holds the work for OpenSSH FIDO2 resident and non-resident keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) over Android NFC / USB CTAP2 with yubikit-android, bridged into JSch through a custom `Identity`. When a hardware key signature is requested during SSH auth, `SshRequest.PromptHardwareKeyTouch` triggers a floating sheet prompting the user to tap or touch their YubiKey.
 
 3. **Hardware-Accelerated Compose Terminal Canvas (`:core:common/.../terminal/`):**
    - Renders `FrameData` cells using pre-shaped monospace glyph atlases, truecolor RGB (`0x02_RR_GG_BB`), 256-color palette (`0x01_00_00_XX`), curly underlines, Kitty graphics placements (`SurfaceGraphicsAsset`), and interactive split-handle overlays.
@@ -985,8 +1015,10 @@ data class ScreenKeyMachineConfigure(
 
 ### Phase 2: Hybrid Rust JNI Core (`rust/herdr-mobile-core`), Mosh UDP Backbone & SSH Auth Suite
 - **Rust JNI core: not started.** The prototype `rust/herdr-mobile-core` crate did not build and is deleted (item 13 of [`02-ssh-defects-issue-20.md`](02-ssh-defects-issue-20.md)). [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) holds the work. The target: a Rust JNI core exposing `russh` SSH2 channel multiplexing, Herdr's Endpoint Generation 1 `bincode` / `surface_delta` state machine, and the clean-room Apache-2.0 Mosh UDP SSP + `libghostty-vt` client over JNI.
-- Implement SSH bootstrap (`command -v mosh-server` + `mosh-server new -s -c 256 -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr` with `pane_borders = "off"`, `pane_outer_borders = false`, `pane_scrollbars = false`, `pane_gaps = false`), `MOSH CONNECT <port> <key>` parser, persistent `herdr remote-client-bridge` + multiplexed SSH2 `herdr remote-api-bridge` control sideband (routing Mosh focus RPCs via `herdr.sock`), automatic fallback to `herdr remote-client-bridge`, and the full SSH authentication suite (Android Keystore Ed25519/RSA/ECDSA, Password/Passphrase, Tailscale + `ProxyJump` bastion hopping, and YubiKey/FIDO2 NFC/USB signing).
-- Implement `BisonSessionService` (`ForegroundService` with `specialUse`), `ConnectivityManager.NetworkCallback` roaming supervisor, and zero-bandwidth background parking (`Mosh Suspend` + `client_shell.surface.set` + `endpoint.presentation.ready.v1`).
+- **Mosh bootstrap: planned** ([issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22)). The target: SSH bootstrap (`command -v mosh-server` + `mosh-server new -s -c 256 -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr` with `pane_borders = "off"`, `pane_outer_borders = false`, `pane_scrollbars = false`, `pane_gaps = false`), `MOSH CONNECT <port> <key>` parser, Mosh focus RPCs via `herdr.sock`, and automatic fallback to `herdr remote-client-bridge`. This version checks only for `mosh-server` and tells the result.
+- **SSH path: done.** One JSch session to the host of each machine, and one more to the bastion of a ProxyJump machine. The host session has two persistent `sh` channels that run `herdr api snapshot` and `herdr remote-api-bridge` requests. This version does not use the `herdr remote-client-bridge` Endpoint Gen 1 stream.
+- **SSH authentication suite: done, except the hardware keys.** This part has Android Keystore Ed25519/RSA-4096/ECDSA-P256 keys, encrypted passwords, keyboard-interactive prompts, and known hosts. It also has Tailscale hosts and `ProxyJump` bastion hopping over a `direct-tcpip` channel ([issue #20](https://github.com/ToxicBakery/BisonHerdr/issues/20)). **YubiKey/FIDO2 NFC/USB signing: planned** ([issue #23](https://github.com/ToxicBakery/BisonHerdr/issues/23)).
+- **Service and roaming: done for the SSH path.** This part has `BisonSessionService` (`ForegroundService` with `specialUse`), the `ConnectivityManager.NetworkCallback` session check, and the reconnect loop with backoff. It also has a background surface lease that pauses the pane reads. The `client_shell.surface.set` request is not sent in this version, and the `Mosh Suspend` part is planned ([issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22)).
 
 ### Phase 3: "Zen Canvas" (Design 2) UI, Terminal Renderer & All 19 Color Themes (`:core:common`)
 - Build the hardware-accelerated Compose `TerminalSurfaceCanvas` (cells, cursor shapes, scrollbars, Kitty graphics, and touch hit-testing) and wire all 18 Herdr color palettes + `OLED Pitch Black` with **`Gruvbox Dark` as default**.
@@ -994,7 +1026,7 @@ data class ScreenKeyMachineConfigure(
 
 ### Phase 4: Split-Thumb Floating Controls, Prompt Composer & Notifications
 - Build the ergonomic **Left & Right Split-Thumb Floating Key Clusters** (sticky/chorded `Ctrl`/`Alt`/`Shift`/`Esc`/`Tab` + swipe arrow trackpad).
-- Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste, and offline Mosh roaming queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
+- Build the **Center Floating Prompt Composer Pill** (expanding into a multi-line native Compose `OutlinedTextField` with voice dictation, image paste (planned), and an offline prompt queue) + inline Blocked-Agent `✓ Approve` / `✕ Reject` buttons and actionable Android System Notifications.
 
 ### Definition of Done (All Phases)
 - **Zero-Warning Builds:** Every Gradle/Kotlin build (`./gradlew build`) and the Cargo checks of `rust/herdr-protocol` (`cargo test -p herdr-protocol`, `cargo clippy -p herdr-protocol --all-targets -- -D warnings`) must complete **with zero warnings** and zero errors.

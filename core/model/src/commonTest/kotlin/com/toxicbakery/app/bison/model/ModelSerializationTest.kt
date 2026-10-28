@@ -70,7 +70,6 @@ class ModelSerializationTest {
                 bastionHost = "bastion.tailnet.ts.net",
                 bastionPort = 2222,
                 bastionUser = "jump",
-                tailscaleMagicDns = true,
             ),
             themeOverrideId = "gruvbox",
             fontSizeSp = 14f,

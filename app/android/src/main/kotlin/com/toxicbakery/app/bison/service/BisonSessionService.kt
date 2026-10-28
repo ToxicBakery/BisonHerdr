@@ -54,9 +54,13 @@ import org.kodein.di.android.closestDI
 import org.kodein.di.instance
 
 /**
- * Persistent foreground service keeping SSH sessions alive across activity backgrounding,
- * supervising `ConnectivityManager.NetworkCallback` fast-roaming, collecting [SshRequestManager.bus],
- * and posting actionable notifications for `Blocked` and `Done` coding agents.
+ * Foreground service that keeps the SSH sessions open while the activity is in the background. It collects
+ * [SshRequestManager.bus]. It gives each change of the default network to [SshTransportManager], which checks the
+ * sessions and connects again when a check fails.
+ *
+ * The service posts an alert with actions for each `Blocked` or `Done` event of [SemanticNotificationBus]. In this
+ * version, only the demo server sends these events, so a real host gives no agent alert. Agent alerts for real hosts
+ * are planned.
  *
  * The service stops itself when [ServiceStopPolicy] finds no connected machine, no connection in
  * progress, and no started activity for 30 s. [MainActivity] starts the service again in `onStart`.

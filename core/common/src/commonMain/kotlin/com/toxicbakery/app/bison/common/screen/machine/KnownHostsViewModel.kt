@@ -58,25 +58,16 @@ class KnownHostsViewModel(
     }
 
     companion object {
-        private const val MAGIC_DNS_SUFFIX = ".ts.net"
-
         /**
          * Returns the `host:port` endpoints that [machine] checks a host key for: the SSH host and, with
          * ProxyJump, the bastion host. This agrees with the host rule of `ProxyJumpTunnel.resolveRoute`:
-         * with Tailscale MagicDNS, a host name with no dot gets the `.ts.net` suffix.
+         * each endpoint has the host name that the user typed, with no change.
          */
         fun hostKeyEndpoints(machine: HostMachine): List<Pair<String, Int>> {
-            val proxy = machine.proxyJump
-            val hostname = machine.hostname.trim()
-            val targetHost = if (proxy?.tailscaleMagicDns == true && hostname.isNotEmpty() && '.' !in hostname) {
-                hostname + MAGIC_DNS_SUFFIX
-            } else {
-                hostname
-            }
-            val bastion = proxy
+            val bastion = machine.proxyJump
                 ?.takeIf { it.bastionHost.isNotBlank() }
                 ?.let { it.bastionHost.trim() to it.bastionPort }
-            return listOfNotNull(targetHost to machine.port, bastion)
+            return listOfNotNull(machine.hostname.trim() to machine.port, bastion)
         }
 
         /** Returns the entries of [knownHosts] for the endpoints of [machine]. See [hostKeyEndpoints]. */

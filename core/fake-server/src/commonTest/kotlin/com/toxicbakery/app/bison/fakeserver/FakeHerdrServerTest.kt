@@ -47,7 +47,7 @@ class FakeHerdrServerTest {
 
         assertTrue(stateManager.isMachineConnected("workbox"))
         assertTrue(stateManager.isMachineConnected("gpu-rig"))
-        // This version has no Mosh transport (issue #22), so the demo machines use the SSH endpoint bridge.
+        // This version has no Mosh transport (issue #22), so the demo machines use the SSH session backbone.
         assertTrue(stateManager.activeTransportBackbone.value["workbox"] is ActiveBackbone.SshEndpoint)
         assertTrue(stateManager.activeTransportBackbone.value["gpu-rig"] is ActiveBackbone.SshEndpoint)
 

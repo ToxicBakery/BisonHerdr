@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.store
 
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.TransportMode
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -50,6 +51,34 @@ class MachineStoreTest {
         assertTrue(store.isLoaded.value)
         assertEquals(1, store.knownMachines.value.size)
         assertEquals("workbox", store.getMachine("workbox")?.name)
+    }
+
+    /**
+     * An earlier version saved `tailscaleMagicDns` in the ProxyJump settings. This version has no such field, because
+     * the bastion resolves the host name. The old file must still load, and the next write must not keep the field.
+     */
+    @Test
+    fun oldMachinesFileWithTailscaleMagicDnsStillLoadsAndTheNextWriteRemovesTheField() = runTest {
+        val oldMachinesFile = """
+            [{"id":"devbox","name":"Devbox","hostname":"devbox","port":22,"username":"ian",
+              "proxyJump":{"bastionHost":"100.64.0.1","bastionPort":22,"bastionUser":"ts","tailscaleMagicDns":true}}]
+        """.trimIndent()
+        val io = InMemoryStoreIOProvider(mapOf(MachineStore.MACHINES_FILE_NAME to oldMachinesFile))
+        val store = MachineStore(
+            storeIOProvider = io,
+            json = appJson,
+            scope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler)),
+        )
+        store.awaitLoaded()
+
+        val machine = assertNotNull(store.getMachine("devbox"))
+        assertEquals("devbox", machine.hostname)
+        assertEquals(ProxyJumpConfig(bastionHost = "100.64.0.1", bastionPort = 22, bastionUser = "ts"), machine.proxyJump)
+
+        store.updateFontSize("devbox", 15f)
+        val written = assertNotNull(io.readText(MachineStore.MACHINES_FILE_NAME))
+        assertFalse("tailscaleMagicDns" in written, written)
+        assertEquals(listOf(machine.copy(fontSizeSp = 15f)), appJson.decodeFromString<List<HostMachine>>(written))
     }
 
     @Test

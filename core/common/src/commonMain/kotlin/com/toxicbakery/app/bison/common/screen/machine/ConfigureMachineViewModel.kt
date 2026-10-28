@@ -89,7 +89,6 @@ class ConfigureMachineViewModel(
         val bastionHost: String = "",
         val bastionPortText: String = "22",
         val bastionUser: String = "",
-        val tailscaleMagicDns: Boolean = false,
         val themeOverrideId: String? = null,
         val fontSizeSp: Float = HostMachine.DEFAULT_FONT_SIZE_SP,
         val validationError: String? = null,
@@ -154,7 +153,6 @@ class ConfigureMachineViewModel(
         data class UpdateBastionHost(val host: String) : Event
         data class UpdateBastionPort(val portText: String) : Event
         data class UpdateBastionUser(val user: String) : Event
-        data class UpdateTailscaleMagicDns(val enabled: Boolean) : Event
         data class UpdateThemeOverride(val themeId: String?) : Event
         data object SaveMachine : Event
         data object SaveAndConnect : Event
@@ -216,7 +214,6 @@ class ConfigureMachineViewModel(
             is Event.UpdateBastionHost -> updateState { it.copy(bastionHost = event.host) }
             is Event.UpdateBastionPort -> updateState { it.copy(bastionPortText = event.portText) }
             is Event.UpdateBastionUser -> updateState { it.copy(bastionUser = event.user) }
-            is Event.UpdateTailscaleMagicDns -> updateState { it.copy(tailscaleMagicDns = event.enabled) }
             is Event.UpdateThemeOverride -> updateState { it.copy(themeOverrideId = event.themeId) }
             Event.SaveMachine -> saveMachine(connectImmediately = false)
             Event.SaveAndConnect -> saveMachine(connectImmediately = true)
@@ -374,7 +371,6 @@ class ConfigureMachineViewModel(
                 bastionHost = current.bastionHost.trim(),
                 bastionPort = current.bastionPortText.trim().toIntOrNull()?.coerceIn(1, 65535) ?: 22,
                 bastionUser = current.bastionUser.trim().ifBlank { current.username.trim() },
-                tailscaleMagicDns = current.tailscaleMagicDns,
             )
         } else {
             null
@@ -510,7 +506,6 @@ class ConfigureMachineViewModel(
                 bastionHost = pj?.bastionHost.orEmpty(),
                 bastionPortText = (pj?.bastionPort ?: 22).toString(),
                 bastionUser = pj?.bastionUser.orEmpty(),
-                tailscaleMagicDns = pj?.tailscaleMagicDns ?: false,
                 themeOverrideId = existing.themeOverrideId,
                 fontSizeSp = existing.fontSizeSp,
             )

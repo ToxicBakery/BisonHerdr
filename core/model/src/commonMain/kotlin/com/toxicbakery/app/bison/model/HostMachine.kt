@@ -57,17 +57,17 @@ data class HostMachine(
 enum class TransportMode {
     /**
      * Prefer Mosh UDP when it is available. This version has no Mosh transport (issue #22), so the app connects
-     * over SSH Endpoint Gen 1. It checks for `mosh-server` and tells when the host has it.
+     * over SSH ([ActiveBackbone.SshEndpoint]). It checks for `mosh-server` and tells when the host has it.
      */
     AutoPreferMosh,
 
     /**
-     * Use only Mosh UDP. This version has no Mosh transport (issue #22), so the app connects over SSH Endpoint
-     * Gen 1, as for [AutoPreferMosh].
+     * Use only Mosh UDP. This version has no Mosh transport (issue #22), so the app connects over SSH, as for
+     * [AutoPreferMosh].
      */
     MoshOnly,
 
-    /** Connect exclusively over SSH TCP using `herdr remote-client-bridge` (Endpoint Generation 1). */
+    /** Connect only over SSH ([ActiveBackbone.SshEndpoint]). The app does not look for `mosh-server`. */
     SshEndpointOnly,
 }
 
@@ -151,12 +151,17 @@ enum class HardwareKeyTransport {
 }
 
 /**
- * Multi-hop SSH bastion (`ProxyJump` / `direct-tcpip`) and Tailscale MagicDNS configuration.
+ * Multi-hop SSH bastion (`ProxyJump` / `direct-tcpip`) configuration.
+ *
+ * The bastion resolves the host name of the target machine. Thus a bastion that uses Tailscale MagicDNS resolves a
+ * MagicDNS short name with no added option. An earlier version had a `tailscaleMagicDns` field that added `.ts.net`
+ * to a short name. A real MagicDNS name is `<machine>.<tailnet>.ts.net`, so that name never resolved. The store
+ * JSON (`appJson`) ignores unknown keys, so an old `machines.json` with the field still loads. The next save
+ * removes the field.
  */
 @Serializable
 data class ProxyJumpConfig(
     val bastionHost: String,
     val bastionPort: Int = 22,
     val bastionUser: String,
-    val tailscaleMagicDns: Boolean = false,
 )
