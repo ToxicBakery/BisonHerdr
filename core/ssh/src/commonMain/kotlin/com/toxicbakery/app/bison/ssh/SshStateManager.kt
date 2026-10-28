@@ -44,6 +44,11 @@ class SshStateManager {
     private val _hardwareKeyTouchPrompt = MutableStateFlow<SshRequest.PromptHardwareKeyTouch?>(null)
     val hardwareKeyTouchPrompt: StateFlow<SshRequest.PromptHardwareKeyTouch?> = _hardwareKeyTouchPrompt.asStateFlow()
 
+    private val _hostKeyPrompts = MutableStateFlow<Map<String, HostKeyPrompt>>(emptyMap())
+
+    /** The open host key decisions, by machine id. See [HostKeyPrompt]. */
+    val hostKeyPrompts: StateFlow<Map<String, HostKeyPrompt>> = _hostKeyPrompts.asStateFlow()
+
     private val _queuedPrompts = MutableStateFlow<Map<String, List<QueuedPrompt>>>(emptyMap())
     val queuedPrompts: StateFlow<Map<String, List<QueuedPrompt>>> = _queuedPrompts.asStateFlow()
 
@@ -105,6 +110,16 @@ class SshStateManager {
 
     fun dismissHardwareKeyTouchPrompt() {
         _hardwareKeyTouchPrompt.value = null
+    }
+
+    /** Puts [prompt] in [hostKeyPrompts]. It replaces the open prompt of the same machine. */
+    fun setHostKeyPrompt(prompt: HostKeyPrompt) {
+        _hostKeyPrompts.update { it + (prompt.machineId to prompt) }
+    }
+
+    /** Removes the open host key prompt of [machineId]. */
+    fun clearHostKeyPrompt(machineId: String) {
+        _hostKeyPrompts.update { it - machineId }
     }
 
     fun enqueuePrompt(prompt: QueuedPrompt) {

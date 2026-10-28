@@ -30,6 +30,7 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceScroll
 import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -80,12 +81,16 @@ import kotlinx.serialization.json.put
  * Uses two dedicated persistent POSIX `sh` worker channels per machine ([WorkerLane.Input] and [WorkerLane.Poll])
  * over `TCP_NODELAY` sockets with client-side optimistic local echo (`<1ms`), keystroke coalescing, and
  * focused-pane-only reads so interactive typing never spawns per-key SSH channels or blocks behind background polls.
+ *
+ * Each session checks the server host key against [knownHostsStore] through [KnownHostsRepository] before it
+ * sends credentials. An unknown or changed key stops the session with a [HostKeyRejectedException].
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
     private val endpointSnapshotBus: EndpointSnapshotBus,
     private val paneSurfaceBus: PaneSurfaceBus,
     private val semanticNotificationBus: SemanticNotificationBus,
+    private val knownHostsStore: KnownHostsStore,
     private val keystoreKeyManagerProvider: () -> AndroidKeystoreKeyManager = { AndroidKeystoreKeyManager() },
     private val remoteBatchExecutor: (
         suspend (
@@ -186,6 +191,7 @@ internal class RealHerdrSshClient(
 
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val knownHostsRepository = KnownHostsRepository(knownHostsStore)
     private val sessions = ConcurrentHashMap<String, Session>()
     private val sessionOpenLocks = ConcurrentHashMap<String, Mutex>()
     private val inputLaneLocks = ConcurrentHashMap<String, Mutex>()
@@ -1392,6 +1398,8 @@ internal class RealHerdrSshClient(
             }
             inputWorkers.remove(machine.id)?.close()
             pollWorkers.remove(machine.id)?.close()
+            // The host key check reads only the loaded entries.
+            knownHostsStore.awaitLoaded()
             JschAndroidCrypto.installGlobalDefaults()
             val jsch = JSch()
             val preferredAuths = when (val auth = machine.authMethod) {
@@ -1420,7 +1428,6 @@ internal class RealHerdrSshClient(
                 session.setPassword(passwordAuth.encryptedPasswordRef.encodeToByteArray())
             }
             val props = Properties().apply {
-                put("StrictHostKeyChecking", "no")
                 put("PreferredAuthentications", preferredAuths)
                 put("Compression", "none")
             }
@@ -1431,7 +1438,7 @@ internal class RealHerdrSshClient(
                 session.setServerAliveCountMax(3)
             }
             JschAndroidCrypto.configureSession(session)
-            session.connect(SOCKET_CONNECT_TIMEOUT_MS)
+            knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
             sessions[machine.id] = session
             session
         }

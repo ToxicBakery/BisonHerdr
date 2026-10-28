@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.CellData
@@ -187,5 +188,32 @@ class SshManagersAndBusesTest {
         assertEquals(2, lanEntries.size)
         assertTrue(lanEntries[0].id > 0L)
         assertTrue(lanEntries[1].id > lanEntries[0].id)
+    }
+
+    @Test
+    fun hostKeyPromptsKeepOnePromptForEachMachine() {
+        val stateManager = SshStateManager()
+        val key = KnownHost(
+            host = "devbox.local",
+            port = 22,
+            keyType = "ssh-ed25519",
+            fingerprint = "SHA256:abc",
+            publicKey = "AAAA",
+        )
+        val unknown = HostKeyPrompt.Unknown(machineId = "workbox", presented = key)
+        val changed = HostKeyPrompt.Changed(
+            machineId = "workbox",
+            known = key,
+            presented = key.copy(fingerprint = "SHA256:def"),
+        )
+        val other = HostKeyPrompt.Unknown(machineId = "gpu-rig", presented = key)
+
+        stateManager.setHostKeyPrompt(unknown)
+        stateManager.setHostKeyPrompt(other)
+        stateManager.setHostKeyPrompt(changed)
+        assertEquals(mapOf("workbox" to changed, "gpu-rig" to other), stateManager.hostKeyPrompts.value)
+
+        stateManager.clearHostKeyPrompt("workbox")
+        assertEquals(mapOf("gpu-rig" to other), stateManager.hostKeyPrompts.value)
     }
 }

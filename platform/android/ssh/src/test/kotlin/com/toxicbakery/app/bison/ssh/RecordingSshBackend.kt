@@ -8,9 +8,10 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * An [SshBackend] that records each call and opens no connection. [authenticate] returns [authResult].
+ * A test can change [authResult] between two calls.
  */
 internal class RecordingSshBackend(
-    private val authResult: SshAuthResult = SshAuthResult.Success,
+    @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
 ) : SshBackend {
 
     /** One entry for each call: the method name and the machine id, for example `resize workbox`. */

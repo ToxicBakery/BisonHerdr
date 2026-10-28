@@ -12,6 +12,8 @@ import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
 import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -237,6 +239,7 @@ class SshPlatformTest {
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
+            knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
             remoteBatchExecutor = { _, _, lane, commands ->
                 if (lane == RealHerdrSshClient.WorkerLane.Input) inputLaneGate.await()
                 synchronized(recordedBatches) {
