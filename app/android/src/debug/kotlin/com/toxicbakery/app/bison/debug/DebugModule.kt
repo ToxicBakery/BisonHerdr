@@ -28,7 +28,6 @@ internal val debugModule = DI.Module("debugModule") {
         SelectingSshBackend(
             real = instance<RealSshBackend>(),
             simulated = SimulatedSshBackend(
-                moshUdpEngine = instance(),
                 sshStateManager = instance(),
                 sshDebugLog = instance(),
                 endpointSnapshotBus = instance(),

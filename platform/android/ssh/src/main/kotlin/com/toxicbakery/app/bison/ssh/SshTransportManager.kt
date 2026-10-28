@@ -34,22 +34,23 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Android SSH2 + Mosh UDP SSP + Herdr Endpoint Generation 1 transport coordinator.
+ * Android SSH2 + Herdr Endpoint Generation 1 transport coordinator.
  *
  * Implements the 4-phase Connection Lifecycle State Machine (`Part IV.1 & IV.2` of `01-core-app-design.md`):
  * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
  *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
- * 2. `BootstrappingMoshOrBridge`: Probes `command -v mosh-server` and launches
- *    `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`,
- *    parsing `MOSH CONNECT <port> <key>` and running the `1,500 ms` UDP reachability handshake.
- * 3. Automatic fallback to [ActiveBackbone.SshEndpoint] (`herdr remote-client-bridge --idle-timeout-v1` with
- *    `surface_active: true`) when `mosh-server` is unavailable or UDP is blocked.
- * 4. Persistent Control Sideband (`herdr remote-client-bridge` with `surface_active: false` when Mosh is active)
- *    + multiplexed SSH2 `herdr remote-api-bridge` exec channels for `events.subscribe`, `pane.layout`,
- *    `agent.read` (`source: "visible"`), `agent.prompt`, and routing Mosh focus RPCs via `herdr.sock`
- *    ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]).
+ * 2. `BootstrappingMoshOrBridge`: The backend selects the backbone ([SshBackend.negotiateBackbone]). This version
+ *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]
+ *    (`herdr remote-client-bridge --idle-timeout-v1` with `surface_active: true`). When the host has
+ *    `mosh-server`, the backbone tells it in [ActiveBackbone.SshEndpoint.fallbackReason].
+ * 3. `VerifyingUdpOrHello`: The Herdr Endpoint Gen 1 hello over the SSH session.
+ * 4. Persistent Control Sideband (`herdr remote-client-bridge`) + multiplexed SSH2 `herdr remote-api-bridge` exec
+ *    channels for `events.subscribe`, `pane.layout`, `agent.read` (`source: "visible"`), and `agent.prompt`.
  * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]
  *    and [onNetworkLost]).
+ *
+ * The code for a Mosh backbone ([ActiveBackbone.MoshUdp] and [moshUdpEngine]) stays for issue #22, but the
+ * backends never select it, and [MoshUdpEngine] starts no session.
  *
  * The manager keeps the connection state. [backend] does the work that uses the connection to the machine.
  *
@@ -354,7 +355,7 @@ class SshTransportManager(
     /**
      * Toggles the zero-bandwidth surface lease (`onStop()` -> `active = false`, `onStart()` -> `active = true`).
      *
-     * - Suspends/wakes the Mosh UDP SSP engine (`0 bytes/sec` in background).
+     * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
      * - Sends `client_shell.surface.set { active }` over the Herdr control stream.
      * - When resuming (`active == true`), arms `endpoint.presentation.sync.v1` and replies with
      *   `endpoint.presentation.ready.v1` as soon as the fresh [PaneSurfaceFrame] is committed.
@@ -397,7 +398,8 @@ class SshTransportManager(
     /**
      * Routes a Herdr RPC over either `herdr remote-api-bridge` (`herdr.sock`) or
      * `ClientMessage::ClientShellEndpointRequest` (`herdr-client.sock`):
-     * - In Mosh UDP mode, focus/navigation RPCs (`workspace.focus`, `tab.focus`, `pane.focus`, `agent.focus`)
+     * - In Mosh UDP mode (not in this version, issue #22), focus/navigation RPCs (`workspace.focus`, `tab.focus`,
+     *   `pane.focus`, `agent.focus`)
      *   are always dispatched over `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode])
      *   so `focus_all_shell_clients_on_default_target()` switches the Mosh `herdr` view.
      * - Non-`client_shell` methods (`agent.read`, `pane.read`, `agent.prompt`, `pane.send_input`, `pane.layout`)
@@ -516,8 +518,8 @@ class SshTransportManager(
     }
 
     /**
-     * Resizes the remote terminal viewport (`ClientSurfaceSize(cols, rows)`) on both the Mosh UDP SSP
-     * engine and the Herdr Endpoint control stream.
+     * Resizes the remote terminal viewport (`ClientSurfaceSize(cols, rows)`) on the Herdr Endpoint control stream,
+     * and on the Mosh engine when it has a session. This version has no Mosh session (issue #22).
      */
     suspend fun resizeShell(
         machineId: String,
@@ -544,9 +546,9 @@ class SshTransportManager(
      * For [machineId], or for each connected machine when it is null, the manager does these steps. It does them
      * one time in each [NETWORK_CHECK_INTERVAL] for each machine, and ignores the calls between. The machines get
      * their checks at the same time, and each check has its own timeout.
-     * - On the Mosh backbone, it sends a wakeup datagram, so that `mosh-server` gets the new address of the client.
-     * - It runs a liveness check with a timeout of [LIVENESS_TIMEOUT]: a keepalive message and one `exec true`. Each
-     *   backbone uses the SSH session for its control commands, so the check runs for each backbone.
+     * - On the Mosh backbone, it tells [MoshUdpEngine] about the network change. This version has no Mosh backbone
+     *   (issue #22).
+     * - It runs a liveness check with a timeout of [LIVENESS_TIMEOUT]: a keepalive message and one `exec true`.
      * - When the check fails, it sets [RoamingStatus.RoamingReconnect] and asks the backend to reconnect now, with
      *   no delay. It gives the session of the check, so that the backend keeps a newer session. After the
      *   reconnect, the reconnect events restore the status and send the queued prompts.
@@ -817,7 +819,6 @@ class SshTransportManager(
         }
 
     companion object {
-        const val MOSH_UDP_HANDSHAKE_TIMEOUT_MS: Long = 1_500L
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
         internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
         internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
@@ -850,6 +851,7 @@ class SshTransportManager(
         /**
          * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet
          * `HERDR_CONFIG_PATH` config, and launches `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`.
+         * No code runs this command in this version. Issue #22 adds the Mosh path.
          */
         fun buildMoshServerBootstrapCommand(machine: HostMachine): String {
             val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"

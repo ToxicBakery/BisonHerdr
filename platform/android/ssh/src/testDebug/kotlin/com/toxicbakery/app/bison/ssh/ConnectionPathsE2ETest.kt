@@ -9,7 +9,9 @@ import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
+import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import java.security.ProviderException
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -23,7 +25,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
@@ -35,6 +36,9 @@ import kotlinx.coroutines.test.runTest
  * Covers Paths 1A..6C across [SshTransportManager], [SimulatedSshBackend], [MoshUdpEngine], [ProxyJumpTunnel],
  * [AndroidKeystoreKeyManager], [SshStateManager], [EndpointSnapshotBus],
  * [PaneSurfaceBus], and [SemanticNotificationBus].
+ *
+ * This version has no Mosh transport (issue #22). Each path thus connects over the SSH endpoint bridge, and the
+ * Mosh engine starts no session.
  *
  * [SimulatedSshBackend] is in the `src/debug` source set, so these tests are in `src/testDebug`.
  */
@@ -55,7 +59,6 @@ class ConnectionPathsE2ETest {
             paneSurfaceBus = surfaceBus,
         )
         val backend = SimulatedSshBackend(
-            moshUdpEngine = moshEngine,
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             endpointSnapshotBus = snapshotBus,
@@ -73,8 +76,22 @@ class ConnectionPathsE2ETest {
         )
     }
 
+    /** Returns the lane of [request] on the SSH endpoint bridge while the surface lease is on. */
+    private fun expectedLane(request: ClientShellEndpointRequest): String =
+        if (MoshBootstrapConfig.isClientShellSupportedMethod(request.method)) {
+            SshTransportManager.CLIENT_BRIDGE_LANE
+        } else {
+            SshTransportManager.API_BRIDGE_LANE
+        }
+
+    /** Sends [request] to [machineId] and asserts that it went on the lane of the SSH endpoint bridge. */
+    private suspend fun Harness.assertSentOnSshEndpointLane(machineId: String, request: ClientShellEndpointRequest) {
+        val response = transport.sendEndpointCommand(machineId, request)
+        assertTrue(response?.contains(expectedLane(request)) == true, "Wrong lane for ${request.method}: $response")
+    }
+
     @Test
-    fun path1A_autoPreferMosh_moshUdpSuccess_fourStageProgression_bspSplits_andFocusRpcs() = runTest {
+    fun path1A_autoPreferMosh_hostWithMoshServer_connectsOverTheSshEndpoint_andRoutesFocusRpcs() = runTest {
         val h = Harness()
         val observedStages = mutableListOf<ConnectionProgress>()
         val collectorJob = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -109,11 +126,11 @@ class ConnectionPathsE2ETest {
             observedStages,
         )
 
-        // 2. Verify ActiveBackbone.MoshUdp, ClientShellSnapshot, and synthesized PaneSurfaceFrame with BSP splits
-        val backbone = assertIs<ActiveBackbone.MoshUdp>(h.stateManager.activeTransportBackbone.value["workbox-1a"])
-        assertEquals(60010, backbone.udpPort)
-        assertTrue(backbone.localEchoEnabled)
-        assertEquals(0, backbone.roamedCount)
+        // 2. The host has mosh-server, but this version connects over the SSH endpoint and tells why.
+        val backbone = assertIs<ActiveBackbone.SshEndpoint>(h.stateManager.activeTransportBackbone.value["workbox-1a"])
+        assertEquals(SimulatedSshBackend.SIMULATED_RTT_MS, backbone.rttMs)
+        assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, backbone.fallbackReason)
+        assertFalse(h.moshEngine.isSessionActive("workbox-1a"))
 
         val initialSnapshot = assertNotNull(h.snapshotBus.snapshotFor("workbox-1a"))
         assertEquals("w1", initialSnapshot.focusedWorkspaceId)
@@ -122,38 +139,29 @@ class ConnectionPathsE2ETest {
 
         val initialSurface = assertNotNull(h.surfaceBus.surfaceFor("workbox-1a"))
         assertEquals(2, initialSurface.panes.size)
-        assertTrue(initialSurface.splits.isNotEmpty(), "Expected BSP split derived from PaneLayoutSnapshot")
-        assertEquals("s0:root", initialSurface.splits.first().id)
 
-        // 3. Verify focus RPCs in Mosh mode route through herdr.sock (remote-api-bridge) and update snapshot/surface
-        val wsResp = h.transport.sendEndpointCommand("workbox-1a", HerdrRpcBuilder.workspaceFocus("w2"))
-        assertTrue(wsResp?.contains("herdr remote-api-bridge (herdr.sock)") == true)
+        // 3. Focus RPCs go on the lanes of the SSH endpoint bridge and update the snapshot and the surface.
+        h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.workspaceFocus("w2"))
         assertEquals("w2", h.snapshotBus.snapshotFor("workbox-1a")?.focusedWorkspaceId)
 
-        val tabResp = h.transport.sendEndpointCommand("workbox-1a", HerdrRpcBuilder.tabFocus("w1:t2"))
-        assertTrue(tabResp?.contains("herdr remote-api-bridge (herdr.sock)") == true)
+        h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.tabFocus("w1:t2"))
         assertEquals("w1:t2", h.snapshotBus.snapshotFor("workbox-1a")?.focusedTabId)
 
-        val paneResp = h.transport.sendEndpointCommand("workbox-1a", HerdrRpcBuilder.paneFocus("w1:p2"))
-        assertTrue(paneResp?.contains("herdr remote-api-bridge (herdr.sock)") == true)
+        h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.paneFocus("w1:p2"))
         assertEquals("w1:p2", h.snapshotBus.snapshotFor("workbox-1a")?.focusedPaneId)
         val surfaceAfterPaneFocus = assertNotNull(h.surfaceBus.surfaceFor("workbox-1a"))
         assertTrue(surfaceAfterPaneFocus.panes.first { it.paneId == "w1:p2" }.focused)
 
-        val agentResp = h.transport.sendEndpointCommand(
-            "workbox-1a",
-            HerdrRpcBuilder.agentFocus(paneId = "w1:p1", name = "claude"),
-        )
-        assertTrue(agentResp?.contains("herdr remote-api-bridge (herdr.sock)") == true)
+        h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.agentFocus(paneId = "w1:p1", name = "claude"))
         assertEquals("w1:p1", h.snapshotBus.snapshotFor("workbox-1a")?.focusedPaneId)
         val surfaceAfterAgentFocus = assertNotNull(h.surfaceBus.surfaceFor("workbox-1a"))
         assertTrue(surfaceAfterAgentFocus.panes.first { it.paneId == "w1:p1" }.focused)
     }
 
     @Test
-    fun path1B_autoPreferMosh_moshServerMissing_fallsBackToSshEndpoint() = runTest {
+    fun path1B_autoPreferMosh_moshServerMissing_connectsOverTheSshEndpointWithNoReason() = runTest {
         val h = Harness()
-        h.backend.moshBootstrapBannerProvider = { "sh: 1: mosh-server: not found" }
+        h.backend.moshServerProbe = { false }
 
         val machine = HostMachine(
             id = "host-1b",
@@ -167,10 +175,10 @@ class ConnectionPathsE2ETest {
         assertEquals(ConnectionProgress.Connected, h.stateManager.connectionProgress.value["host-1b"])
 
         val backbone = assertIs<ActiveBackbone.SshEndpoint>(h.stateManager.activeTransportBackbone.value["host-1b"])
-        val reason = assertNotNull(backbone.fallbackReason)
-        assertTrue(reason.contains("mosh-server", ignoreCase = true))
+        assertNull(backbone.fallbackReason)
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "host-1b" }
+        assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
         assertTrue(
             logs.any {
                 it.tag == "EndpointGen1" &&
@@ -183,41 +191,10 @@ class ConnectionPathsE2ETest {
     }
 
     @Test
-    fun path1C_autoPreferMosh_udpFirewallBlockedAndHandshakeTimeout_fallsBackToSshEndpoint() = runTest {
-        val h = Harness()
-        h.backend.moshBootstrapBannerProvider = { "MOSH CONNECT 60042 4k9X2vL8pQ1mN7rT3wY6zA" }
-        h.backend.moshUdpReachabilityProbe = { _, _ ->
-            // Simulate UDP packets dropped by firewall exceeding the 1,500ms handshake timeout
-            delay(SshTransportManager.MOSH_UDP_HANDSHAKE_TIMEOUT_MS + 500L)
-            true
-        }
-
-        val machine = HostMachine(
-            id = "host-1c",
-            name = "Host 1C",
-            hostname = "203.0.113.50",
-            username = "ian",
-            transportMode = TransportMode.AutoPreferMosh,
-        )
-
-        assertTrue(h.transport.connect(machine))
-        assertEquals(ConnectionProgress.Connected, h.stateManager.connectionProgress.value["host-1c"])
-        assertFalse(h.moshEngine.isSessionActive("host-1c"))
-
-        val backbone = assertIs<ActiveBackbone.SshEndpoint>(h.stateManager.activeTransportBackbone.value["host-1c"])
-        val fallbackReason = assertNotNull(backbone.fallbackReason)
-        assertTrue(
-            fallbackReason.contains("UDP", ignoreCase = true) &&
-                (fallbackReason.contains("unreachable", ignoreCase = true) ||
-                    fallbackReason.contains("blocked", ignoreCase = true)),
-        )
-    }
-
-    @Test
-    fun path2A_and_2B_moshOnly_succeedsWithUdp_andFailsWithoutFallingBackWhenMissingOrBlocked() = runTest {
-        // Path 2A: MoshOnly succeeds when mosh-server + UDP succeed
-        val hSuccess = Harness()
-        val moshSuccessHost = HostMachine(
+    fun path2_moshOnly_connectsOverTheSshEndpoint_becauseThisVersionHasNoMosh() = runTest {
+        // Path 2A: The host has mosh-server. The backbone tells that Mosh is not available.
+        val hWithServer = Harness()
+        val moshOnlyHost = HostMachine(
             id = "mosh-2a",
             name = "Mosh 2A",
             hostname = "100.64.0.21",
@@ -225,39 +202,32 @@ class ConnectionPathsE2ETest {
             transportMode = TransportMode.MoshOnly,
             moshUdpPortRange = "60050:60060",
         )
-        assertTrue(hSuccess.transport.connect(moshSuccessHost))
-        val moshBackbone = assertIs<ActiveBackbone.MoshUdp>(
-            hSuccess.stateManager.activeTransportBackbone.value["mosh-2a"],
+        assertTrue(hWithServer.transport.connect(moshOnlyHost))
+        val withServer = assertIs<ActiveBackbone.SshEndpoint>(
+            hWithServer.stateManager.activeTransportBackbone.value["mosh-2a"],
         )
-        assertEquals(60050, moshBackbone.udpPort)
+        assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, withServer.fallbackReason)
+        assertFalse(hWithServer.moshEngine.isSessionActive("mosh-2a"))
 
-        // Path 2B (part 1): MoshOnly fails when mosh-server is missing (no SSH TCP fallback)
+        // Path 2B: The host has no mosh-server. The machine still connects over the SSH endpoint.
         val hMissing = Harness()
-        hMissing.backend.moshBootstrapBannerProvider = { "command not found: mosh-server" }
-        val moshMissingHost = moshSuccessHost.copy(id = "mosh-2b-missing")
-        assertFalse(hMissing.transport.connect(moshMissingHost))
-        assertEquals(ConnectionProgress.Failed, hMissing.stateManager.connectionProgress.value["mosh-2b-missing"])
-        assertNull(hMissing.stateManager.activeTransportBackbone.value["mosh-2b-missing"])
-        assertFalse(hMissing.stateManager.isMachineConnected("mosh-2b-missing"))
-
-        // Path 2B (part 2): MoshOnly fails when UDP handshake is blocked/times out (no SSH TCP fallback)
-        val hBlocked = Harness()
-        hBlocked.backend.moshBootstrapBannerProvider = { "MOSH CONNECT 60055 4k9X2vL8pQ1mN7rT3wY6zA" }
-        hBlocked.backend.moshUdpReachabilityProbe = { _, _ -> false }
-        val moshBlockedHost = moshSuccessHost.copy(id = "mosh-2b-blocked")
-        assertFalse(hBlocked.transport.connect(moshBlockedHost))
-        assertEquals(ConnectionProgress.Failed, hBlocked.stateManager.connectionProgress.value["mosh-2b-blocked"])
-        assertNull(hBlocked.stateManager.activeTransportBackbone.value["mosh-2b-blocked"])
-        assertFalse(hBlocked.stateManager.isMachineConnected("mosh-2b-blocked"))
+        hMissing.backend.moshServerProbe = { false }
+        val missingHost = moshOnlyHost.copy(id = "mosh-2b-missing")
+        assertTrue(hMissing.transport.connect(missingHost))
+        assertEquals(ConnectionProgress.Connected, hMissing.stateManager.connectionProgress.value["mosh-2b-missing"])
+        val missing = assertIs<ActiveBackbone.SshEndpoint>(
+            hMissing.stateManager.activeTransportBackbone.value["mosh-2b-missing"],
+        )
+        assertNull(missing.fallbackReason)
     }
 
     @Test
     fun path3_sshEndpointOnly_skipsMoshProbeAndConnectsDirectlyViaRemoteClientBridge() = runTest {
         val h = Harness()
-        var moshBannerProbed = false
-        h.backend.moshBootstrapBannerProvider = {
-            moshBannerProbed = true
-            "MOSH CONNECT 60000 4k9X2vL8pQ1mN7rT3wY6zA"
+        var moshServerProbed = false
+        h.backend.moshServerProbe = {
+            moshServerProbed = true
+            true
         }
 
         val machine = HostMachine(
@@ -269,7 +239,7 @@ class ConnectionPathsE2ETest {
         )
 
         assertTrue(h.transport.connect(machine))
-        assertFalse(moshBannerProbed, "SshEndpointOnly must skip mosh-server probing completely")
+        assertFalse(moshServerProbed, "SshEndpointOnly must skip mosh-server probing completely")
         assertFalse(h.moshEngine.isSessionActive("ssh-only-3"))
 
         val backbone = assertIs<ActiveBackbone.SshEndpoint>(h.stateManager.activeTransportBackbone.value["ssh-only-3"])
@@ -278,7 +248,7 @@ class ConnectionPathsE2ETest {
         assertNotNull(h.surfaceBus.surfaceFor("ssh-only-3"))
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "ssh-only-3" }
-        assertTrue(logs.none { it.tag == "MoshBootstrap" })
+        assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
         assertTrue(
             logs.any {
                 it.tag == "EndpointGen1" &&
@@ -483,17 +453,15 @@ class ConnectionPathsE2ETest {
         assertTrue(h.transport.connect(machine))
         val surfaceBeforePark = assertNotNull(h.surfaceBus.surfaceFor(machineId))
 
-        // Path 6A: setSurfaceLease(active = false) parks Mosh UDP and transitions to SurfaceParked while preserving frame
+        // Path 6A: setSurfaceLease(active = false) transitions to SurfaceParked while preserving frame
         h.transport.setSurfaceLease(machineId, active = false)
-        assertTrue(h.moshEngine.isParked(machineId))
         assertEquals(RoamingStatus.SurfaceParked, h.stateManager.roamingState.value[machineId])
         val surfaceWhileParked = assertNotNull(h.surfaceBus.surfaceFor(machineId))
         assertEquals(surfaceBeforePark.bootId, surfaceWhileParked.bootId)
         assertEquals(surfaceBeforePark.panes.size, surfaceWhileParked.panes.size)
 
-        // Path 6B: setSurfaceLease(active = true) wakes Mosh UDP, commits presentation fence, and restores Healthy
+        // Path 6B: setSurfaceLease(active = true) commits presentation fence and restores Healthy
         h.transport.setSurfaceLease(machineId, active = true)
-        assertFalse(h.moshEngine.isParked(machineId))
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(
             h.debugLog.entries.value.any {
@@ -503,7 +471,7 @@ class ConnectionPathsE2ETest {
             },
         )
 
-        // Path 6C: Queue prompts while RoamingReconnect, then call onNetworkAvailable() -> FIFO flush + roamedCount++
+        // Path 6C: Queue prompts while RoamingReconnect, then call onNetworkAvailable() -> FIFO flush
         h.stateManager.setRoamingStatus(machineId, RoamingStatus.RoamingReconnect)
         val firstQueued = h.transport.submitAgentPrompt(
             machineId = machineId,
@@ -532,10 +500,9 @@ class ConnectionPathsE2ETest {
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(h.stateManager.queuedPromptsForMachine(machineId).isEmpty())
 
-        val backboneAfterRoam = assertIs<ActiveBackbone.MoshUdp>(
-            h.stateManager.activeTransportBackbone.value[machineId],
-        )
-        assertEquals(1, backboneAfterRoam.roamedCount)
+        // The SSH endpoint stays the backbone after the network change.
+        assertIs<ActiveBackbone.SshEndpoint>(h.stateManager.activeTransportBackbone.value[machineId])
+        assertFalse(h.moshEngine.isSessionActive(machineId))
 
         val rpcLogsAfterRoam = h.debugLog.entries.value
             .drop(logCountBeforeRoam)
@@ -546,7 +513,7 @@ class ConnectionPathsE2ETest {
     }
 
     @Test
-    fun sshTransportManagerNegotiatesMoshAndFallsBackToSshEndpoint() = runTest {
+    fun sshTransportManagerConnectsEachSimulatedHostOverTheSshEndpoint() = runTest {
         val h = Harness()
         val stateManager = h.stateManager
         val transport = h.transport
@@ -559,12 +526,13 @@ class ConnectionPathsE2ETest {
             transportMode = TransportMode.AutoPreferMosh,
         )
         assertTrue(transport.connect(workbox))
-        val moshBackbone = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
-        assertEquals(60000, moshBackbone.udpPort)
+        val workboxBackbone = assertIs<ActiveBackbone.SshEndpoint>(
+            stateManager.activeTransportBackbone.value["workbox"],
+        )
+        assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, workboxBackbone.fallbackReason)
 
-        // Verify Mosh focus RPC routes over herdr remote-api-bridge (herdr.sock)
-        val focusResp = transport.sendEndpointCommand("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
-        assertTrue(focusResp?.contains("herdr.sock") == true)
+        // A focus RPC goes on the lane of the SSH endpoint bridge.
+        h.assertSentOnSshEndpointLane("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
 
         // Verify background surface parking and wakeup presentation fence
         transport.setSurfaceLease("workbox", active = false)
@@ -572,19 +540,20 @@ class ConnectionPathsE2ETest {
         transport.setSurfaceLease("workbox", active = true)
         assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value["workbox"])
 
-        // Verify fallback when mosh-server banner is absent
-        h.backend.moshBootstrapBannerProvider = { "mosh-server: not found" }
-        val fallbackHost = HostMachine(
+        // A host with no mosh-server gets no reason.
+        h.backend.moshServerProbe = { false }
+        val gpuRig = HostMachine(
             id = "gpu-rig",
             name = "gpu-rig",
             hostname = "100.64.0.25",
             username = "ian",
             transportMode = TransportMode.AutoPreferMosh,
         )
-        assertTrue(transport.connect(fallbackHost))
-        assertIs<ActiveBackbone.SshEndpoint>(stateManager.activeTransportBackbone.value["gpu-rig"])
+        assertTrue(transport.connect(gpuRig))
+        val gpuRigBackbone = assertIs<ActiveBackbone.SshEndpoint>(stateManager.activeTransportBackbone.value["gpu-rig"])
+        assertNull(gpuRigBackbone.fallbackReason)
 
-        // Verify pane input and network roam wakeup
+        // Verify pane input and a network change on the SSH endpoint
         assertTrue(
             transport.sendPaneInput(
                 machineId = "workbox",
@@ -593,7 +562,6 @@ class ConnectionPathsE2ETest {
             )
         )
         transport.onNetworkAvailable("workbox")
-        val afterRoam = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
-        assertEquals(1, afterRoam.roamedCount)
+        assertEquals(workboxBackbone, stateManager.activeTransportBackbone.value["workbox"])
     }
 }

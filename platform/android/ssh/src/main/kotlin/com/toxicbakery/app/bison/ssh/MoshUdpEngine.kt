@@ -11,25 +11,24 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
-import com.toxicbakery.logging.Arbor
-import java.net.InetSocketAddress
-import java.nio.ByteBuffer
-import java.nio.channels.DatagramChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Android Mosh UDP State Synchronization Protocol (SSP) engine + `libghostty-vt` terminal synthesizer.
+ * The Android [MoshSessionEngine]. This version has no Mosh transport, so the engine starts no session.
  *
- * Implements [MoshSessionEngine] with:
- * - Non-blocking UDP `DatagramChannel` SSP transport (and JNI hook into `libherdr_mobile_core.so` when loaded,
- *   falling back transparently to the pure-Kotlin SSP + VT synthesizer in JVM unit tests).
- * - Client-side predictive echo (`CellData.MOD_PREDICTED_ECHO` underlined tentative predictions).
- * - Zero-traffic background suspend (`setParked` / `setSuspended`): halts SSP heartbeat/ack emission so
- *   `mosh-server` pauses diff transmission at 0 bytes/sec while keeping the remote `herdr` session alive.
- * - Instant IP roaming wakeup (`sendWakeupDatagram` / `notifyNetworkRoamed`) on `onStart()` or `NetworkCallback`.
- * - Unified `PaneSurfaceFrame` synthesis onto [PaneSurfaceBus] combining the VT cell grid with
- *   [PaneLayoutSnapshot] (`deriveSplitsFromLayout`), automatically stripping row `0` when `tabCount > 1`.
+ * [startSession] writes [MoshSessionEngine.NOT_AVAILABLE] to the debug log and returns false. Thus each other
+ * function finds no session and does nothing. The app connects each machine over the SSH endpoint bridge.
+ *
+ * The engine keeps the parts that do not use the network, for the Mosh path of issue #22
+ * (https://github.com/ToxicBakery/BisonHerdr/issues/22):
+ * - Client-side predictive echo (`CellData.MOD_PREDICTED_ECHO` underlined cells).
+ * - The parked state of a session ([setParked]) and its roam count ([sendWakeupDatagram]).
+ * - A [PaneSurfaceFrame] on [PaneSurfaceBus] from the screen lines and the [PaneLayoutSnapshot]
+ *   (`deriveSplitsFromLayout`), with row `0` removed when `tabCount > 1`.
+ *
+ * An earlier version sent UDP datagrams with no encryption and read no reply, and a real `mosh-server` does not
+ * accept such datagrams. Issue #22 lists the work for a real Mosh path.
  */
 class MoshUdpEngine(
     private val sshDebugLog: SshDebugLog,
@@ -55,18 +54,18 @@ class MoshUdpEngine(
         var tabCount: Int = 1,
         var parked: Boolean = false,
         var roamedCount: Int = 0,
-        val sequenceNumber: AtomicLong = AtomicLong(1L),
         val frameRevision: AtomicLong = AtomicLong(1L),
         var cursorCol: Int = 0,
         var cursorRow: Int = 0,
         var layoutSnapshot: PaneLayoutSnapshot? = null,
         val predictions: MutableList<PredictedCell> = mutableListOf(),
         val screenLines: MutableList<String> = mutableListOf(),
-        var channel: DatagramChannel? = null,
-    ) {
-        val remoteAddress: InetSocketAddress by lazy { InetSocketAddress(host, udpPort) }
-    }
+    )
 
+    /**
+     * Writes [MoshSessionEngine.NOT_AVAILABLE] to the debug log and returns false. This version has no Mosh
+     * transport (issue #22), so the engine starts no session.
+     */
     override suspend fun startSession(
         machineId: String,
         host: String,
@@ -76,55 +75,19 @@ class MoshUdpEngine(
         rows: UShort,
         localEcho: Boolean,
     ): Boolean {
-        if (udpPort !in 1..65535 || sessionKey.isBlank()) {
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "MoshUDP",
-                message = "Invalid Mosh UDP parameters (port=$udpPort)",
-                isError = true,
-            )
-            return false
-        }
-
-        stopSession(machineId)
-
-        val channel = runCatching {
-            DatagramChannel.open().apply {
-                configureBlocking(false)
-            }
-        }.getOrNull()
-
-        val state = MoshSessionState(
-            machineId = machineId,
-            host = host,
-            udpPort = udpPort,
-            sessionKey = sessionKey,
-            cols = cols,
-            rows = rows,
-            localEchoEnabled = localEcho,
-            channel = channel,
-        )
-        state.screenLines.addAll(
-            listOf(
-                "BisonHerdr Mosh UDP SSP ($host:$udpPort) · AES-128-OCB armed",
-                "Local Predictive Echo: ${if (localEcho) "ON" else "OFF"} · Zero-Drop Roaming: READY",
-            )
-        )
-        sessions[machineId] = state
-
-        // Transmit initial SSP heartbeat datagram for the 1,500ms reachability handshake
-        transmitSspDatagram(state, payload = byteArrayOf(SSP_HEARTBEAT_FRAME))
-
         sshDebugLog.record(
             machineId = machineId,
-            tag = "MoshUDP",
-            message = "Mosh UDP SSP session started on $host:$udpPort (${cols}x$rows, localEcho=$localEcho, native=$isNativeLibraryLoaded)",
+            tag = LOG_TAG,
+            message = MoshSessionEngine.NOT_AVAILABLE,
+            isError = true,
         )
-
-        synthesizeAndPublishFrame(state)
-        return true
+        return false
     }
 
+    /**
+     * Adds the predictive echo of [bytes] to the session of [machineId]. Returns false when the machine has no
+     * session. This version sends no datagram.
+     */
     override suspend fun sendInput(machineId: String, bytes: ByteArray): Boolean {
         val state = sessions[machineId] ?: return false
         if (bytes.isEmpty()) return true
@@ -163,26 +126,22 @@ class MoshUdpEngine(
             }
             synthesizeAndPublishFrame(state)
         }
-
-        transmitSspDatagram(state, payload = bytes)
         return true
     }
 
+    /**
+     * Sets the viewport of the session of [machineId] to [cols] x [rows]. Returns false when the machine has no
+     * session. This version sends no datagram.
+     */
     override suspend fun resize(machineId: String, cols: UShort, rows: UShort): Boolean {
         val state = sessions[machineId] ?: return false
         state.cols = cols
         state.rows = rows
         // Request rows + 1 on the Mosh PTY when tabCount > 1 so row 0 (top tab bar) can be stripped cleanly
         val ptyRows = if (state.tabCount > 1) (rows.toInt() + 1).toUShort() else rows
-        val resizePayload = ByteBuffer.allocate(5)
-            .put(SSP_RESIZE_FRAME)
-            .putShort(cols.toShort())
-            .putShort(ptyRows.toShort())
-            .array()
-        transmitSspDatagram(state, payload = resizePayload)
         sshDebugLog.record(
             machineId = machineId,
-            tag = "MoshUDP",
+            tag = LOG_TAG,
             message = "Resized Mosh viewport to ${cols}x$rows (ptyRows=$ptyRows, tabCount=${state.tabCount})",
         )
         synthesizeAndPublishFrame(state)
@@ -194,11 +153,8 @@ class MoshUdpEngine(
     }
 
     /**
-     * Enters or exits zero-traffic background suspend for [machineId].
-     *
-     * When [parked] is `true`, the client stops sending SSP acknowledgments and heartbeats so
-     * `mosh-server` pauses diff transmission at 0 bytes/sec while keeping the session alive.
-     * When [parked] transitions back to `false`, an immediate SSP wakeup datagram is sent.
+     * Sets the parked state of the session of [machineId]. A Mosh client sends no acknowledgment while it is
+     * parked, so that `mosh-server` stops its updates and keeps the session open. This version sends no datagram.
      */
     suspend fun setParked(machineId: String, parked: Boolean) {
         val state = sessions[machineId] ?: return
@@ -207,15 +163,14 @@ class MoshUdpEngine(
         if (parked) {
             sshDebugLog.record(
                 machineId = machineId,
-                tag = "MoshUDP",
-                message = "Mosh UDP session parked (0 bytes/sec background suspend)",
+                tag = LOG_TAG,
+                message = "Mosh session parked",
             )
         } else if (wasParked) {
-            transmitSspDatagram(state, payload = byteArrayOf(SSP_WAKEUP_HEARTBEAT_FRAME))
             sshDebugLog.record(
                 machineId = machineId,
-                tag = "MoshUDP",
-                message = "Mosh UDP session resumed from background suspend",
+                tag = LOG_TAG,
+                message = "Mosh session not parked",
             )
             synthesizeAndPublishFrame(state)
         }
@@ -225,20 +180,20 @@ class MoshUdpEngine(
         sendWakeupDatagram(machineId)
 
     /**
-     * Immediately sends an authenticated SSP heartbeat datagram from the current network interface
-     * so `mosh-server` learns the tablet's new source IP:port in 0ms without reconnecting SSH.
+     * Clears the parked state of the session of [machineId], adds one to its roam count, and returns the count.
+     * Returns 0 when the machine has no session.
      *
-     * @return Updated roam count for [machineId].
+     * A Mosh client sends a datagram from its new address after a network change, so that `mosh-server` learns
+     * the address. This version sends no datagram (issue #22).
      */
     suspend fun sendWakeupDatagram(machineId: String): Int {
         val state = sessions[machineId] ?: return 0
         state.parked = false
         state.roamedCount += 1
-        transmitSspDatagram(state, payload = byteArrayOf(SSP_WAKEUP_HEARTBEAT_FRAME))
         sshDebugLog.record(
             machineId = machineId,
-            tag = "MoshUDP",
-            message = "Sent Mosh SSP wakeup datagram to ${state.host}:${state.udpPort} (roam #${state.roamedCount})",
+            tag = LOG_TAG,
+            message = "Network change ${state.roamedCount} of the Mosh session to ${state.host}:${state.udpPort}",
         )
         synthesizeAndPublishFrame(state)
         return state.roamedCount
@@ -285,12 +240,11 @@ class MoshUdpEngine(
     }
 
     override suspend fun stopSession(machineId: String) {
-        val removed = sessions.remove(machineId) ?: return
-        runCatching { removed.channel?.close() }
+        sessions.remove(machineId) ?: return
         sshDebugLog.record(
             machineId = machineId,
-            tag = "MoshUDP",
-            message = "Stopped Mosh UDP session for $machineId",
+            tag = LOG_TAG,
+            message = "Stopped Mosh session for $machineId",
         )
     }
 
@@ -299,22 +253,6 @@ class MoshUdpEngine(
 
     fun isParked(machineId: String): Boolean =
         sessions[machineId]?.parked == true
-
-    private fun transmitSspDatagram(state: MoshSessionState, payload: ByteArray) {
-        if (state.parked) return
-        val seq = state.sequenceNumber.getAndIncrement()
-        val channel = state.channel ?: return
-        runCatching {
-            val packet = ByteBuffer.allocate(8 + payload.size)
-                .putLong(seq)
-                .put(payload)
-            packet.flip()
-            channel.send(packet, state.remoteAddress)
-        }.onFailure { error ->
-            // Non-fatal in unit tests or unreachable networks
-            log.d(error) { "UDP datagram send on ${state.host}:${state.udpPort} deferred" }
-        }
-    }
 
     private fun synthesizeAndPublishFrame(state: MoshSessionState) {
         val cols: UShort
@@ -418,9 +356,8 @@ class MoshUdpEngine(
         if (ch.code in 0..<128) ASCII_SYMBOLS[ch.code] else ch.toString()
 
     companion object {
-        private const val SSP_HEARTBEAT_FRAME: Byte = 0x01
-        private const val SSP_WAKEUP_HEARTBEAT_FRAME: Byte = 0x02
-        private const val SSP_RESIZE_FRAME: Byte = 0x03
+        /** The debug log tag of the engine. */
+        const val LOG_TAG: String = "MoshUDP"
 
         private val BLANK_CELL = CellData()
         private val ASCII_SYMBOLS = Array(128) { it.toChar().toString() }
@@ -428,15 +365,6 @@ class MoshUdpEngine(
         private val PREDICTED_ECHO_FG_COLOR = CellData.rgbColor(0xD7, 0x99, 0x21)
         private val PREDICTED_ECHO_MODIFIER =
             (CellData.MOD_UNDERLINE.toInt() or CellData.MOD_PREDICTED_ECHO.toInt()).toUShort()
-
-        private val log = Arbor.tag("MoshUdpEngine")
-
-        val isNativeLibraryLoaded: Boolean by lazy {
-            runCatching {
-                System.loadLibrary("herdr_mobile_core")
-                true
-            }.getOrDefault(false)
-        }
     }
 }
 
