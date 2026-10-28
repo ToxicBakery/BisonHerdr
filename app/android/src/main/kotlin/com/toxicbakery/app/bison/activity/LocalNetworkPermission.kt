@@ -36,7 +36,7 @@ internal enum class LocalNetworkDialog {
     /** Tells the user why the app needs the permission, before the system dialog. */
     Rationale,
 
-    /** Tells the user that Android does not ask again, and offers to open the app settings. */
+    /** Tells the user that the app does not have the permission, and offers to open the app settings. */
     Settings,
 }
 
@@ -50,7 +50,7 @@ internal enum class LocalNetworkDialog {
  * 4. Android shows no system dialog after the user refused the permission two times. Then Android also tells the app
  *    not to explain the permission. When the flow sees this before and after the system dialog, it shows
  *    [LocalNetworkDialog.Settings], which can open the app settings. A user who closes the first system dialog with
- *    no answer also sees this dialog.
+ *    Back also sees this dialog, so its text is true in the two cases.
  *
  * [showDialog] shows a dialog of the app for a host, and returns true when the user selects the main button.
  * [requestPermission] shows the system dialog, and returns true when the app has the permission after it.
@@ -96,8 +96,14 @@ internal suspend fun reconnectAfterLocalNetworkGrant(
 /**
  * Connects [LocalNetworkPermissionFlow] to [activity]: the system dialog, the dialogs of the app, and the app settings.
  * Make it before [activity] starts, because it registers an activity result.
+ *
+ * [onGranted] runs on each grant from the system dialog. It also runs when no request waits for the result. This
+ * occurs after the time limit of the request, or when Android made the activity again while the dialog was open.
  */
-internal class LocalNetworkPermissionRequester(private val activity: ComponentActivity) {
+internal class LocalNetworkPermissionRequester(
+    private val activity: ComponentActivity,
+    private val onGranted: () -> Unit,
+) {
 
     /** A dialog of the app that waits for the user. */
     class OpenDialog(val dialog: LocalNetworkDialog, val hostPort: String) {
@@ -110,6 +116,7 @@ internal class LocalNetworkPermissionRequester(private val activity: ComponentAc
 
     private val launcher = activity.registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         permissionResult?.complete(granted)
+        if (granted) onGranted()
     }
 
     /** The dialog that the activity shows now, or null. */

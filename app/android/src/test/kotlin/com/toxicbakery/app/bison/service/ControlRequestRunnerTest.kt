@@ -5,6 +5,8 @@ import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.ssh.KeyboardInteractiveOutcome
 import com.toxicbakery.app.bison.ssh.KeyboardInteractivePrompt
 import com.toxicbakery.app.bison.ssh.KeyboardInteractiveQuestion
+import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
+import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.UserAuthOutcome
@@ -199,6 +201,27 @@ class ControlRequestRunnerTest {
         stateManager.cancelUserAuthBeforeQueue(SshRequest.Disconnect("workbox"))
 
         assertEquals(KeyboardInteractiveOutcome.Cancelled, waiting.await())
+        assertEquals(0L, currentTime, "The connect waited for the time-out")
+    }
+
+    @Test
+    fun aDisconnectEndsTheLocalNetworkWaitOfItsMachineBeforeTheQueue() = runTest {
+        val localNetworkAccess = LocalNetworkAccess()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            localNetworkAccess.hostRequests { awaitCancellation() }
+        }
+        // The connect in the control queue waits for the answer of the user to the system dialog.
+        val waiting = async { localNetworkAccess.request("workbox", "192.168.1.42:22", 60.seconds) }
+        runCurrent()
+
+        localNetworkAccess.cancelRequestBeforeQueue(SshRequest.Disconnect("gpu-rig"))
+        localNetworkAccess.cancelRequestBeforeQueue(SshRequest.Connect("workbox"))
+        runCurrent()
+        assertTrue(waiting.isActive, "A request that is not a disconnect of the machine ended the wait")
+
+        localNetworkAccess.cancelRequestBeforeQueue(SshRequest.Disconnect("workbox"))
+
+        assertEquals(LocalNetworkOutcome.Cancelled, waiting.await())
         assertEquals(0L, currentTime, "The connect waited for the time-out")
     }
 

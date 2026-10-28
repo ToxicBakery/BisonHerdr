@@ -57,7 +57,9 @@ class MainActivity : FragmentActivity(), DIAware {
             log.d { "POST_NOTIFICATIONS granted: $granted" }
         }
     private var showNotificationRationale by mutableStateOf(false)
-    private val localNetworkRequester = LocalNetworkPermissionRequester(this)
+    private val localNetworkRequester = LocalNetworkPermissionRequester(this) {
+        lifecycleScope.launch { reconnectAfterLocalNetworkGrant(sshStateManager, sshRequestManager) }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -191,13 +193,12 @@ class MainActivity : FragmentActivity(), DIAware {
     }
 
     /**
-     * Asks for the local network permission for a connection to [hostPort]. When the app gets it, the machines that
-     * stopped for it connect again.
+     * Asks for the local network permission for a connection to [hostPort]. After a grant, the requester connects
+     * again the machines that stopped for the permission.
      */
     private suspend fun askForLocalNetwork(hostPort: String): LocalNetworkOutcome {
         val outcome = localNetworkRequester.flow.ask(hostPort)
         log.d { "ACCESS_LOCAL_NETWORK for $hostPort: $outcome" }
-        if (outcome == LocalNetworkOutcome.Granted) reconnectAfterLocalNetworkGrant(sshStateManager, sshRequestManager)
         return outcome
     }
 
