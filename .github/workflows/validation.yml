@@ -119,12 +119,14 @@ jobs:
         #   android — :app:android debug and release APKs, a check of the release classes (no debug-only
         #             class, RealSshBackend present), compile checks of the baseline profile generator and
         #             Android instrumented tests, unit tests for :platform:android:ssh and :app:android
-        #             (the release unit tests check the release bindings), plus `lint` across all modules
+        #             (the release unit tests check the release bindings), the license check of the
+        #             runtime classpath of each app variant (:app:android:licensee), plus `lint` across
+        #             all modules
         include:
           - target: jvm
             tasks: ":core:app-version:check :core:common:check :core:di:check :core:fake-server:check :core:model:check :core:mosh:check :core:protocol:check :core:resources:localizationCheck :core:ssh:check :core:store:check :core:util:check"
           - target: android
-            tasks: ":app:android:assembleDebug :app:android:assembleRelease :app:android:checkReleaseClasses :app:android:baseline:compileBenchmarkReleaseKotlin :app:android:compileDebugAndroidTestKotlin :platform:android:ssh:testDebugUnitTest :app:android:testDebugUnitTest :app:android:testReleaseUnitTest lint"
+            tasks: ":app:android:assembleDebug :app:android:assembleRelease :app:android:checkReleaseClasses :app:android:baseline:compileBenchmarkReleaseKotlin :app:android:compileDebugAndroidTestKotlin :platform:android:ssh:testDebugUnitTest :app:android:testDebugUnitTest :app:android:testReleaseUnitTest :app:android:licensee lint"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

@@ -13,6 +13,7 @@ plugins {
     alias(libs.plugins.androidBaseline)
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
+    alias(libs.plugins.licensee)
 }
 
 // The feature flag of FIDO2 hardware security keys. See FeatureFlags.hardwareSecurityKeys.
@@ -139,6 +140,31 @@ baselineProfile {
     saveInSrc = true
     automaticGenerationDuringBuild = false
     dexLayoutOptimization = true
+}
+
+// The license check. The licensee tasks fail when a dependency in the runtime classpath of an app
+// variant has no license in this allow list. The library modules get into the APK only through this
+// classpath, so the check also covers their dependencies. Test and androidTest dependencies do not
+// get into an APK, so the check does not read them. Do not allow a GPL, AGPL, or LGPL-only license.
+// Licensee writes a warning for an entry that no dependency uses, so add only the entries in use.
+licensee {
+    // AndroidX, Compose, Kotlin, kotlinx, Material, Coil, Moshi, Okio, Guava, JSpecify, YubiKit, Arbor.
+    allow("Apache-2.0")
+    // Kodein DI and Kaverit.
+    allow("MIT")
+    allowUrl("https://opensource.org/license/mit") {
+        because("it is the MIT license. The POM of org.slf4j:slf4j-api gives only this URL.")
+    }
+    allowUrl("https://www.bouncycastle.org/licence.html") {
+        because("the Bouncy Castle Licence is the MIT license (META-INF/LICENSE.md of bcprov)")
+    }
+    // The POM of JSch lists three licenses: JSch and the JZlib copy in JSch are BSD-3-Clause, and
+    // the jBCrypt copy is ISC. Licensee accepts an artifact at its first allowed license, so an
+    // entry for the two other URLs is not used. A review found that the two other licenses are
+    // also permissive.
+    allowUrl("https://github.com/mwiede/jsch/blob/master/LICENSE.txt") {
+        because("it is the BSD-3-Clause license (Revised BSD) of JSch")
+    }
 }
 
 dependencies {
