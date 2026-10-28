@@ -133,6 +133,11 @@
     <!-- Foreground Service & Actionable System Notifications -->
     <string name="service_notification_channel_name">BisonHerdr Active Sessions</string>
     <string name="service_notification_title">BisonHerdr: %1$d machines (%2$s) &#8226; %3$d agents active</string>
+    <string name="service_notification_action_disconnect_all">Disconnect All</string>
+    <string name="notification_permission_rationale_title">Notification permission</string>
+    <string name="notification_permission_rationale_body">BisonHerdr uses a notification to show the SSH sessions that stay open in the background. Agent alerts also use notifications.</string>
+    <string name="notification_permission_rationale_continue">Continue</string>
+    <string name="notification_permission_rationale_dismiss">Not now</string>
     <string name="agent_alert_channel_name">Coding Agent Alerts</string>
     <string name="agent_alert_blocked_title">Agent Blocked on %1$s (%2$s)</string>
     <string name="agent_alert_done_title">Agent Finished on %1$s (%2$s)</string>

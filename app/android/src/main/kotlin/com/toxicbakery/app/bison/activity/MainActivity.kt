@@ -1,14 +1,21 @@
 package com.toxicbakery.app.bison.activity
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.ReportDrawn
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
@@ -36,6 +43,13 @@ class MainActivity : ComponentActivity(), DIAware {
     private val debugServer: DebugServer by instance()
     private val sshRequestManager: SshRequestManager by instance()
     private val sshStateManager: SshStateManager by instance()
+    private val startedActivityCounter: StartedActivityCounter by instance()
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            log.d { "POST_NOTIFICATIONS granted: $granted" }
+        }
+    private var showNotificationRationale by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -45,7 +59,8 @@ class MainActivity : ComponentActivity(), DIAware {
         setTurnScreenOn(true)
 
         applyFakeServerIntent(intent)
-        window.decorView.post { startSessionService() }
+        // A uiMode or locale change makes a new activity. Keep the rationale dialog open.
+        showNotificationRationale = savedInstanceState?.getBoolean(STATE_SHOW_NOTIFICATION_RATIONALE) ?: false
 
         setContent {
             withDI(di) {
@@ -56,9 +71,28 @@ class MainActivity : ComponentActivity(), DIAware {
                         )
                         ReportDrawn()
                     }
+                    if (showNotificationRationale) {
+                        NotificationPermissionRationale(
+                            onContinue = {
+                                showNotificationRationale = false
+                                launchNotificationPermissionRequest()
+                            },
+                            onDismiss = { showNotificationRationale = false },
+                        )
+                    }
                 }
             }
         }
+
+        // The app starts on the machine list, so this request comes before the first connect.
+        if (savedInstanceState == null) {
+            requestNotificationPermissionIfNeeded()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_SHOW_NOTIFICATION_RATIONALE, showNotificationRationale)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -70,6 +104,10 @@ class MainActivity : ComponentActivity(), DIAware {
 
     override fun onStart() {
         super.onStart()
+        startedActivityCounter.onActivityStarted()
+        // The service is the only collector of the request queue, so start it before the requests.
+        // The service can stop itself while this activity is stopped.
+        startSessionService()
         // Resume active terminal surface leases (<50ms Endpoint resync / <20ms Mosh UDP SSP wakeup)
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
@@ -85,6 +123,7 @@ class MainActivity : ComponentActivity(), DIAware {
 
     override fun onStop() {
         super.onStop()
+        startedActivityCounter.onActivityStopped()
         // Park active terminal surfaces at 0 bytes/sec while keeping control stream & Mosh session alive
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
@@ -106,6 +145,27 @@ class MainActivity : ComponentActivity(), DIAware {
         }
     }
 
+    /**
+     * Asks for `POST_NOTIFICATIONS` on API 33 and later. When the user denied the permission one
+     * time, the activity first shows [NotificationPermissionRationale]. When the user denied it two
+     * times, Android shows no dialog.
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val permission = Manifest.permission.POST_NOTIFICATIONS
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) return
+        if (shouldShowRequestPermissionRationale(permission)) {
+            showNotificationRationale = true
+        } else {
+            notificationPermissionLauncher.launch(permission)
+        }
+    }
+
+    private fun launchNotificationPermissionRequest() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     private fun startSessionService() {
         runCatching {
             val serviceIntent = Intent(this, BisonSessionService::class.java)
@@ -120,6 +180,7 @@ class MainActivity : ComponentActivity(), DIAware {
 
     companion object {
         const val EXTRA_FAKE_SERVER: String = "fake_server"
+        private const val STATE_SHOW_NOTIFICATION_RATIONALE: String = "show_notification_rationale"
 
         private val log = Arbor.tag("MainActivity")
     }
