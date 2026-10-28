@@ -48,9 +48,9 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
  * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
- * in [binDirectory] before the programs of the test machine. When [allowTcpForwarding] is
- * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion. [directTcpipTargets]
- * records the `host:port` of each channel that a client asked for.
+ * in [binDirectory] before the programs of the test machine. A test can also give each command a [homeDirectory].
+ * When [allowTcpForwarding] is true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump
+ * bastion. [directTcpipTargets] records the `host:port` of each channel that a client asked for.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
  * client sent no credentials, for example after a host key check stopped the connection.
@@ -86,6 +86,14 @@ internal class TestSshServer(
      */
     @Volatile
     var binDirectory: File? = null
+
+    /**
+     * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The workers of the client put
+     * `$HOME/.local/bin` first on the `PATH`. Thus a test that sets this directory finds a program in its own
+     * `.local/bin` before a program of the same name on the test machine, for example `herdr`.
+     */
+    @Volatile
+    var homeDirectory: File? = null
 
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
@@ -218,10 +226,14 @@ internal class TestSshServer(
         transportMode = transportMode,
     )
 
-    /** Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], and [binDirectory] on the `PATH`. */
+    /**
+     * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [binDirectory] on the `PATH`, and
+     * [homeDirectory] as `HOME`.
+     */
     private fun shellCommand(command: String): List<String> = buildList {
         add("env")
         add("$NAME_VARIABLE=$name")
+        homeDirectory?.let { add("HOME=${it.absolutePath}") }
         binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
         addAll(listOf("sh", "-c", command))
     }
