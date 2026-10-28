@@ -355,6 +355,28 @@ class UserAuthLoginTest {
             debugLogDump(),
         )
         assertTrue(result.message.contains("Open the app and connect again"), result.message)
+        assertEquals(NeedsUserCause.UserAuthRequired(TestSshServer.KEY_ALIAS), stateManager.needsUser.value[machine.id])
+    }
+
+    @Test
+    fun aKeyFromAnEarlierVersionGivesItsOwnCause() = runTest {
+        val result = SshAuthResult.UserAuthRequired(TestSshServer.KEY_ALIAS, keyNeedsUserForEachSign = true)
+        val surfaceBus = PaneSurfaceBus()
+        val transport = SshTransportManager(
+            backend = RecordingSshBackend(authResult = result),
+            moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
+            sshStateManager = stateManager,
+            sshDebugLog = debugLog,
+            paneSurfaceBus = surfaceBus,
+        )
+        val machine = machine("earlier-version", server.keyAuthMethod)
+
+        assertFalse(transport.connect(machine))
+
+        assertEquals(
+            NeedsUserCause.KeyFromEarlierVersion(TestSshServer.KEY_ALIAS),
+            stateManager.needsUser.value[machine.id],
+        )
     }
 
     /** Connects to [server] with an identity whose sign throws [signError], and returns no result. */

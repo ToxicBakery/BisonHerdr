@@ -28,6 +28,18 @@ sealed interface NeedsUserCause {
     data object PasswordMissing : NeedsUserCause
 
     /**
+     * The key [keyAlias] needs a user authentication, and it is locked. A connect from the user shows the prompt
+     * that unlocks it. [keyAlias] is null when the error did not name the key.
+     */
+    data class UserAuthRequired(val keyAlias: String?) : NeedsUserCause
+
+    /**
+     * The key [keyAlias] is from an earlier version and needs a user authentication for each sign. No prompt can
+     * unlock it, so the user must make a new key.
+     */
+    data class KeyFromEarlierVersion(val keyAlias: String) : NeedsUserCause
+
+    /**
      * The app did not get a connection to the host. Only a connect from the user gives this cause, because the
      * reconnect loop tries again after a network error. [detail] is the error text.
      */

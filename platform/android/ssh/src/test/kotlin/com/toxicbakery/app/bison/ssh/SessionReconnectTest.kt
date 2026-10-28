@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.ssh
 
+import android.security.keystore.UserNotAuthenticatedException
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
@@ -7,6 +8,7 @@ import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
+import java.security.Signature
 import kotlin.random.Random
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -48,7 +50,14 @@ import kotlinx.coroutines.withTimeoutOrNull
 class SessionReconnectTest {
 
     private val debugLog = SshDebugLog()
-    private val keyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true)
+
+    /** The error of each sign with a [keyManager] key, or null when the key signs. */
+    @Volatile
+    private var signError: Exception? = null
+    private val keyManager = AndroidKeystoreKeyManager(
+        allowSoftwareKeys = true,
+        signatureFactory = { algorithm -> signError?.let { throw it } ?: Signature.getInstance(algorithm) },
+    )
     private val server = TestSshServer(keyManager = keyManager, name = TARGET).start()
     private val bastions = mutableListOf<TestSshServer>()
     private val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply {
@@ -118,6 +127,26 @@ class SessionReconnectTest {
         runCurrent()
         assertEquals(checks, server.credentialChecks, "The loop tried the login again")
         assertFalse(backend().client.hasLiveSession(machine.id))
+    }
+
+    @Test
+    fun aLockedKeyAtTheReconnectStopsTheLoopWithTheUserAuthCause() = runTest {
+        val transport = startTransport()
+        val machine = server.machine(
+            id = "reconnect-locked-key",
+            username = TestSshServer.KEY_USER,
+            authMethod = server.keyAuthMethod,
+        ).also { machines += it }
+        assertTrue(transport.connect(machine), debugLogDump())
+        // The time after the user authentication ended, so the key is locked again.
+        signError = UserNotAuthenticatedException()
+
+        server.closeSessions()
+
+        awaitFailed(machine)
+        assertEquals(NeedsUserCause.UserAuthRequired(TestSshServer.KEY_ALIAS), stateManager.needsUser.value[machine.id])
+        assertFalse(stateManager.isMachineConnected(machine.id))
+        assertTrue(delays.value.isEmpty(), "The loop waited for a new attempt: ${delays.value}")
     }
 
     @Test

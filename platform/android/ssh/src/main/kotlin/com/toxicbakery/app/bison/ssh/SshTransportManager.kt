@@ -737,7 +737,14 @@ class SshTransportManager(
             is SshAuthResult.HostKeyUnknown -> NeedsUserCause.HostKeyUnknown(result.presented.hostPort)
             is SshAuthResult.HostKeyChanged -> NeedsUserCause.HostKeyChanged(result.presented.hostPort)
             is SshAuthResult.KeyMissing -> NeedsUserCause.KeyMissing(result.keyAlias)
-            is SshAuthResult.UserAuthRequired -> NeedsUserCause.Other(result.message)
+            is SshAuthResult.UserAuthRequired -> {
+                val keyAlias = result.keyAlias
+                if (result.keyNeedsUserForEachSign && keyAlias != null) {
+                    NeedsUserCause.KeyFromEarlierVersion(keyAlias)
+                } else {
+                    NeedsUserCause.UserAuthRequired(keyAlias)
+                }
+            }
             is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
             is SshAuthResult.Failed -> causeOf(result.cause)
             // A login that passed needs nothing. Only an error in the caller gets here.
