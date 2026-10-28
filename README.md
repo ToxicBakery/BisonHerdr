@@ -5,7 +5,7 @@
 It is designed around two core principles:
 
 1. **Survive Backgrounding & Network Roaming** — A foreground service keeps the SSH sessions open when you switch apps or when the tablet sleeps. In the background, the app stops its terminal reads. SSH uses TCP, so a Wi-Fi ↔ cellular change can close a session. The app then checks each session, connects again at once when a session does not reply, and keeps the last terminal state on the screen.
-2. **A Strong, Touch-First Terminal Experience as the Primary Input** — The app does not shrink a desktop TUI onto the tablet, and touch is not a second input. The terminal is an edge-to-edge native Compose canvas with ergonomic split-thumb controls, direct touch gestures, and a native prompt composer. With these controls, you can control interactive shells, TUIs, and AI coding agents quickly and easily on a tablet.
+2. **A Strong, Touch-First Terminal Experience as the Primary Input** — The app does not shrink a desktop TUI onto the tablet, and touch is a main input. The terminal is an edge-to-edge native Compose canvas with ergonomic split-thumb controls, direct touch gestures, and a native prompt composer. With these controls, you can operate interactive shells, TUIs, and AI coding agents on a tablet.
 
 ---
 
