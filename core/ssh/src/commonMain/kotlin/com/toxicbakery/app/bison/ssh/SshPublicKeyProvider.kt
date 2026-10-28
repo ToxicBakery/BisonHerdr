@@ -17,4 +17,15 @@ interface SshPublicKeyProvider {
         algorithm: KeyAlgorithm,
         requireBiometric: Boolean,
     ): String
+
+    /**
+     * Makes a new key for [keyAlias] with the current key parameters and returns its `authorized_keys` line.
+     * The new key replaces the stored key of [keyAlias]. Each host that has only the old public key then
+     * refuses the login. Throws a [KeyCreationException] when the device key store does not make the key.
+     */
+    suspend fun regenerateAuthorizedKeyLine(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean,
+    ): String
 }

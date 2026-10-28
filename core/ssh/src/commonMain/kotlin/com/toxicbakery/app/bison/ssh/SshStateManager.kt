@@ -3,10 +3,16 @@ package com.toxicbakery.app.bison.ssh
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.RoamingStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 
 /**
@@ -56,6 +62,14 @@ class SshStateManager {
      * See [NeedsUserCause].
      */
     val needsUser: StateFlow<Map<String, NeedsUserCause>> = _needsUser.asStateFlow()
+
+    private val _userAuthPrompts = MutableStateFlow<List<UserAuthPrompt>>(emptyList())
+
+    /** The open user authentication prompts, the oldest first. See [UserAuthPrompt] and [requestUserAuth]. */
+    val userAuthPrompts: StateFlow<List<UserAuthPrompt>> = _userAuthPrompts.asStateFlow()
+
+    /** The number of callers that run [hostUserAuthPrompts] now. */
+    private val userAuthHosts = MutableStateFlow(0)
 
     private val _queuedPrompts = MutableStateFlow<Map<String, List<QueuedPrompt>>>(emptyMap())
     val queuedPrompts: StateFlow<Map<String, List<QueuedPrompt>>> = _queuedPrompts.asStateFlow()
@@ -139,6 +153,95 @@ class SshStateManager {
     /** Removes the cause of [machineId] from [needsUser]. */
     fun clearNeedsUser(machineId: String) {
         _needsUser.update { it - machineId }
+    }
+
+    /**
+     * Asks the user to confirm the identity for the key [keyAlias] of [machineId], and waits for the answer.
+     * The UI shows [machineName].
+     *
+     * - When no UI runs [hostUserAuthPrompts], it returns [UserAuthOutcome.NoUi] at once and puts no prompt.
+     * - When no answer comes in [timeoutMs], it returns [UserAuthOutcome.TimedOut] and removes the prompt.
+     * - A new prompt for [machineId] cancels the open prompt of the same machine.
+     */
+    suspend fun requestUserAuth(
+        machineId: String,
+        machineName: String,
+        keyAlias: String,
+        timeoutMs: Long,
+    ): UserAuthOutcome {
+        if (userAuthHosts.value == 0) return UserAuthOutcome.NoUi
+        val prompt = UserAuthPrompt(machineId = machineId, machineName = machineName, keyAlias = keyAlias)
+        var replaced: List<UserAuthPrompt> = emptyList()
+        _userAuthPrompts.update { current ->
+            replaced = current.filter { it.machineId == machineId }
+            current.filter { it.machineId != machineId } + prompt
+        }
+        replaced.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+        try {
+            // The last UI can stop after the first check. Its stop cancels only the prompts that it can see.
+            if (userAuthHosts.value == 0) return UserAuthOutcome.NoUi
+            return withTimeoutOrNull(timeoutMs) { prompt.answer.await() } ?: UserAuthOutcome.TimedOut
+        } finally {
+            // A late answer from the UI has no effect.
+            answerUserAuth(prompt, UserAuthOutcome.TimedOut)
+        }
+    }
+
+    /**
+     * Shows each open [UserAuthPrompt] with [show], one at a time, and gives the result of [show] as the answer.
+     *
+     * A UI calls this function only while it can show a prompt, for example while its activity is started.
+     * [requestUserAuth] asks the user only while one or more callers run this function. The function runs until
+     * the caller cancels it. When a prompt closes before [show] returns, for example after a time-out, it cancels
+     * [show]. When the last caller stops, the open prompts get [UserAuthOutcome.Cancelled].
+     */
+    suspend fun hostUserAuthPrompts(show: suspend (UserAuthPrompt) -> UserAuthOutcome) {
+        userAuthHosts.update { it + 1 }
+        try {
+            _userAuthPrompts
+                .map { prompts -> prompts.firstOrNull() }
+                .distinctUntilChanged { old, new -> old === new }
+                .collectLatest { prompt ->
+                    if (prompt != null) answerUserAuth(prompt, showSafely(prompt, show))
+                }
+        } finally {
+            if (userAuthHosts.updateAndGet { it - 1 } == 0) cancelAllUserAuth()
+        }
+    }
+
+    /**
+     * Gives [UserAuthOutcome.Cancelled] to the open user authentication prompt of [machineId]. The wait of
+     * [requestUserAuth] then ends at once. A disconnect calls it before its request goes into a queue, because the
+     * connect that waits for the prompt can hold that queue.
+     */
+    fun cancelUserAuth(machineId: String) {
+        _userAuthPrompts.value
+            .filter { it.machineId == machineId }
+            .forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+    }
+
+    /** Gives [UserAuthOutcome.Cancelled] to all open user authentication prompts. */
+    fun cancelAllUserAuth() {
+        _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+    }
+
+    /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */
+    private suspend fun showSafely(
+        prompt: UserAuthPrompt,
+        show: suspend (UserAuthPrompt) -> UserAuthOutcome,
+    ): UserAuthOutcome =
+        try {
+            show(prompt)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            UserAuthOutcome.Failed(error.message ?: error::class.simpleName.orEmpty())
+        }
+
+    /** Gives [outcome] as the answer to [prompt] when [prompt] has no answer, and removes [prompt]. */
+    private fun answerUserAuth(prompt: UserAuthPrompt, outcome: UserAuthOutcome) {
+        prompt.answer.complete(outcome)
+        _userAuthPrompts.update { current -> current.filter { it !== prompt } }
     }
 
     fun enqueuePrompt(prompt: QueuedPrompt) {

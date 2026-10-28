@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.ssh
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.logging.Arbor
@@ -53,6 +54,25 @@ data class ExportedSshPublicKey(
     }
 }
 
+/** The user authentication that a stored key needs before it can sign. */
+enum class KeyUserAuth {
+
+    /** The key signs with no user authentication. */
+    NotRequired,
+
+    /** After a user authentication, the key can sign for a short time. A prompt with no `CryptoObject` unlocks it. */
+    TimeBound,
+
+    /**
+     * The key needs a user authentication for each sign. Earlier versions made such keys. Only a `CryptoObject`
+     * unlocks such a key, and JSch signs with no `CryptoObject`. Thus the app cannot use the key.
+     */
+    EachSign,
+
+    /** The key exists, but the key store did not tell its user authentication. */
+    Unknown,
+}
+
 /** Makes a key pair for an alias in AndroidKeyStore. */
 internal fun interface KeystoreKeyGenerator {
     fun generate(keyAlias: String, algorithm: KeyAlgorithm, requireBiometric: Boolean): KeyPair
@@ -65,6 +85,10 @@ internal fun interface KeystoreKeyGenerator {
  * When AndroidKeyStore does not make a key, the manager throws a [KeyCreationException] that names the
  * cause. When [allowSoftwareKeys] is true, the manager makes a software JCA key in memory instead. Only JVM
  * tests set it, because the JVM has no AndroidKeyStore. A device must not use a software key.
+ *
+ * A key that the manager makes with `requireBiometric = true` can sign for [USER_AUTH_VALIDITY_SECONDS]
+ * after the user unlocks it with a strong biometric or the device screen lock. The sign needs no
+ * `CryptoObject`, so JSch can sign on its own thread.
  */
 class AndroidKeystoreKeyManager internal constructor(
     private val allowSoftwareKeys: Boolean,
@@ -72,6 +96,10 @@ class AndroidKeystoreKeyManager internal constructor(
     private val keystoreKeyGenerator: KeystoreKeyGenerator = androidKeystoreGenerator,
     /** The key types that AndroidKeyStore supports on this device. A JVM test can give a different list. */
     private val keySupport: KeystoreKeySupport = AndroidKeystoreKeySupport,
+    /** Makes the JCA [Signature] for a signature algorithm name. A JVM test can give a signature that fails. */
+    private val signatureFactory: (String) -> Signature = jcaSignatureFactory,
+    /** Reads the [KeyUserAuth] of a stored private key. A JVM test can give a different reader. */
+    private val keyUserAuthReader: (PrivateKey) -> KeyUserAuth = androidKeystoreUserAuthReader,
 ) : SshPublicKeyProvider {
 
     /** Makes a manager that uses AndroidKeyStore. Set [allowSoftwareKeys] to true only in JVM tests. */
@@ -79,6 +107,8 @@ class AndroidKeystoreKeyManager internal constructor(
         allowSoftwareKeys = allowSoftwareKeys,
         keystoreKeyGenerator = androidKeystoreGenerator,
         keySupport = AndroidKeystoreKeySupport,
+        signatureFactory = jcaSignatureFactory,
+        keyUserAuthReader = androidKeystoreUserAuthReader,
     )
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
@@ -153,12 +183,55 @@ class AndroidKeystoreKeyManager internal constructor(
         ).openSshAuthorizedKeyLine
     }
 
+    override suspend fun regenerateAuthorizedKeyLine(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean,
+    ): String = withContext(Dispatchers.IO) {
+        regenerateKey(
+            keyAlias = keyAlias,
+            algorithm = algorithm,
+            requireBiometric = requireBiometric,
+        ).openSshAuthorizedKeyLine
+    }
+
+    /**
+     * Makes a new key pair for [keyAlias] with the current key parameters and returns its public key. The new
+     * key replaces the stored key of [keyAlias], also a key of a different algorithm or a key from an earlier
+     * version. Each host that knows only the old public key then refuses the login.
+     *
+     * Throws a [KeyCreationException] when AndroidKeyStore does not make the key.
+     */
+    fun regenerateKey(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean = false,
+        comment: String = DEFAULT_KEY_COMMENT,
+    ): ExportedSshPublicKey =
+        synchronized(keyLock) {
+            fallbackKeyPairs.remove(keyAlias)
+            forgetExportedPublicKeys(keyAlias)
+            // AndroidKeyStore replaces the entry of an alias when it makes a new key with that alias.
+            val exported = exportPublicKey(
+                keyAlias = keyAlias,
+                algorithm = algorithm,
+                publicKey = generateKeyPair(keyAlias, algorithm, requireBiometric).public,
+                comment = comment,
+            )
+            exportedPublicKeys["$keyAlias:${algorithm.name}:$comment"] = exported
+            exported
+        }
+
     /**
      * Signs an SSH `SSH_MSG_USERAUTH_REQUEST` challenge payload using the private key for [keyAlias]
      * and returns the RFC 4253 / RFC 8332 / RFC 5656 / RFC 8709 formatted SSH signature blob.
      *
      * It does not make a key, because the host does not know a new key. Throws a [MissingKeyException]
      * when [keyAlias] has no key. Use [getOrCreatePublicKey] to make the key.
+     *
+     * Throws a [UserAuthRequiredException] when the key needs a user authentication that the user did not
+     * give in the last [USER_AUTH_VALIDITY_SECONDS]. The sign does not try again. Throws a [KeySignException]
+     * for each other checked error, because JSch hides a checked error.
      */
     fun signSshChallenge(
         keyAlias: String,
@@ -170,43 +243,62 @@ class AndroidKeystoreKeyManager internal constructor(
             ?: synchronized(keyLock) { usableStoredKey(keyAlias, algorithm, ::loadPrivateKey) }
             ?: throw MissingKeyException(keyAlias)
         val resolvedSshAlg = sshAlgorithmOverride?.takeIf { it.isNotBlank() } ?: algorithm.sshKeyType
-        val rawSignature = when (algorithm) {
+        val rawSignature = try {
+            sign(privateKey, algorithm, resolvedSshAlg, challenge)
+        } catch (error: Exception) {
+            val needsUser = generateSequence<Throwable>(error) { it.cause }
+                .take(MAX_CAUSE_DEPTH)
+                .any { it is UserNotAuthenticatedException }
+            when {
+                needsUser -> throw UserAuthRequiredException(keyAlias, error)
+                error is RuntimeException -> throw error
+                else -> throw KeySignException(keyAlias, error)
+            }
+        }
+        return encodeSshSignatureBlob(resolvedSshAlg, rawSignature)
+    }
+
+    /** Signs [challenge] with [privateKey] and returns the raw signature of the SSH algorithm [sshAlgorithm]. */
+    private fun sign(
+        privateKey: PrivateKey,
+        algorithm: KeyAlgorithm,
+        sshAlgorithm: String,
+        challenge: ByteArray,
+    ): ByteArray =
+        when (algorithm) {
             KeyAlgorithm.Ed25519 -> {
-                val sig = Signature.getInstance("Ed25519")
+                val sig = signatureFactory("Ed25519")
                 sig.initSign(privateKey)
                 sig.update(challenge)
                 sig.sign()
             }
 
             KeyAlgorithm.Rsa4096 -> {
-                val jcaDigestAlg = when (resolvedSshAlg) {
+                val jcaDigestAlg = when (sshAlgorithm) {
                     "rsa-sha2-256", "ssh-rsa-sha256@ssh.com" -> "SHA256withRSA"
                     "ssh-rsa" -> "SHA1withRSA"
                     else -> "SHA512withRSA"
                 }
-                val sig = Signature.getInstance(jcaDigestAlg)
+                val sig = signatureFactory(jcaDigestAlg)
                 sig.initSign(privateKey)
                 sig.update(challenge)
                 sig.sign()
             }
 
             KeyAlgorithm.EcdsaP256 -> {
-                val sig = Signature.getInstance("SHA256withECDSA")
+                val sig = signatureFactory("SHA256withECDSA")
                 sig.initSign(privateKey)
                 sig.update(challenge)
                 derEcdsaToSshMpintPair(sig.sign())
             }
         }
-        return encodeSshSignatureBlob(resolvedSshAlg, rawSignature)
-    }
 
     /**
      * Deletes a key entry by [keyAlias] from AndroidKeyStore (and the in-memory fallback store).
      */
     fun deleteKey(keyAlias: String) {
         fallbackKeyPairs.remove(keyAlias)
-        val prefix = "$keyAlias:"
-        exportedPublicKeys.keys.removeIf { it.startsWith(prefix) }
+        forgetExportedPublicKeys(keyAlias)
         runCatching {
             val ks = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
             ks.load(null)
@@ -218,8 +310,24 @@ class AndroidKeystoreKeyManager internal constructor(
         }
     }
 
+    /**
+     * Returns the user authentication that the stored key of [keyAlias] needs before it can sign, or null when
+     * [keyAlias] has no key. It does not make a key. A key that the key store does not describe is
+     * [KeyUserAuth.Unknown].
+     */
+    fun storedKeyUserAuth(keyAlias: String): KeyUserAuth? {
+        val privateKey = loadPrivateKey(keyAlias) ?: return null
+        return runCatching { keyUserAuthReader(privateKey) }.getOrDefault(KeyUserAuth.Unknown)
+    }
+
     /** Returns true when a key exists for [keyAlias]. It does not make a key. */
     fun hasKey(keyAlias: String): Boolean = storedKeyExists(keyAlias)
+
+    /** Removes the cached public keys of [keyAlias]. */
+    private fun forgetExportedPublicKeys(keyAlias: String) {
+        val prefix = "$keyAlias:"
+        exportedPublicKeys.keys.removeIf { it.startsWith(prefix) }
+    }
 
     /**
      * Returns the stored key for [keyAlias] from [load], or null when the caller must create a key.
@@ -332,7 +440,7 @@ class AndroidKeystoreKeyManager internal constructor(
 
     /**
      * Returns the cause of the AndroidKeyStore [error]. AndroidKeyStore gives an [IllegalStateException]
-     * when a key needs user authentication and the device has no secure screen lock or no biometric.
+     * when a key needs user authentication and the device has no secure screen lock.
      */
     private fun keyCreationFailure(
         algorithm: KeyAlgorithm,
@@ -351,7 +459,7 @@ class AndroidKeystoreKeyManager internal constructor(
         when (failure) {
             KeyCreationFailure.NoSecureLockScreen ->
                 "AndroidKeyStore did not make the key $keyAlias. The key needs user authentication, " +
-                    "but the device has no secure screen lock or no biometric."
+                    "but the device has no secure screen lock."
             is KeyCreationFailure.AlgorithmNotSupported -> unsupportedAlgorithmMessage(failure.algorithm)
             is KeyCreationFailure.Other -> "AndroidKeyStore did not make the key $keyAlias: ${failure.detail}"
         }
@@ -522,12 +630,48 @@ class AndroidKeystoreKeyManager internal constructor(
         private const val ED25519_OID = "1.3.101.112"
         private const val DEFAULT_KEY_COMMENT = "bison-tablet"
 
-        /** The maximum number of causes that [keyCreationFailure] examines. */
+        /**
+         * The time in seconds that a key with `requireBiometric = true` can sign after the user unlocks it with
+         * a strong biometric or the device screen lock.
+         */
+        const val USER_AUTH_VALIDITY_SECONDS: Int = 30
+
+        /** The user authentication types that unlock a key with `requireBiometric = true`. */
+        const val USER_AUTH_TYPES: Int = KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
+
+        /** The maximum number of causes that [keyCreationFailure] and [signSshChallenge] examine. */
         private const val MAX_CAUSE_DEPTH = 16
         private val log = Arbor.tag("AndroidKeystoreKeyManager")
 
         /** The [KeystoreKeyGenerator] of a device. */
         private val androidKeystoreGenerator = KeystoreKeyGenerator(::generateInAndroidKeystore)
+
+        /** Makes the JCA [Signature] of the platform providers. */
+        private val jcaSignatureFactory: (String) -> Signature = { algorithm -> Signature.getInstance(algorithm) }
+
+        /** Reads the [KeyUserAuth] of an AndroidKeyStore private key from its [KeyInfo]. */
+        private val androidKeystoreUserAuthReader: (PrivateKey) -> KeyUserAuth = { privateKey ->
+            val keyInfo = KeyFactory.getInstance(privateKey.algorithm, ANDROID_KEYSTORE_PROVIDER)
+                .getKeySpec(privateKey, KeyInfo::class.java)
+            when {
+                !keyInfo.isUserAuthenticationRequired -> KeyUserAuth.NotRequired
+                keyInfo.userAuthenticationValidityDurationSeconds <= 0 -> KeyUserAuth.EachSign
+                else -> KeyUserAuth.TimeBound
+            }
+        }
+
+        /**
+         * Sets the user authentication of a key. When [requireBiometric] is true, the key can sign for
+         * [USER_AUTH_VALIDITY_SECONDS] after a user authentication of a type in [USER_AUTH_TYPES]. When it is
+         * false, the key needs no user authentication.
+         */
+        private fun KeyGenParameterSpec.Builder.setUserAuthentication(requireBiometric: Boolean): KeyGenParameterSpec.Builder =
+            if (requireBiometric) {
+                setUserAuthenticationRequired(true)
+                    .setUserAuthenticationParameters(USER_AUTH_VALIDITY_SECONDS, USER_AUTH_TYPES)
+            } else {
+                this
+            }
 
         private fun generateInAndroidKeystore(
             keyAlias: String,
@@ -543,7 +687,7 @@ class AndroidKeystoreKeyManager internal constructor(
                     val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
                         .setAlgorithmParameterSpec(ECGenParameterSpec(ED25519_CURVE))
                         .setDigests(KeyProperties.DIGEST_NONE)
-                        .setUserAuthenticationRequired(requireBiometric)
+                        .setUserAuthentication(requireBiometric)
                         .build()
                     generator.initialize(spec)
                     generator.generateKeyPair()
@@ -555,7 +699,7 @@ class AndroidKeystoreKeyManager internal constructor(
                         .setKeySize(4096)
                         .setDigests(KeyProperties.DIGEST_SHA512, KeyProperties.DIGEST_SHA256)
                         .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
-                        .setUserAuthenticationRequired(requireBiometric)
+                        .setUserAuthentication(requireBiometric)
                         .build()
                     generator.initialize(spec)
                     generator.generateKeyPair()
@@ -566,7 +710,7 @@ class AndroidKeystoreKeyManager internal constructor(
                     val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
                         .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
                         .setDigests(KeyProperties.DIGEST_SHA256)
-                        .setUserAuthenticationRequired(requireBiometric)
+                        .setUserAuthentication(requireBiometric)
                         .build()
                     generator.initialize(spec)
                     generator.generateKeyPair()

@@ -1,15 +1,19 @@
 package com.toxicbakery.app.bison.ssh
 
+import android.security.keystore.UserNotAuthenticatedException
 import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import kotlin.time.Duration
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * The [SshBackend] that connects to a real Herdr host over JSch through [RealHerdrSshClient].
@@ -24,10 +28,17 @@ import kotlin.time.Duration
  *
  * After a connect, the client reconnects on its own when the session closes, and sends the events of the loop to
  * the receiver of [setSessionEvents]. See [SessionSupervisor].
+ *
+ * Before the login with a stored key that needs a user authentication, [authenticate] asks the user to unlock
+ * the key through [SshStateManager.requestUserAuth]. The stored key decides, not the `requireBiometric` setting
+ * of the machine, because machines can share a key alias. [authenticate] waits for the answer for
+ * [USER_AUTH_TIMEOUT_MS] at most. The bastion of a ProxyJump machine logs in with the same key, so the one
+ * prompt also unlocks the bastion login.
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
     private val sshStateManager: SshStateManager,
+    private val keystoreKeyManager: AndroidKeystoreKeyManager,
 ) : SshBackend {
 
     constructor(
@@ -50,13 +61,47 @@ class RealSshBackend internal constructor(
             secretStore = secretStore,
         ),
         sshStateManager = sshStateManager,
+        keystoreKeyManager = keystoreKeyManager,
     )
 
-    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult =
-        client.connectAndVerify(machine, route).fold(
+    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
+        val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
+        var promptOutcome: UserAuthOutcome? = null
+        if (keyAuth != null) {
+            val keyUserAuth = withContext(Dispatchers.IO) { keystoreKeyManager.storedKeyUserAuth(keyAuth.keyAlias) }
+            if (keyUserAuth == KeyUserAuth.EachSign) {
+                // No prompt can unlock this key, so do not show one. The app opens no connection.
+                return SshAuthResult.UserAuthRequired(keyAuth.keyAlias, keyNeedsUserForEachSign = true)
+            }
+            // The stored key decides. When the key store does not tell, the machine setting decides. A missing key
+            // gets no prompt: the login then gives KeyMissing.
+            val needsPrompt = keyUserAuth == KeyUserAuth.TimeBound ||
+                (keyUserAuth == KeyUserAuth.Unknown && keyAuth.requireBiometric)
+            if (needsPrompt) {
+                val outcome = sshStateManager.requestUserAuth(
+                    machineId = machine.id,
+                    machineName = machine.name.ifBlank { machine.displayAddress },
+                    keyAlias = keyAuth.keyAlias,
+                    timeoutMs = USER_AUTH_TIMEOUT_MS,
+                )
+                if (outcome != UserAuthOutcome.Confirmed) {
+                    // The key stays locked, so the login cannot sign. The app opens no connection.
+                    return SshAuthResult.UserAuthRequired(keyAuth.keyAlias, outcome)
+                }
+                promptOutcome = outcome
+            }
+        }
+        return client.connectAndVerify(machine, route).fold(
             onSuccess = { SshAuthResult.Success },
-            onFailure = ::toAuthResult,
+            onFailure = { error ->
+                when (val result = toAuthResult(error)) {
+                    is SshAuthResult.UserAuthRequired ->
+                        result.copy(keyAlias = result.keyAlias ?: keyAuth?.keyAlias, promptOutcome = promptOutcome)
+                    else -> result
+                }
+            },
         )
+    }
 
     override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone {
         sshStateManager.setConnectionProgress(machine.id, ConnectionProgress.VerifyingUdpOrHello)
@@ -132,6 +177,9 @@ class RealSshBackend internal constructor(
     }
 
     internal companion object {
+        /** The maximum time that [authenticate] waits for the answer of the user to a user authentication prompt. */
+        const val USER_AUTH_TIMEOUT_MS: Long = 60_000L
+
         /** JSch starts the message of a refused login with one of these texts. */
         private val AUTH_FAILURE_PREFIXES = listOf("Auth fail", "Auth cancel")
 
@@ -151,22 +199,25 @@ class RealSshBackend internal constructor(
         /**
          * Maps a login [error] from JSch to its [SshAuthResult] kind. A rejected host key is its
          * [SshAuthResult.HostKeyRejected] kind. A [MissingKeyException] at any level of the cause chain is
-         * [SshAuthResult.KeyMissing]. A refused login is [SshAuthResult.AuthFailed]. An [IOException] at
-         * any level of the cause chain is [SshAuthResult.NetworkError]. A [JSchException] with a message that
-         * starts with a text of [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only the message
-         * of [error] counts, because a cause with that text can be in an error that tells a different kind, for
-         * example a channel that the bastion refuses ([BastionChannelProxy.openFailure]). All other errors are
-         * [SshAuthResult.Failed].
+         * [SshAuthResult.KeyMissing]. A [UserAuthRequiredException] or a [UserNotAuthenticatedException] at any
+         * level of the cause chain is [SshAuthResult.UserAuthRequired]. A refused login is
+         * [SshAuthResult.AuthFailed]. An [IOException] at any level of the cause chain is
+         * [SshAuthResult.NetworkError]. A [JSchException] with a message that starts with a text of
+         * [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only the message of [error] counts,
+         * because a cause with that text can be in an error that tells a different kind, for example a channel
+         * that the bastion refuses ([BastionChannelProxy.openFailure]). All other errors are [SshAuthResult.Failed].
          */
         fun toAuthResult(error: Throwable): SshAuthResult {
             val message = error.message.orEmpty()
-            val missingKey = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH)
-                .filterIsInstance<MissingKeyException>()
-                .firstOrNull()
+            val causes = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
+            val missingKey = causes.filterIsInstance<MissingKeyException>().firstOrNull()
+            val userAuth = causes.firstOrNull { it is UserAuthRequiredException || it is UserNotAuthenticatedException }
             return when {
                 error is HostKeyRejectedException -> error.rejection
 
                 missingKey != null -> SshAuthResult.KeyMissing(missingKey.keyAlias)
+
+                userAuth != null -> SshAuthResult.UserAuthRequired((userAuth as? UserAuthRequiredException)?.keyAlias)
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)
@@ -174,8 +225,7 @@ class RealSshBackend internal constructor(
                 error is JSchException && CLOSED_CONNECTION_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.NetworkError(error)
 
-                generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).any { it is IOException } ->
-                    SshAuthResult.NetworkError(error)
+                causes.any { it is IOException } -> SshAuthResult.NetworkError(error)
 
                 else -> SshAuthResult.Failed(error)
             }

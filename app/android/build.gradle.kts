@@ -114,6 +114,7 @@ dependencies {
     debugImplementation(projects.core.fakeServer)
 
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.biometric)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.core.splash)
     implementation(libs.androidx.lifecycle.runtimeCompose)

@@ -30,6 +30,15 @@ internal suspend fun SshStateManager.runControlRequest(
     return error
 }
 
+/**
+ * Ends the user authentication wait of the machine of [request] at once when [request] is a disconnect. Call it when
+ * the request arrives, before the control queue. A connect that waits for the user can hold that queue for up to
+ * 60 s, so a disconnect in the queue cannot end that wait.
+ */
+internal fun SshStateManager.cancelUserAuthBeforeQueue(request: SshRequest) {
+    if (request is SshRequest.Disconnect) cancelUserAuth(request.machineId)
+}
+
 /** Sets [ConnectionProgress.Failed] when [request] is a connect and its machine is at a connect step. */
 internal fun SshStateManager.markInterruptedConnectFailed(request: SshRequest) {
     if (request !is SshRequest.Connect) return

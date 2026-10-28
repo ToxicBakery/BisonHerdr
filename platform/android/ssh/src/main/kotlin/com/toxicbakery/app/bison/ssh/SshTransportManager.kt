@@ -342,6 +342,7 @@ class SshTransportManager(
         activeMachines.remove(machineId)
         sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.clearNeedsUser(machineId)
+        sshStateManager.cancelUserAuth(machineId)
         sshStateManager.markMachineDisconnected(machineId)
         sshDebugLog.record(
             machineId = machineId,
@@ -713,6 +714,7 @@ class SshTransportManager(
                     "sent ${result.presented.fingerprint})"
 
             is SshAuthResult.KeyMissing -> "KeyMissing (${result.message})"
+            is SshAuthResult.UserAuthRequired -> "UserAuthRequired (${result.message})"
         }
 
     /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */
@@ -735,6 +737,14 @@ class SshTransportManager(
             is SshAuthResult.HostKeyUnknown -> NeedsUserCause.HostKeyUnknown(result.presented.hostPort)
             is SshAuthResult.HostKeyChanged -> NeedsUserCause.HostKeyChanged(result.presented.hostPort)
             is SshAuthResult.KeyMissing -> NeedsUserCause.KeyMissing(result.keyAlias)
+            is SshAuthResult.UserAuthRequired -> {
+                val keyAlias = result.keyAlias
+                if (result.keyNeedsUserForEachSign && keyAlias != null) {
+                    NeedsUserCause.KeyFromEarlierVersion(keyAlias)
+                } else {
+                    NeedsUserCause.UserAuthRequired(keyAlias)
+                }
+            }
             is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
             is SshAuthResult.Failed -> causeOf(result.cause)
             // A login that passed needs nothing. Only an error in the caller gets here.

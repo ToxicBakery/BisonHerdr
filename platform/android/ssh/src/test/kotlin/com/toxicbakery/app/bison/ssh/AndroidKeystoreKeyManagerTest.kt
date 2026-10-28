@@ -1,17 +1,25 @@
 package com.toxicbakery.app.bison.ssh
 
+import android.security.keystore.UserNotAuthenticatedException
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import java.security.InvalidAlgorithmParameterException
 import java.security.KeyPair
+import java.security.PrivateKey
 import java.security.ProviderException
+import java.security.PublicKey
+import java.security.Signature
+import java.security.SignatureException
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 /**
  * Tests that [AndroidKeystoreKeyManager] makes no software key on a device, and that only
@@ -30,16 +38,43 @@ class AndroidKeystoreKeyManagerTest {
         }
     }
 
+    /** A JCA signature whose init throws [error], as AndroidKeyStore does for a locked key. */
+    private class FailingSignature(private val error: Exception) : Signature("failing") {
+        override fun engineInitSign(privateKey: PrivateKey?) {
+            throw error
+        }
+
+        override fun engineInitVerify(publicKey: PublicKey?) {
+            throw UnsupportedOperationException()
+        }
+
+        override fun engineUpdate(b: Byte) = Unit
+
+        override fun engineUpdate(b: ByteArray?, off: Int, len: Int) = Unit
+
+        override fun engineSign(): ByteArray = throw UnsupportedOperationException()
+
+        override fun engineVerify(sigBytes: ByteArray?): Boolean = false
+
+        @Deprecated("Deprecated in SignatureSpi")
+        override fun engineSetParameter(param: String?, value: Any?) = Unit
+
+        @Deprecated("Deprecated in SignatureSpi")
+        override fun engineGetParameter(param: String?): Any? = null
+    }
+
     private fun manager(
         keystore: KeystoreKeyGenerator,
         allowSoftwareKeys: Boolean = false,
         supportedAlgorithms: List<KeyAlgorithm> = KeyAlgorithm.entries.toList(),
+        signatureFactory: (String) -> Signature = { Signature.getInstance(it) },
     ) = AndroidKeystoreKeyManager(
         allowSoftwareKeys = allowSoftwareKeys,
         keystoreKeyGenerator = keystore,
         keySupport = object : KeystoreKeySupport {
             override val supportedAlgorithms: List<KeyAlgorithm> = supportedAlgorithms
         },
+        signatureFactory = signatureFactory,
     )
 
     @Test
@@ -131,6 +166,115 @@ class AndroidKeystoreKeyManagerTest {
         assertIs<MissingKeyException>(runCatching { identity.publicKeyBlob }.exceptionOrNull())
         assertIs<MissingKeyException>(runCatching { identity.getSignature(CHALLENGE, "ssh-ed25519") }.exceptionOrNull())
         assertEquals(0, keystore.calls)
+    }
+
+    @Test
+    fun aSignWithALockedKeyThrowsUserAuthRequiredAndDoesNotTryAgain() {
+        var signatures = 0
+        val locked = UserNotAuthenticatedException()
+        val manager = manager(
+            keystore = FailingKeystore(ProviderException("No AndroidKeyStore")),
+            allowSoftwareKeys = true,
+            signatureFactory = {
+                signatures++
+                FailingSignature(locked)
+            },
+        )
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
+
+        val error = assertFailsWith<UserAuthRequiredException> {
+            manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE)
+        }
+
+        assertEquals(KEY_ALIAS, error.keyAlias)
+        assertSame(locked, error.cause)
+        assertEquals(1, signatures)
+    }
+
+    @Test
+    fun aCheckedSignErrorBecomesAKeySignExceptionThatJschDoesNotHide() {
+        val signError = SignatureException("Keystore operation failed")
+        val manager = manager(
+            keystore = FailingKeystore(ProviderException("No AndroidKeyStore")),
+            allowSoftwareKeys = true,
+            signatureFactory = { FailingSignature(signError) },
+        )
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+
+        val error = assertFailsWith<KeySignException> {
+            manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE)
+        }
+
+        assertEquals(KEY_ALIAS, error.keyAlias)
+        assertSame(signError, error.cause)
+    }
+
+    @Test
+    fun anUncheckedSignErrorIsNotChanged() {
+        val signError = ProviderException("Keystore operation failed")
+        val manager = manager(
+            keystore = FailingKeystore(ProviderException("No AndroidKeyStore")),
+            allowSoftwareKeys = true,
+            signatureFactory = { FailingSignature(signError) },
+        )
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+
+        val error = assertFailsWith<ProviderException> {
+            manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE)
+        }
+
+        assertSame(signError, error)
+    }
+
+    @Test
+    fun storedKeyUserAuthReadsTheStoredKeyAndMakesNoKey() {
+        val keystore = FailingKeystore(ProviderException("No AndroidKeyStore"))
+        var reply: () -> KeyUserAuth = { KeyUserAuth.TimeBound }
+        val manager = AndroidKeystoreKeyManager(
+            allowSoftwareKeys = true,
+            keystoreKeyGenerator = keystore,
+            keyUserAuthReader = { reply() },
+        )
+
+        assertNull(manager.storedKeyUserAuth(KEY_ALIAS))
+        assertEquals(0, keystore.calls)
+
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+        assertEquals(KeyUserAuth.TimeBound, manager.storedKeyUserAuth(KEY_ALIAS))
+
+        reply = { throw ProviderException("No KeyInfo for this key") }
+        assertEquals(KeyUserAuth.Unknown, manager.storedKeyUserAuth(KEY_ALIAS))
+    }
+
+    @Test
+    fun regenerateKeyReplacesTheKeyAndTheNewKeySigns() {
+        val manager = manager(FailingKeystore(ProviderException("No AndroidKeyStore")), allowSoftwareKeys = true)
+        val oldKey = manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+
+        val newKey = manager.regenerateKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
+
+        assertNotEquals(oldKey.openSshAuthorizedKeyLine, newKey.openSshAuthorizedKeyLine)
+        assertEquals(newKey, manager.getExistingPublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256))
+        assertEquals(newKey, manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256))
+        assertTrue(manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE).isNotEmpty())
+    }
+
+    @Test
+    fun regenerateKeyAsksTheKeyStoreWithTheNewParameters() {
+        val requests = mutableListOf<Triple<String, KeyAlgorithm, Boolean>>()
+        val manager = manager(
+            keystore = { alias, algorithm, requireBiometric ->
+                requests += Triple(alias, algorithm, requireBiometric)
+                throw InvalidAlgorithmParameterException(IllegalStateException("No secure lock screen"))
+            },
+        )
+
+        val error = assertFailsWith<KeyCreationException> {
+            manager.regenerateKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
+        }
+
+        assertEquals(KeyCreationFailure.NoSecureLockScreen, error.failure)
+        assertEquals(listOf(Triple(KEY_ALIAS, KeyAlgorithm.EcdsaP256, true)), requests)
     }
 
     private companion object {

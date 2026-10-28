@@ -4,6 +4,9 @@ import androidx.compose.runtime.Composable
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.needs_user_host_key_changed
 import com.toxicbakery.app.bison.resources.needs_user_host_key_unknown
+import com.toxicbakery.app.bison.resources.needs_user_key_from_earlier_version
+import com.toxicbakery.app.bison.resources.needs_user_key_locked
+import com.toxicbakery.app.bison.resources.needs_user_key_locked_no_alias
 import com.toxicbakery.app.bison.resources.needs_user_key_missing
 import com.toxicbakery.app.bison.resources.needs_user_login_refused
 import com.toxicbakery.app.bison.resources.needs_user_other
@@ -21,6 +24,11 @@ fun needsUserText(cause: NeedsUserCause): String =
         is NeedsUserCause.HostKeyChanged -> stringResource(Res.string.needs_user_host_key_changed, cause.hostPort)
         is NeedsUserCause.KeyMissing -> stringResource(Res.string.needs_user_key_missing, cause.keyAlias)
         NeedsUserCause.PasswordMissing -> stringResource(Res.string.needs_user_password_missing)
+        is NeedsUserCause.UserAuthRequired -> cause.keyAlias
+            ?.let { stringResource(Res.string.needs_user_key_locked, it) }
+            ?: stringResource(Res.string.needs_user_key_locked_no_alias)
+        is NeedsUserCause.KeyFromEarlierVersion ->
+            stringResource(Res.string.needs_user_key_from_earlier_version, cause.keyAlias)
         is NeedsUserCause.Unreachable -> stringResource(Res.string.needs_user_unreachable, cause.detail)
         is NeedsUserCause.Other -> stringResource(Res.string.needs_user_other, cause.detail)
     }

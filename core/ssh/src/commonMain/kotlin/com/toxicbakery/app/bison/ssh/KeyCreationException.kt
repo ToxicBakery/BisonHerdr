@@ -5,7 +5,10 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 /** The cause when the device key store does not make a key. */
 sealed interface KeyCreationFailure {
 
-    /** The key needs user authentication, but the device has no secure screen lock or no biometric. */
+    /**
+     * The key needs user authentication, but the device has no secure screen lock. A PIN, a pattern, or a
+     * password is sufficient. A biometric is not necessary.
+     */
     data object NoSecureLockScreen : KeyCreationFailure
 
     /** The key store of the device does not support [algorithm]. For example, Ed25519 needs Android 13. */

@@ -98,9 +98,14 @@
     <string name="machine_field_mosh_ports_label">Mosh UDP Port Range</string>
     <string name="machine_field_auth_method_label">Authentication Method</string>
     <string name="machine_auth_keystore">Android Keystore Private Key (Ed25519 / RSA / ECDSA)</string>
-    <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock and a biometric. Set them in the device settings. Then show the public key again.</string>
+    <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock. Set a PIN, a pattern, or a password in the device settings. Then show the public key again.</string>
     <string name="machine_key_error_algorithm_not_supported">This device cannot make %1$s keys. Select a different key type.</string>
     <string name="machine_key_error_other">The device key store did not make the key: %1$s</string>
+    <string name="machine_key_regenerate_hint">The biometric setting applies only when the app makes a key. To apply a changed setting, or to update a key from an earlier version, make a new key.</string>
+    <string name="machine_key_regenerate">Make a New Key</string>
+    <string name="machine_key_regenerate_warning_title">Make a New Key?</string>
+    <string name="machine_key_regenerate_warning_body">The app replaces the key %1$s with a new key. Hosts that have only the old public key then refuse the login. Add the new public key to ~/.ssh/authorized_keys on each host. All machines that use this key alias use the new key.</string>
+    <string name="machine_key_regenerate_confirm">Replace the Key</string>
     <string name="machine_auth_password">Password / Keyboard-Interactive</string>
     <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
     <string name="machine_bastion_credentials_hint">The app also uses the password or key of this machine for the bastion.</string>
@@ -109,6 +114,11 @@
     <string name="machine_connecting_step_mosh">2. Probing mosh-server &amp; bootstrapping Herdr session&#8230;</string>
     <string name="machine_connecting_step_handshake">3. Verifying Mosh UDP SSP / Endpoint Gen 1 handshake&#8230;</string>
     <string name="machine_connecting_step_snapshot">4. Synchronizing Herdr workspace &amp; agent snapshot&#8230;</string>
+
+    <!-- User Authentication Prompt for an SSH Key that Requires a Biometric -->
+    <string name="user_auth_prompt_title">Unlock the SSH Key</string>
+    <string name="user_auth_prompt_subtitle">Connect to %1$s</string>
+    <string name="user_auth_prompt_description">The key %1$s needs your biometric or your screen lock before the app can use it to connect.</string>
 
     <!-- YubiKey / FIDO2 Hardware Security Key Prompt -->
     <string name="hardware_key_sheet_title">Security Key Verification Required</string>
@@ -138,6 +148,9 @@
     <string name="needs_user_host_key_unknown">The app does not know the host key of %1$s. Accept or reject the key before you connect.</string>
     <string name="needs_user_host_key_changed">The host key of %1$s is different from the saved key. Do not connect until you know why the key changed.</string>
     <string name="needs_user_key_missing">The key %1$s does not exist. Open the machine settings, make a new key, and add its public key to the host.</string>
+    <string name="needs_user_key_locked">The key %1$s is locked. Connect again from the app, and unlock the key with your biometric or your screen lock.</string>
+    <string name="needs_user_key_locked_no_alias">The SSH key is locked. Connect again from the app, and unlock the key with your biometric or your screen lock.</string>
+    <string name="needs_user_key_from_earlier_version">The key %1$s is from an earlier version and needs a user authentication for each sign. This version cannot use it. Open the machine settings, make a new key, and add its public key to the host.</string>
     <string name="needs_user_password_missing">This device does not have the password of this machine. Edit the machine and type the password again.</string>
     <string name="needs_user_unreachable">The app cannot connect to the host: %1$s</string>
     <string name="needs_user_other">The connection failed: %1$s</string>

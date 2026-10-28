@@ -370,6 +370,25 @@ fun ConfigureMachineScreen(
                                     },
                                 )
                             }
+                            if (state.isEditingExisting && state.canShowPublicKey) {
+                                RegenerateKeySection(
+                                    enabled = !state.isLoadingPublicKey,
+                                    onRegenerate = {
+                                        viewModel.onEvent(ConfigureMachineViewModel.Event.RegenerateKey)
+                                    },
+                                )
+                            }
+                            if (state.showRegenerateKeyWarning) {
+                                RegenerateKeyWarningDialog(
+                                    keyAlias = state.keystoreAlias.trim().ifBlank { state.keyAlgorithm.defaultKeystoreAlias },
+                                    onConfirm = {
+                                        viewModel.onEvent(ConfigureMachineViewModel.Event.ConfirmRegenerateKey)
+                                    },
+                                    onDismiss = {
+                                        viewModel.onEvent(ConfigureMachineViewModel.Event.DismissRegenerateKey)
+                                    },
+                                )
+                            }
                             if (state.canShowPublicKey) {
                                 PublicKeySection(
                                     state = state,
