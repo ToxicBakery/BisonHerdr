@@ -6,13 +6,14 @@ import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
 /**
- * Tests that each `herdr` command of [RealHerdrSshClient] has `--session <name>` when the machine has a Herdr session
- * name, and no `--session` when the machine has no name. [HerdrSessionTest] runs the same commands on a real SSH
- * server.
+ * Tests the Herdr session of each `herdr` command of [RealHerdrSshClient]. A machine with a Herdr session name gets
+ * `--session <name>`. A machine with no name gets no `--session`. [HerdrSessionTest] runs the same commands on a real
+ * SSH server.
  */
 class HerdrCommandTest {
 
@@ -43,7 +44,7 @@ class HerdrCommandTest {
 
     @Test
     fun theWorkerScriptStartsEachApiBridgeCallWithTheSessionOfTheMachine() {
-        val (script, _) = client().buildShellBatchScript(BATCH_ID, BATCH, herdrSessionName = "work")
+        val (script, _) = client().buildShellBatchScript(BATCH_ID, BATCH, HerdrCommand.forSession("work"))
 
         assertEquals(
             listOf(
@@ -56,7 +57,7 @@ class HerdrCommandTest {
 
     @Test
     fun theWorkerScriptHasNoSessionFlagForAMachineWithNoSessionName() {
-        val (script, _) = client().buildShellBatchScript(BATCH_ID, BATCH, herdrSessionName = null)
+        val (script, _) = client().buildShellBatchScript(BATCH_ID, BATCH, HerdrCommand.forSession(null))
 
         assertEquals(
             listOf(
@@ -69,7 +70,7 @@ class HerdrCommandTest {
 
     @Test
     fun theOneShotScriptStartsEachApiBridgeCallWithTheSessionOfTheMachine() {
-        val script = client().buildOneShotBatchScript(BATCH_ID, BATCH, herdrSessionName = "work")
+        val script = client().buildOneShotBatchScript(BATCH_ID, BATCH, HerdrCommand.forSession("work"))
 
         assertEquals(
             listOf(
@@ -82,7 +83,7 @@ class HerdrCommandTest {
 
     @Test
     fun theOneShotScriptHasNoSessionFlagForAMachineWithNoSessionName() {
-        val script = client().buildOneShotBatchScript(BATCH_ID, BATCH, herdrSessionName = null)
+        val script = client().buildOneShotBatchScript(BATCH_ID, BATCH, HerdrCommand.forSession(null))
 
         assertEquals(
             listOf(
@@ -109,6 +110,51 @@ class HerdrCommandTest {
         )
     }
 
+    @Test
+    fun aPollWithNoSnapshotTellsWhenHerdrDoesNotAcceptTheSessionName() = runTest {
+        val debugLog = SshDebugLog()
+        val machine = machine(sessionName = "my work")
+        // Herdr writes the error only to standard error, so the batch has no output.
+        val client = client(debugLog) { "" }
+
+        assertFalse(client.refreshSnapshotAndSurface(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        assertEquals(
+            listOf(
+                "No snapshot from `herdr --session 'my work' api snapshot`: Herdr does not accept the session name " +
+                    "\"my work\". Change the name in the machine settings.",
+            ),
+            snapshotErrors(debugLog),
+        )
+    }
+
+    @Test
+    fun aPollWithNoSnapshotWritesTheErrorOfHerdrOnceForEachSeries() = runTest {
+        val debugLog = SshDebugLog()
+        val machine = machine(sessionName = "work")
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+        var snapshotAnswer = SERVER_NOT_RUNNING_JSON
+        val client = client(debugLog) { batch ->
+            if (batch.any { it is RealHerdrSshClient.RemoteShellCommand.Exec }) snapshotAnswer + "\n" else ""
+        }
+        val expected = "No snapshot from `herdr --session 'work' api snapshot`: no herdr server is running"
+
+        assertFalse(client.refreshSnapshotAndSurface(machine, route))
+        assertFalse(client.refreshSnapshotAndSurface(machine, route))
+        assertEquals(listOf(expected), snapshotErrors(debugLog))
+
+        // A poll with a snapshot ends the series. The next poll that fails writes a new error.
+        snapshotAnswer = SNAPSHOT_JSON
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+        snapshotAnswer = SERVER_NOT_RUNNING_JSON
+        assertFalse(client.refreshSnapshotAndSurface(machine, route))
+        assertEquals(listOf(expected, expected), snapshotErrors(debugLog))
+    }
+
+    /** Returns the errors in [debugLog] for a poll with no snapshot. */
+    private fun snapshotErrors(debugLog: SshDebugLog): List<String> =
+        debugLog.entries.value.filter { it.isError && it.message.startsWith("No snapshot") }.map { it.message }
+
     /** Runs the connect check and one poll of [machine]. Returns the text of each `Exec` command, in order. */
     private suspend fun execCommands(machine: HostMachine): List<String> {
         val commands = CopyOnWriteArrayList<RealHerdrSshClient.RemoteShellCommand>()
@@ -129,10 +175,11 @@ class HerdrCommandTest {
     }
 
     private fun client(
+        debugLog: SshDebugLog = SshDebugLog(),
         execute: (List<RealHerdrSshClient.RemoteShellCommand>) -> String = { "" },
     ) = RealHerdrSshClient(
         localNetworkGuard = permittedLocalNetwork(),
-        sshDebugLog = SshDebugLog(),
+        sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = PaneSurfaceBus(),
         semanticNotificationBus = SemanticNotificationBus(),
@@ -154,6 +201,10 @@ class HerdrCommandTest {
 
     internal companion object {
         const val BATCH_ID = 7L
+
+        /** The answer of `herdr api snapshot` when the session has no server. */
+        const val SERVER_NOT_RUNNING_JSON =
+            """{"id":"cli:api:snapshot","error":{"code":"server_not_running","message":"no herdr server is running"}}"""
 
         /** The answer of `herdr api snapshot` for a host with one pane, `w1:p1`. */
         const val SNAPSHOT_JSON =

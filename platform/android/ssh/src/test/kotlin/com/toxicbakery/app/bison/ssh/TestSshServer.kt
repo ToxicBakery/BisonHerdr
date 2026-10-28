@@ -89,8 +89,8 @@ internal class TestSshServer(
 
     /**
      * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The workers of the client put
-     * `$HOME/.local/bin` first on the `PATH`. Thus a test that sets this directory finds a program in its own
-     * `.local/bin` before a program of the same name on the test machine, for example `herdr`.
+     * `$HOME/.local/bin` first on the `PATH`. Thus a command finds a program in the `.local/bin` of this directory
+     * first. A program of the same name on the test machine, for example `herdr`, comes after it.
      */
     @Volatile
     var homeDirectory: File? = null

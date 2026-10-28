@@ -9,6 +9,7 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
@@ -18,12 +19,14 @@ import kotlinx.coroutines.test.runTest
  * Tests the Herdr session of each `herdr` call that [RealHerdrSshClient] makes on a real SSH server ([TestSshServer]).
  *
  * The server runs each command with [home] as `HOME`. The workers of the client put `$HOME/.local/bin` first on the
- * `PATH`, so they find the fake `herdr` of [FAKE_HERDR] and not a `herdr` of the test machine. The fake writes the
- * arguments of each call to [callLog] and gives a small answer.
+ * `PATH`. Thus they find the fake `herdr` of [FAKE_HERDR], and not a `herdr` of the test machine. Each test also
+ * checks this path before it sends a request to Herdr. The fake writes the arguments of each call to [callLog] and
+ * gives a small answer.
  */
 class HerdrSessionTest {
 
     private val home = createTempDirectory("bison-herdr-home").toFile()
+    private val fakeHerdr = File(home, ".local/bin/herdr")
     private val callLog = File(home, "herdr-calls")
     private val server = TestSshServer().apply { homeDirectory = home }.start()
     private val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply {
@@ -45,10 +48,10 @@ class HerdrSessionTest {
 
     init {
         File(home, ".local/bin").mkdirs()
-        File(home, ".local/bin/herdr").apply {
-            writeText(FAKE_HERDR)
-            setExecutable(true)
-        }
+        fakeHerdr.writeText(FAKE_HERDR)
+        // A command must not find a different herdr, for example when the temporary directory does not allow programs.
+        check(fakeHerdr.setExecutable(true)) { "Cannot make $fakeHerdr executable" }
+        check(fakeHerdr.canExecute()) { "Cannot run $fakeHerdr" }
         File(home, "snapshot.json").writeText(HerdrCommandTest.SNAPSHOT_JSON + "\n")
         File(home, "read.json").writeText(PANE_READ_JSON + "\n")
     }
@@ -105,11 +108,68 @@ class HerdrSessionTest {
         calls.forEach { call -> assertEquals(listOf("--session", name), call.take(2), debugLogDump()) }
     }
 
+    @Test
+    fun theNewWorkerAndTheOneShotFallbackKeepTheSessionOfTheMachine() = runTest {
+        val (machine, route) = connect(sessionName = "work")
+        // The fake stops the worker in the first two calls of remote-api-bridge.
+        File(home, "kill-workers").writeText("2\n")
+
+        val answer = backend.sendEndpointCommand(machine, route, SEND_ENTER, isMoshActive = false)
+
+        assertNotNull(answer, debugLogDump())
+        assertEquals(
+            listOf(
+                listOf("--session", "work", "--version"),
+                // The fake stops the Input worker. The client opens a new worker and sends the batch again.
+                listOf("--session", "work", "remote-api-bridge"),
+                // The fake stops the new worker too. The client sends the batch on a one-shot channel.
+                listOf("--session", "work", "remote-api-bridge"),
+                listOf("--session", "work", "remote-api-bridge"),
+                listOf("--session", "work", "remote-api-bridge"),
+            ),
+            readCalls(),
+            debugLogDump(),
+        )
+    }
+
+    @Test
+    fun theDebugLogShowsTheErrorThatHerdrWritesToStandardError() = runTest {
+        val (machine, route) = connect(sessionName = "work")
+        val error = File(home, "snapshot-error")
+        error.writeText("error: no server for this test\n")
+
+        // Herdr fails two polls. The client writes one error for the two polls.
+        assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
+        assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
+        val expected = "No snapshot from `herdr --session 'work' api snapshot`: error: no server for this test"
+        assertEquals(listOf(expected), snapshotErrors(), debugLogDump())
+
+        // A poll with a snapshot ends the series. The next poll that fails writes a new error.
+        error.delete()
+        assertTrue(backend.client.refreshSnapshotAndSurface(machine, route), debugLogDump())
+        error.writeText("error: no server for this test\n")
+        assertFalse(backend.client.refreshSnapshotAndSurface(machine, route))
+        assertEquals(listOf(expected, expected), snapshotErrors(), debugLogDump())
+    }
+
     /**
      * Connects a machine with the Herdr session [sessionName], runs one poll, and sends one key to the pane. Returns
      * the arguments of each `herdr` call, in order.
      */
     private suspend fun runControlLane(sessionName: String?): List<List<String>> {
+        val (machine, route) = connect(sessionName)
+
+        assertTrue(backend.client.refreshSnapshotAndSurface(machine, route), debugLogDump())
+        val answer = backend.sendEndpointCommand(machine, route, SEND_ENTER, isMoshActive = false)
+        assertNotNull(answer, debugLogDump())
+        return readCalls()
+    }
+
+    /**
+     * Logs in to a new machine with the Herdr session [sessionName]. The login runs `herdr --version`. Then the
+     * function checks that the shell of the client finds [fakeHerdr], and not a `herdr` of the test machine.
+     */
+    private suspend fun connect(sessionName: String?): Pair<HostMachine, ResolvedSshRoute> {
         val machine = server.machine(
             id = "session-${machines.size}",
             username = TestSshServer.KEY_USER,
@@ -119,19 +179,8 @@ class HerdrSessionTest {
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
         assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
-        assertTrue(backend.client.refreshSnapshotAndSurface(machine, route), debugLogDump())
-        val answer = backend.sendEndpointCommand(
-            machine = machine,
-            route = route,
-            request = ClientShellEndpointRequest(
-                id = "keys",
-                method = "pane.send_keys",
-                paramsJson = """{"pane_id":"w1:p1","keys":["Enter"]}""",
-            ),
-            isMoshActive = false,
-        )
-        assertNotNull(answer, debugLogDump())
-        return readCalls()
+        assertEquals(fakeHerdr.absolutePath, backend.client.runCommand(machine, route, "command -v herdr").trim())
+        return machine to route
     }
 
     /** Reads [callLog]. The fake writes each argument on its own line, and [CALL_END] after the last argument. */
@@ -150,6 +199,10 @@ class HerdrSessionTest {
         return calls
     }
 
+    /** Returns the errors in the debug log for a poll with no snapshot. */
+    private fun snapshotErrors(): List<String> =
+        debugLog.entries.value.filter { it.isError && it.message.startsWith("No snapshot") }.map { it.message }
+
     private fun debugLogDump(): String = debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
 
     private companion object {
@@ -160,17 +213,46 @@ class HerdrSessionTest {
         const val PANE_READ_JSON =
             """{"id":"read_w1:p1","result":{"type":"pane_read","read":{"pane_id":"w1:p1","text":"ready"}}}"""
 
+        /** A request that sends Enter to the pane `w1:p1` on the Input lane. */
+        val SEND_ENTER = ClientShellEndpointRequest(
+            id = "keys",
+            method = "pane.send_keys",
+            paramsJson = """{"pane_id":"w1:p1","keys":["Enter"]}""",
+        )
+
         /**
          * A fake `herdr` for POSIX `sh`. It writes its arguments to `$HOME/herdr-calls`, one line for each argument.
          * It answers `--version`, `api snapshot`, and one request of `remote-api-bridge`.
+         *
+         * Two files change its answers:
+         * - `$HOME/snapshot-error`: `api snapshot` writes this text to standard error and exits with code 2, as Herdr
+         *   does for a session name that it does not accept. It waits before it exits, so that the error gets to the
+         *   client before the next output of the worker.
+         * - `$HOME/kill-workers`: the first N calls of `remote-api-bridge` stop the shell that runs them. The fake
+         *   stops only a shell, never a different process.
          */
         val FAKE_HERDR = """
             #!/bin/sh
             printf '%s\n' "${'$'}@" '$CALL_END' >> "${'$'}HOME/herdr-calls"
             case " ${'$'}* " in
                 *" --version "*) echo 'herdr 0.9.5' ;;
-                *" api snapshot "*) cat "${'$'}HOME/snapshot.json" ;;
+                *" api snapshot "*)
+                    if [ -e "${'$'}HOME/snapshot-error" ]; then
+                        cat "${'$'}HOME/snapshot-error" >&2
+                        sleep 0.3
+                        exit 2
+                    fi
+                    cat "${'$'}HOME/snapshot.json"
+                    ;;
                 *" remote-api-bridge "*)
+                    count=${'$'}(( ${'$'}(cat "${'$'}HOME/bridge-count" 2>/dev/null || echo 0) + 1 ))
+                    echo "${'$'}count" > "${'$'}HOME/bridge-count"
+                    if [ "${'$'}count" -le "${'$'}(cat "${'$'}HOME/kill-workers" 2>/dev/null || echo 0)" ]; then
+                        case ${'$'}(ps -o comm= -p "${'$'}PPID") in
+                            *sh) kill -KILL "${'$'}PPID" ;;
+                        esac
+                        exit 1
+                    fi
                     IFS= read -r request
                     case ${'$'}request in
                         *'"pane.read"'*) cat "${'$'}HOME/read.json" ;;

@@ -47,6 +47,22 @@ data class HostMachine(
         const val DEFAULT_SSH_PORT: Int = 22
         const val DEFAULT_MOSH_UDP_PORT_RANGE: String = "60000:61000"
         const val DEFAULT_FONT_SIZE_SP: Float = 13f
+
+        /** The maximum length of a Herdr session name. See [isValidHerdrSessionName]. */
+        const val MAX_HERDR_SESSION_NAME_LENGTH: Int = 64
+
+        /**
+         * Returns true when Herdr accepts [name] as a session name. The rule is `validate_name` in `src/session.rs`
+         * of Herdr 0.9.5. A valid name has 1 to [MAX_HERDR_SESSION_NAME_LENGTH] characters. It has only the ASCII
+         * letters, the digits, `.`, `_`, and `-`. The names `.` and `..` are not valid.
+         *
+         * Herdr refuses a command with a name that is not valid, and writes the error only to standard error.
+         */
+        fun isValidHerdrSessionName(name: String): Boolean =
+            name.length in 1..MAX_HERDR_SESSION_NAME_LENGTH &&
+                name != "." &&
+                name != ".." &&
+                name.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '.' || it == '_' || it == '-' }
     }
 }
 
