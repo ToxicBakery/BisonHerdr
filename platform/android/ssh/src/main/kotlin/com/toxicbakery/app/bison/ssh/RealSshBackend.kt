@@ -112,6 +112,16 @@ class RealSshBackend internal constructor(
         /** JSch starts the message of a refused login with one of these texts. */
         private val AUTH_FAILURE_PREFIXES = listOf("Auth fail", "Auth cancel")
 
+        /**
+         * JSch starts the message of these errors with one of these texts. The connection or the session closed, but
+         * the error has no [IOException] cause.
+         */
+        private val CLOSED_CONNECTION_PREFIXES = listOf(
+            "connection is closed by foreign host",
+            "channel is not opened.",
+            "session is down",
+        )
+
         /** The maximum number of causes that [toAuthResult] examines. */
         private const val MAX_CAUSE_DEPTH = 16
 
@@ -119,8 +129,11 @@ class RealSshBackend internal constructor(
          * Maps a login [error] from JSch to its [SshAuthResult] kind. A rejected host key is its
          * [SshAuthResult.HostKeyRejected] kind. A [MissingKeyException] at any level of the cause chain is
          * [SshAuthResult.KeyMissing]. A refused login is [SshAuthResult.AuthFailed]. An [IOException] at
-         * any level of the cause chain is [SshAuthResult.NetworkError]. All other errors
-         * are [SshAuthResult.Failed].
+         * any level of the cause chain is [SshAuthResult.NetworkError]. A [JSchException] with a message that
+         * starts with a text of [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only the message
+         * of [error] counts, because a cause with that text can be in an error that tells a different kind, for
+         * example a channel that the bastion refuses ([BastionChannelProxy.openFailure]). All other errors are
+         * [SshAuthResult.Failed].
          */
         fun toAuthResult(error: Throwable): SshAuthResult {
             val message = error.message.orEmpty()
@@ -134,6 +147,9 @@ class RealSshBackend internal constructor(
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)
+
+                error is JSchException && CLOSED_CONNECTION_PREFIXES.any { message.startsWith(it) } ->
+                    SshAuthResult.NetworkError(error)
 
                 generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).any { it is IOException } ->
                     SshAuthResult.NetworkError(error)
