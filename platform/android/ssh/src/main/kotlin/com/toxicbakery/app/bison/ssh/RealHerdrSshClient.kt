@@ -710,6 +710,7 @@ internal class RealHerdrSshClient(
         val watch = AgentStatusWatch(
             knownPaneIds = { withFrames(machine.id) { it.knownAgents?.keys?.toSet() } },
             readSnapshot = { readAgentSnapshot(machine, route) },
+            timeSource = timeSource,
             openStream = { requestLine -> opener(machine, route, requestLine) },
             onStatusEvent = { agent -> recordAgentStatusEvent(machine, agent) },
             log = { message, isError ->
@@ -1223,7 +1224,8 @@ internal class RealHerdrSshClient(
     /**
      * Reads a snapshot of [machine] for its [AgentStatusWatch]. It reads no panes and publishes nothing on the
      * snapshot and surface buses. It records the agents, publishes their alerts, and returns the agent panes. Returns
-     * null when the output has no snapshot.
+     * null when the output has no snapshot. Then it writes the cause to the debug log, as the poll does
+     * ([recordMissingSnapshot]).
      */
     private suspend fun readAgentSnapshot(machine: HostMachine, route: ResolvedSshRoute): Set<String>? =
         withContext(Dispatchers.IO) {
@@ -1232,10 +1234,14 @@ internal class RealHerdrSshClient(
                 machine = machine,
                 route = route,
                 lane = WorkerLane.Poll,
-                commands = listOf(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot")),
+                commands = listOf(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot 2>&1")),
                 onLaneLocked = { seq = pollSequence.incrementAndGet() },
             )
-            val snapshotObj = findSnapshotObject(output) ?: return@withContext null
+            val snapshotObj = findSnapshotObject(output) ?: run {
+                recordMissingSnapshot(machine, output)
+                return@withContext null
+            }
+            machinesWithoutSnapshot.remove(machine.id)
             val agents = (snapshotObj["agents"] as? JsonArray).orEmpty().mapNotNull { element ->
                 (element as? JsonObject)?.let { parseAgentObject(it, focusedPaneId = null) }
             }
@@ -1253,7 +1259,9 @@ internal class RealHerdrSshClient(
         val seq = pollSequence.incrementAndGet()
         val alerts = withFrames(machine.id) { frames ->
             // With no known agents, the client has no snapshot since the last disconnect. Then it ignores the event.
-            recordAgents(frames, seq) { known -> known?.let { AgentStatusTransitions.fromEvent(it, agent) } }
+            recordAgents(frames, seq) { known ->
+                known?.let { AgentStatusTransitions.fromEvent(it, agent) }
+            }
         }
         publishAgentAlerts(machine.id, alerts)
     }
@@ -1294,6 +1302,9 @@ internal class RealHerdrSshClient(
      * Opens an `exec` channel that runs `herdr remote-api-bridge` on the session of [machine], and sends
      * [requestLine]. The channel keeps its input open, because Herdr ends a subscription when the bridge reads more
      * input or the end of its input. The stream ends when the channel closes, for example when the session closes.
+     *
+     * A cancel during the open does not leave the channel open: [openNonCancellable] closes it. Each open channel
+     * uses one session of the `MaxSessions` limit of the host, and a subscription on the host.
      */
     private suspend fun openBridgeEventStream(
         machine: HostMachine,
@@ -1302,39 +1313,56 @@ internal class RealHerdrSshClient(
     ): AgentEventStream = withContext(Dispatchers.IO) {
         awaitSession(machine)
         val session = getOrOpenSession(machine, route)
-        val channel = session.openChannel("exec") as ChannelExec
-        channel.setCommand("$REMOTE_PATH_EXPORT; exec ${HerdrCommand.of(machine)} remote-api-bridge")
-        val stdout = channel.inputStream
-        val stdin = channel.outputStream
-        channel.setErrStream(DiscardingOutputStream)
-        try {
-            channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
-            stdin.write("$requestLine\n".toByteArray(Charsets.UTF_8))
-            stdin.flush()
-        } catch (error: Exception) {
-            channel.disconnect()
-            throw error
-        }
-        BridgeEventStream(channel, BufferedReader(InputStreamReader(stdout, Charsets.UTF_8)))
+        openNonCancellable(
+            open = {
+                val channel = session.openChannel("exec") as ChannelExec
+                channel.setCommand("$REMOTE_PATH_EXPORT; exec ${HerdrCommand.of(machine)} remote-api-bridge")
+                val stdout = channel.inputStream
+                val stdin = channel.outputStream
+                val errors = TailOutputStream(MAX_LOGGED_CAUSE_LENGTH * 2)
+                channel.setErrStream(errors)
+                try {
+                    channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
+                    stdin.write("$requestLine\n".toByteArray(Charsets.UTF_8))
+                    stdin.flush()
+                } catch (error: Exception) {
+                    channel.disconnect()
+                    throw error
+                }
+                BridgeEventStream(channel, BufferedReader(InputStreamReader(stdout, Charsets.UTF_8)), errors)
+            },
+            close = { it.close() },
+        )
     }
 
     /** The output lines of one `herdr remote-api-bridge` channel. See [openBridgeEventStream]. */
     private class BridgeEventStream(
         private val channel: ChannelExec,
         private val reader: BufferedReader,
+        private val errors: TailOutputStream,
     ) : AgentEventStream {
         override suspend fun readLine(): String? = runInterruptible(Dispatchers.IO) { reader.readLine() }
+
+        override fun errorText(): String? =
+            errors.text().lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }?.take(MAX_LOGGED_CAUSE_LENGTH)
 
         override fun close() {
             runCatching { channel.disconnect() }
         }
     }
 
-    /** Drops the error output of a channel that stays open for a long time. */
-    private object DiscardingOutputStream : OutputStream() {
-        override fun write(b: Int) = Unit
+    /** Keeps the last [capacity] bytes of the error output of a channel that stays open for a long time. */
+    private class TailOutputStream(private val capacity: Int) : OutputStream() {
+        private val bytes = ArrayDeque<Byte>(capacity)
 
-        override fun write(b: ByteArray, off: Int, len: Int) = Unit
+        @Synchronized
+        override fun write(b: Int) {
+            if (bytes.size == capacity) bytes.removeFirst()
+            bytes.addLast(b.toByte())
+        }
+
+        @Synchronized
+        fun text(): String = bytes.toByteArray().toString(Charsets.UTF_8)
     }
 
     /** Returns the snapshot object of the `herdr api snapshot` output in [output], or null. */

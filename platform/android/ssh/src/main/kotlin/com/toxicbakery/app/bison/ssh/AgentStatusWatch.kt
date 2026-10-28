@@ -6,14 +6,19 @@ import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 
@@ -22,8 +27,29 @@ internal interface AgentEventStream {
     /** Waits for the next line of the host. Returns null when the stream ended. */
     suspend fun readLine(): String?
 
+    /** Returns the last line of the error output of the process, or null. A Herdr error tells the cause there. */
+    fun errorText(): String? = null
+
     /** Closes the stream. A [readLine] that waits then returns null or throws. */
     fun close()
+}
+
+/**
+ * Runs [open] to its end, also when the caller is cancelled during [open], and returns its resource. When the caller
+ * is cancelled, this function gives the resource to [close] and throws the [CancellationException].
+ *
+ * `withContext` discards the result of a block that ends after a cancel. Thus a resource that [open] makes, for
+ * example an SSH channel, stays open with no owner. This function closes it.
+ */
+internal suspend fun <T> openNonCancellable(open: suspend () -> T, close: (T) -> Unit): T {
+    val resource = withContext(NonCancellable) { open() }
+    try {
+        currentCoroutineContext().ensureActive()
+    } catch (error: CancellationException) {
+        close(resource)
+        throw error
+    }
+    return resource
 }
 
 /**
@@ -32,20 +58,21 @@ internal interface AgentEventStream {
  * While the lease is off, the control poll of [RealHerdrSshClient] reads nothing, and it runs [run]. One
  * subscription has these steps:
  * 1. The watch opens a stream with an `events.subscribe` request ([openStream]). The request names the agent panes
- *    that the client knows ([knownPaneIds]). After a failed request, the watch reads a snapshot first, because a
- *    pane of the request can be closed.
+ *    that the client knows ([knownPaneIds]). After a failure, the watch reads a snapshot first, because a pane of the
+ *    request can be closed, and Herdr then refuses the full request.
  * 2. Herdr answers `subscription_started`. Then the watch reads one snapshot ([readSnapshot]). Thus a status change
  *    between the last snapshot and the start of the subscription also gives its alert.
  * 3. The watch gives each `pane.agent_status_changed` event to [onStatusEvent].
- * 4. A `pane.agent_detected` event, or a snapshot with different agent panes, starts a new subscription, because
- *    Herdr needs one subscription for each pane. After a `pane.agent_detected` event, the watch reads a snapshot
- *    first, so that the new request has the new panes. The new subscription starts after [RESUBSCRIBE_DELAY], so
- *    that an agent that starts and stops again and again cannot cause a fast loop of requests.
+ * 4. Herdr writes the event `pane_agent_detected` when an agent starts or stops in a pane. For a new pane or a stopped
+ *    agent, the watch starts a new subscription with the panes of a new snapshot, because Herdr needs one subscription
+ *    for each pane. A snapshot with different agent panes also starts a new subscription. The new subscription starts
+ *    after [RESUBSCRIBE_DELAY], so that an agent that starts and stops again and again cannot cause a fast loop.
  *
  * Herdr ends the stream when the bridge reads more input or the end of its input, so the stream keeps its input
  * open. While no agent changes, the stream sends no data. When a step fails or the stream ends, [run] waits for the
- * delay from [retryDelay] and starts a new subscription. [run] ends when its coroutine is cancelled or when
- * `awaitLive` returns false.
+ * delay from [retryDelay] and starts a new subscription. Only a stream that stayed open for [STABLE_STREAM_TIME]
+ * starts the delays again from the first delay. [run] ends when its coroutine is cancelled or when `awaitLive`
+ * returns false.
  */
 internal class AgentStatusWatch(
     /** Returns the agent panes of the last snapshot of the machine, or null when the client has no snapshot. */
@@ -60,17 +87,22 @@ internal class AgentStatusWatch(
     private val log: (message: String, isError: Boolean) -> Unit,
     /** Gives the delay after a number of failed subscriptions in sequence. */
     private val retryDelay: (failures: Int) -> Duration = ::defaultRetryDelay,
+    /** Measures how long a stream stayed open. A test gives a source with virtual time. */
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     /** How one subscription ended. */
     private sealed interface Outcome {
         /**
-         * The agent panes changed. Start a new subscription at once. When [snapshotFirst] is true, the client does not
-         * know the new panes yet.
+         * The agent panes changed. Start a new subscription after [RESUBSCRIBE_DELAY]. When [snapshotFirst] is true,
+         * the client does not know the new panes yet.
          */
         data class Resubscribe(val snapshotFirst: Boolean) : Outcome
 
-        /** A step failed, or the stream ended. [started] is true when Herdr started the subscription. */
-        data class Failed(val cause: String, val started: Boolean) : Outcome
+        /**
+         * A step failed, or the stream ended. [stable] is true when Herdr started the subscription and the stream
+         * stayed open for [STABLE_STREAM_TIME] or more.
+         */
+        data class Failed(val cause: String, val stable: Boolean = false) : Outcome
     }
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -91,8 +123,8 @@ internal class AgentStatusWatch(
                 }
 
                 is Outcome.Failed -> {
-                    failures = if (outcome.started) 1 else failures + 1
-                    snapshotFirst = !outcome.started
+                    failures = if (outcome.stable) 1 else failures + 1
+                    snapshotFirst = true
                     val nextDelay = retryDelay(failures)
                     log(
                         "The agent watch stopped: ${outcome.cause}. The next attempt starts in " +
@@ -112,8 +144,8 @@ internal class AgentStatusWatch(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            return failure(error, started = false)
-        } ?: return Outcome.Failed("Herdr gave no snapshot", started = false)
+            return failure(error)
+        } ?: return Outcome.Failed("Herdr gave no snapshot")
 
         val request = HerdrRpcBuilder.toNdjsonLine(HerdrRpcBuilder.agentStatusSubscribe(paneIds.sorted())).trim()
         val stream = try {
@@ -121,41 +153,62 @@ internal class AgentStatusWatch(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            return failure(error, started = false)
+            return failure(error)
         }
-        var started = false
+        var startedAt: TimeMark? = null
         return try {
             val answer = readObject(stream)
-                ?: return Outcome.Failed("The stream ended before Herdr answered", started = false)
+                ?: return Outcome.Failed(stream.errorText() ?: "The stream ended before Herdr answered")
             if (!isSubscriptionStarted(answer)) {
-                return Outcome.Failed(errorOf(answer) ?: "Herdr did not start the subscription", started = false)
+                return Outcome.Failed(errorOf(answer) ?: "Herdr did not start the subscription")
             }
-            started = true
+            val started = timeSource.markNow().also { startedAt = it }
             log("The agent watch subscribed to ${paneIds.size} agent panes", false)
             val snapshotPaneIds = readSnapshot()
-                ?: return Outcome.Failed("Herdr gave no snapshot", started = true)
+                ?: return Outcome.Failed("Herdr gave no snapshot")
             if (snapshotPaneIds != paneIds) return Outcome.Resubscribe(snapshotFirst = false)
-            readEvents(stream)
+            readEvents(stream, paneIds, started)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            failure(error, started)
+            failure(error, startedAt)
         } finally {
             stream.close()
         }
     }
 
     /** Reads the events of a started subscription until the agent panes change or the stream ends. */
-    private suspend fun readEvents(stream: AgentEventStream): Outcome {
+    private suspend fun readEvents(stream: AgentEventStream, paneIds: Set<String>, startedAt: TimeMark): Outcome {
         while (true) {
-            val obj = readObject(stream) ?: return Outcome.Failed("The stream ended", started = true)
+            val obj = readObject(stream)
+                ?: return Outcome.Failed(
+                    cause = stream.errorText()?.let { "The stream ended: $it" } ?: "The stream ended",
+                    stable = isStable(startedAt),
+                )
             when (obj.text("event")) {
-                STATUS_EVENT -> parseStatusEvent(obj)?.let(onStatusEvent)
-                AGENT_DETECTED_EVENT -> return Outcome.Resubscribe(snapshotFirst = true)
-                else -> errorOf(obj)?.let { return Outcome.Failed(it, started = true) }
+                in STATUS_EVENTS -> parseStatusEvent(obj)?.let(onStatusEvent)
+                in AGENT_DETECTED_EVENTS -> if (changesPanes(obj, paneIds)) {
+                    return Outcome.Resubscribe(snapshotFirst = true)
+                }
+                else -> errorOf(obj)?.let { return Outcome.Failed(it, stable = isStable(startedAt)) }
             }
         }
     }
+
+    /**
+     * Returns true when the `pane_agent_detected` event [obj] changes the agent panes: an agent in a pane that is not
+     * in [paneIds], or an agent that stopped. Herdr also writes this event for an agent that it finds again in a pane
+     * of the subscription. Such an event changes nothing.
+     */
+    private fun changesPanes(obj: JsonObject, paneIds: Set<String>): Boolean {
+        val data = obj["data"] as? JsonObject ?: return true
+        val paneId = data.text("pane_id") ?: return true
+        val released = (data["released"] as? JsonPrimitive)?.booleanOrNull == true
+        return released || paneId !in paneIds
+    }
+
+    private fun isStable(startedAt: TimeMark?): Boolean =
+        startedAt != null && startedAt.elapsedNow() >= STABLE_STREAM_TIME
 
     /** Returns the next JSON object of [stream]. It skips the lines that are not JSON. Returns null at the end. */
     private suspend fun readObject(stream: AgentEventStream): JsonObject? {
@@ -196,9 +249,9 @@ internal class AgentStatusWatch(
      * then throws an [java.io.IOException]. Thus this function first throws a [CancellationException] when the
      * coroutine is cancelled.
      */
-    private suspend fun failure(error: Exception, started: Boolean): Outcome.Failed {
+    private suspend fun failure(error: Exception, startedAt: TimeMark? = null): Outcome.Failed {
         currentCoroutineContext().ensureActive()
-        return Outcome.Failed(causeOf(error), started)
+        return Outcome.Failed(causeOf(error), stable = isStable(startedAt))
     }
 
     private fun JsonObject.text(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
@@ -210,14 +263,23 @@ internal class AgentStatusWatch(
         /** Herdr writes this result type when the subscription starts. */
         const val SUBSCRIPTION_STARTED: String = "subscription_started"
 
-        /** The event of a status change of one pane. */
-        const val STATUS_EVENT: String = "pane.agent_status_changed"
+        /**
+         * The names of the event of a status change of one pane. Herdr 0.9.0 to 0.9.5 writes the first name. The
+         * watch also accepts the name in the form of the other Herdr events.
+         */
+        val STATUS_EVENTS: Set<String> = setOf("pane.agent_status_changed", "pane_agent_status_changed")
 
-        /** The event of an agent that started or stopped in a pane. */
-        const val AGENT_DETECTED_EVENT: String = "pane.agent_detected"
+        /**
+         * The names of the event of an agent that started or stopped in a pane. Herdr 0.9.0 to 0.9.5 writes the first
+         * name, because its `EventKind` uses `snake_case`. Only the subscribe request uses the name with a dot.
+         */
+        val AGENT_DETECTED_EVENTS: Set<String> = setOf("pane_agent_detected", "pane.agent_detected")
 
         /** The delay before a new subscription after a change of the agent panes. */
         val RESUBSCRIBE_DELAY: Duration = 1.seconds
+
+        /** A stream that stayed open for this time starts the delays again from the first delay. */
+        val STABLE_STREAM_TIME: Duration = 60.seconds
 
         /** The delay after the first failed subscription. Each failure in sequence doubles it. */
         val FIRST_RETRY_DELAY: Duration = 5.seconds
