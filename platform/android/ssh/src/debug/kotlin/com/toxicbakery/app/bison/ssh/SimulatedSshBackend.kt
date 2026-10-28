@@ -129,7 +129,8 @@ class SimulatedSshBackend(
                 SshAuthResult.Success
             }
 
-            // SshTransportManager refuses this method before it calls a backend (issue #23).
+            // The simulated server has no security key. Without the flag, SshTransportManager refuses this method
+            // before it calls a backend (issue #23).
             is SshAuthMethod.HardwareSecurityKey ->
                 SshAuthResult.Failed(UnsupportedOperationException(HARDWARE_KEY_NOT_SUPPORTED))
         }

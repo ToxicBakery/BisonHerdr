@@ -133,10 +133,10 @@ jobs:
           # The build runs third-party Gradle plugins. Do not keep the token in .git/config.
           persist-credentials: false
 
-      # The JetBrains JDK, not Temurin: gradle/gradle-daemon-jvm.properties makes the Gradle
-      # daemon run on a JetBrains JDK 21. With a different JDK here, Gradle downloads that
-      # JDK through the foojay API, and only the Gradle cache hides a failure of that
-      # download. On 2026-10-08 foojay had no JetBrains JDK 21.
+      # The JetBrains JDK, not Temurin: gradle/gradle-daemon-jvm.properties and its copy in
+      # composite/gradle/ make the Gradle daemons run on a JetBrains JDK 21. With a different
+      # JDK here, Gradle downloads that JDK through the foojay API, and only the Gradle cache
+      # hides a failure of that download. On 2026-10-08 foojay had no JetBrains JDK 21.
       - uses: actions/setup-java@v6
         with:
           distribution: 'jetbrains'
@@ -165,14 +165,18 @@ jobs:
       # `composite` is a SEPARATE Gradle build with its own settings.gradle.kts, consumed as a
       # pre-published jar from composite/m2 rather than via includeBuild. No root task reaches it,
       # so its unit tests would never run. They guard the rules that decide whether
-      # :core:resources:localizationCheck fails the build, the version mapping, and the parity
-      # of the two buildLogicVersion() copies, so run them on the jvm target.
+      # :core:resources:localizationCheck fails the build, the version mapping, the parity of the
+      # two buildLogicVersion() copies, and the parity of the two daemon JVM files, so run them on
+      # the jvm target.
+      # --rerun: the parity tests read files that are not inputs of the test task, for example
+      # the two gradle-daemon-jvm.properties files. Without this flag, Gradle can take the test
+      # result from the cache when only such a file changes.
       # --no-daemon: the composite build has different org.gradle.jvmargs, so it cannot reuse
       # the daemon of the root build. Without this flag a second daemon stays in memory for the
       # full jvm build.
       - name: Test build logic (composite)
         if: matrix.target == 'jvm'
-        run: ./gradlew -p composite test --no-daemon --stacktrace -Dorg.gradle.console=plain
+        run: ./gradlew -p composite test --rerun --no-daemon --stacktrace -Dorg.gradle.console=plain
 
       # The jvm target runs the :core:mosh tests against a real mosh-server.
       - name: Install mosh

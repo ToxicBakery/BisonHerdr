@@ -55,18 +55,36 @@ class SessionServiceManifestTest {
     }
 
     /**
-     * This version does not support hardware security keys, so the app does not ask for NFC or USB host
-     * access. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds them again with FIDO2 keys.
+     * FIDO2 security keys (issue #23, https://github.com/ToxicBakery/BisonHerdr/issues/23) use NFC and USB host
+     * access. Both features are optional, so that a device without NFC or USB host access can still install the
+     * app. The keys do not change the service type: it stays `specialUse` (see [serviceDeclaresOnlyTheSpecialUseType]).
      */
     @Test
-    fun manifestDeclaresNoNfcPermissionAndNoHardwareKeyFeatures() {
+    fun manifestDeclaresNfcPermissionAndOptionalHardwareKeyFeatures() {
         val permissions = elements("uses-permission").map { element -> element.androidAttribute("name") }
-        val features = elements("uses-feature").map { element -> element.androidAttribute("name") }
+        val features = elements("uses-feature").associate { element ->
+            element.androidAttribute("name") to element.androidAttribute("required")
+        }
 
         assertTrue("android.permission.INTERNET" in permissions)
-        assertFalse("android.permission.NFC" in permissions)
-        assertFalse("android.hardware.nfc" in features)
-        assertFalse("android.hardware.usb.host" in features)
+        assertTrue("android.permission.NFC" in permissions)
+        assertEquals(
+            mapOf("android.hardware.nfc" to "false", "android.hardware.usb.host" to "false"),
+            features,
+        )
+    }
+
+    /** The app does not use the OTP and prompt screens of yubikit-android. The merged manifest must not have them. */
+    @Test
+    fun manifestRemovesTheActivitiesOfYubikit() {
+        val removed = elements("activity")
+            .filter { element -> element.getAttributeNS(TOOLS_NAMESPACE, "node") == "remove" }
+            .map { element -> element.androidAttribute("name") }
+
+        assertEquals(
+            listOf("com.yubico.yubikit.android.ui.OtpActivity", "com.yubico.yubikit.android.ui.YubiKeyPromptActivity"),
+            removed,
+        )
     }
 
     /**
@@ -116,5 +134,6 @@ class SessionServiceManifestTest {
 
     private companion object {
         const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+        const val TOOLS_NAMESPACE = "http://schemas.android.com/tools"
     }
 }

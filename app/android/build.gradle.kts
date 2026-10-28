@@ -15,6 +15,27 @@ plugins {
     alias(libs.plugins.composeCompiler)
 }
 
+// The feature flag of FIDO2 hardware security keys. See FeatureFlags.hardwareSecurityKeys.
+val hardwareSecurityKeys: Boolean = providers.gradleProperty("bison.hardwareSecurityKeys")
+    .map(String::toBoolean)
+    .getOrElse(false)
+
+// Stop a release build with FIDO2 security keys on, because nobody did the manual test yet (issue #23). The debug and
+// benchmark build types are test builds, so they can have the flag. The pull request that turns on the flag removes
+// this check.
+val checkReleaseFeatureFlags = tasks.register("checkReleaseFeatureFlags") {
+    val enabled = hardwareSecurityKeys
+    doLast {
+        if (enabled) {
+            throw GradleException(
+                "bison.hardwareSecurityKeys=true is only for a debug or benchmark test build (issue #23). " +
+                    "Remove the property to build a release.",
+            )
+        }
+    }
+}
+tasks.named { it == "preReleaseBuild" }.configureEach { dependsOn(checkReleaseFeatureFlags) }
+
 android {
     namespace = "com.toxicbakery.app.bison"
     compileSdk {
@@ -31,6 +52,11 @@ android {
         versionName = project.version.toString()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // FIDO2 hardware security keys (issue #23). Off in each build type until the manual test in
+        // docs/testing/fido2-security-keys.md passes. Add -Pbison.hardwareSecurityKeys=true to a debug or benchmark
+        // build to test it. A release build with the property stops (checkReleaseFeatureFlags).
+        buildConfigField("boolean", "HARDWARE_SECURITY_KEYS", hardwareSecurityKeys.toString())
     }
 
     buildFeatures {
@@ -53,6 +79,9 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = true
+            // The resource shrink removes each resource that no kept code and no manifest refers
+            // to. Give a resource that the app loads by name (getIdentifier) a tools:keep rule.
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -63,6 +92,7 @@ android {
         create("benchmark") {
             isDebuggable = false
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -75,6 +105,17 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+    }
+
+    packaging {
+        jniLibs {
+            // androidx.graphics:graphics-path (from Compose UI) ships this library without a
+            // symbol table, so `llvm-strip --strip-unneeded` gives the same bytes. Without this
+            // line, AGP strips it with its default NDK 28.2.13676358. On 2026-10-28, the CI runner
+            // image has NDK 27.3, 29.0 and 30.0, but not 28.2. Thus AGP writes "Unable to strip"
+            // for each APK. Do not add a library with symbols here.
+            keepDebugSymbols += "**/libandroidx.graphics.path.so"
+        }
     }
 
     lint {
@@ -143,6 +184,8 @@ dependencies {
     implementation(libs.kotlinx.datetime)
     implementation(libs.kotlinx.io)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.yubikit.android)
+    implementation(libs.yubikit.core)
 
     debugImplementation(libs.compose.ui.tooling)
 

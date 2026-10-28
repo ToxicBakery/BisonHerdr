@@ -128,21 +128,3 @@ interface MoshSessionEngine {
             }
     }
 }
-
-/**
- * Platform-agnostic contract for YubiKey / FIDO2 (`sk-ssh-ed25519@openssh.com`,
- * `sk-ecdsa-sha2-nistp256@openssh.com`) and PIV smartcard SSH challenge signing over USB-C and NFC.
- *
- * No class implements this contract in this version, and the app does not connect a machine that uses a
- * hardware security key. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds the FIDO2 signer.
- */
-interface HardwareKeySigner {
-    suspend fun signChallenge(
-        machineId: String,
-        keyType: String,
-        applicationId: String,
-        challenge: ByteArray,
-    ): Result<ByteArray>
-
-    fun isHardwareKeyAvailable(): Boolean
-}

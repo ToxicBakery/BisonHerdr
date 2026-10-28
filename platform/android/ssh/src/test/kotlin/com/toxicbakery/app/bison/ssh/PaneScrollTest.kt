@@ -2,24 +2,30 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
+import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -28,6 +34,7 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Tests the scroll position and the `pane.scroll` handling of [RealHerdrSshClient]. */
 class PaneScrollTest {
@@ -38,11 +45,15 @@ class PaneScrollTest {
     /**
      * A poll batch that Herdr holds until the test calls [release]. When [beforeRead] is true, Herdr holds the batch
      * before it reads its state. Otherwise Herdr reads its state, and then holds the output. When [snapshot] is true,
-     * Herdr holds a batch with `herdr api snapshot`. Otherwise it holds a batch with only pane reads.
+     * Herdr holds a batch with `herdr api snapshot`. Otherwise it holds a batch with only pane reads. Herdr lets
+     * [skip] batches of this kind go first.
      */
-    private class HeldPoll(val beforeRead: Boolean, val snapshot: Boolean) {
+    private class HeldPoll(val beforeRead: Boolean, val snapshot: Boolean, skip: Int) {
         private val held = CompletableDeferred<Unit>()
         private val released = CompletableDeferred<Unit>()
+        private val skipsLeft = AtomicInteger(skip)
+
+        @Volatile private var timedOut = false
 
         /** True when Herdr holds the batch. */
         val isHeld: Boolean
@@ -51,29 +62,36 @@ class PaneScrollTest {
         /** Waits until Herdr holds the batch. */
         suspend fun awaitHeld() = withTimeout(TIMEOUT_MS) { held.await() }
 
-        /** Tells Herdr to continue the batch. */
+        /** Tells Herdr to continue the batch. It fails the test when the batch did not wait for this call. */
         fun release() {
+            assertFalse(timedOut, "Herdr must hold the batch until the test releases it")
             released.complete(Unit)
         }
 
-        /** Holds the batch until the test calls [release]. */
+        /** Returns true for the batch to hold. Each batch of this kind before it decreases the skip count by one. */
+        fun takeTurn(): Boolean = skipsLeft.getAndDecrement() <= 0
+
+        /**
+         * Holds the batch until the test calls [release]. After the time limit, the batch continues, so that a test
+         * that cannot continue does not stop the build. Then [release] fails the test.
+         */
         suspend fun hold() {
             held.complete(Unit)
-            released.await()
+            if (withTimeoutOrNull(TIMEOUT_MS) { released.await() } == null) timedOut = true
         }
     }
 
     /**
-     * A Herdr server with one tab. The panes of [paneIds] are side by side, and each pane starts at offset 12 of 263.
-     * The server tells that the first pane has the focus. The layout shows the panes of [layoutPaneIds].
+     * A Herdr server with one tab. Each pane of [paneIds] starts at offset 12 of 263. The snapshot tells the panes of
+     * [openPaneIds], and the layout shows the panes of [layoutPaneIds] side by side. The server tells that the first
+     * pane has the focus.
      *
      * When [holdScrolls] is true, Herdr holds each `pane.scroll` request until the test calls [answerScroll].
      * When [holdInputs] is true, Herdr holds each `pane.send_text` request until the test calls [answerInput].
      * [holdNextPoll] holds one poll batch. Then the test, not the clock, sets the order of the events.
      *
-     * The client gives each batch to [execute] through `remoteBatchExecutor`. That path has no lane lock, so two
-     * batches of one lane can run at the same time. In production, each lane runs one batch at a time. Thus some
-     * orders of these tests cannot occur in production. The tests check the rules of the client for each order.
+     * The client runs each batch of [execute] in the lock of its lane, as in production. Thus a batch that Herdr holds
+     * also holds its lane, and the next batch of that lane waits. The executor does not wait for a reconnect.
      */
     private class FakeHerdr(
         private val paneIds: List<String> = listOf("w1:p1"),
@@ -98,8 +116,20 @@ class PaneScrollTest {
         /** When true, each `pane.scroll` request fails after the answer of the test. */
         @Volatile var failScrolls = false
 
+        /** When true, Herdr moves the pane when it gets a `pane.scroll` request, before the test answers it. */
+        @Volatile var applyScrollsAtOnce = false
+
+        /** The panes that the snapshot tells. A pane that is not in this list is closed. */
+        @Volatile var openPaneIds: List<String> = paneIds
+
         /** The panes that the layout of the tab shows. */
         @Volatile var layoutPaneIds: List<String> = paneIds
+
+        /** The thread that continues a `pane.scroll` request after the answer of the test. */
+        @Volatile var scrollThread: Thread? = null
+
+        /** The thread that got the cancellation of a `pane.scroll` request that Herdr held. */
+        @Volatile var cancelledScrollThread: Thread? = null
         val snapshotCalls = mutableListOf<RealHerdrSshClient.WorkerLane>()
 
         /** Each `pane.scroll` request that Herdr gets, in order. */
@@ -118,9 +148,9 @@ class PaneScrollTest {
             inputAnswers.trySend(Unit)
         }
 
-        /** Tells Herdr to hold the next poll batch of one kind. See [HeldPoll]. */
-        fun holdNextPoll(beforeRead: Boolean = false, snapshot: Boolean = true): HeldPoll =
-            HeldPoll(beforeRead, snapshot).also { nextHold.set(it) }
+        /** Tells Herdr to hold a poll batch of one kind. See [HeldPoll]. */
+        fun holdNextPoll(beforeRead: Boolean = false, snapshot: Boolean = true, skip: Int = 0): HeldPoll =
+            HeldPoll(beforeRead, snapshot, skip).also { nextHold.set(it) }
 
         /** Waits for the next `pane.scroll` request that Herdr gets. */
         suspend fun nextScrollCall(): ScrollCall = withTimeout(TIMEOUT_MS) { scrollRequests.receive() }
@@ -136,7 +166,7 @@ class PaneScrollTest {
                 it is RealHerdrSshClient.RemoteShellCommand.Exec && it.command.contains("herdr api snapshot")
             }
             val hold = nextHold.get()?.takeIf { held ->
-                lane == RealHerdrSshClient.WorkerLane.Poll && held.snapshot == hasSnapshot &&
+                lane == RealHerdrSshClient.WorkerLane.Poll && held.snapshot == hasSnapshot && held.takeTurn() &&
                     nextHold.compareAndSet(held, null)
             }
             if (hold?.beforeRead == true) hold.hold()
@@ -159,8 +189,11 @@ class PaneScrollTest {
                         cmd.ndjsonLine.contains("\"pane.scroll\"") -> {
                             val paneId = paneIdOf(cmd.ndjsonLine)
                             val offset = Regex("\"offset_from_bottom\":(\\d+)").find(cmd.ndjsonLine)!!.groupValues[1].toInt()
+                            // Move the pane before the test sees the request, so that a poll after this point shows it.
+                            if (applyScrollsAtOnce) offsets[paneId] = offset
                             scrollRequests.send(ScrollCall(paneId, offset))
-                            if (holdScrolls) scrollAnswers.receive()
+                            if (holdScrolls) awaitScrollAnswer()
+                            scrollThread = Thread.currentThread()
                             if (failScrolls) throw IOException("The channel closed")
                             offsets[paneId] = offset
                             appendLine("""{"id":"pane_scroll","result":{"type":"pane_info"}}""")
@@ -180,13 +213,22 @@ class PaneScrollTest {
             }
         }
 
+        private suspend fun awaitScrollAnswer() {
+            try {
+                scrollAnswers.receive()
+            } catch (cancelled: CancellationException) {
+                cancelledScrollThread = Thread.currentThread()
+                throw cancelled
+            }
+        }
+
         private fun paneIdOf(ndjsonLine: String): String =
             Regex("\"pane_id\":\"([^\"]+)\"").find(ndjsonLine)!!.groupValues[1]
 
         fun snapshotJson(): String {
             val layoutPaneIds = layoutPaneIds
             val width = 80 / layoutPaneIds.size
-            val panes = paneIds.joinToString(",") { id ->
+            val panes = openPaneIds.joinToString(",") { id ->
                 """{"pane_id":"$id","workspace_id":"w1","tab_id":"w1:t1","focused":${id == paneIds.first()},""" +
                     """"scroll":{"offset_from_bottom":${offsets.getValue(id)},"max_offset_from_bottom":263,"viewport_rows":40}}"""
             }
@@ -205,58 +247,65 @@ class PaneScrollTest {
     private val route = ProxyJumpTunnel().resolveRoute(machine)
 
     /**
-     * Puts the frames of the client on [bus]. After [holdNextFrame], it holds the next frame before the bus gets it,
-     * until the test calls [publishHeldFrame]. The step that publishes the frame waits for the test in that time.
+     * Puts the values of the client on a bus with [publishTo], and keeps each value in [published]. After [holdNext],
+     * it holds the next value before the bus gets it, until the test calls [publishHeld]. The step that publishes the
+     * value waits for the test in that time.
      */
-    private class FrameGate(private val bus: PaneSurfaceBus) {
+    private class PublishGate<T>(private val publishTo: (String, T) -> Unit) {
         private val holdNext = AtomicBoolean(false)
         private val held = CountDownLatch(1)
         private val released = CountDownLatch(1)
-        private val published = CountDownLatch(1)
+        private val heldPublished = CountDownLatch(1)
 
-        fun publish(machineId: String, frame: PaneSurfaceFrame) {
-            if (holdNext.compareAndSet(true, false)) {
+        /** The values that went to the bus, in order. */
+        val published: MutableList<T> = CopyOnWriteArrayList()
+
+        fun publish(machineId: String, value: T) {
+            val hold = holdNext.compareAndSet(true, false)
+            if (hold) {
                 held.countDown()
                 released.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                bus.publish(machineId, frame)
-                published.countDown()
-            } else {
-                bus.publish(machineId, frame)
             }
+            publishTo(machineId, value)
+            published += value
+            if (hold) heldPublished.countDown()
         }
 
-        /** Tells the gate to hold the next frame. */
-        fun holdNextFrame() {
+        /** Tells the gate to hold the next value. */
+        fun holdNext() {
             holdNext.set(true)
         }
 
-        /** Waits until the gate holds a frame. */
-        fun awaitHeldFrame() {
-            assertTrue(held.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "A step must publish a frame")
+        /** Waits until the gate holds a value. */
+        fun awaitHeld() {
+            assertTrue(held.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "A step must publish a value")
         }
 
-        /** Sends the held frame to the bus, and waits until the bus has it. */
-        fun publishHeldFrame() {
+        /** Sends the held value to the bus, and waits until the bus has it. */
+        fun publishHeld() {
             released.countDown()
-            assertTrue(published.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "The held frame must go to the bus")
+            assertTrue(heldPublished.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "The held value must go to the bus")
         }
     }
 
     private fun client(
         fake: FakeHerdr,
         surfaceBus: PaneSurfaceBus,
-        gate: FrameGate = FrameGate(surfaceBus),
+        gate: PublishGate<PaneSurfaceFrame> = PublishGate(surfaceBus::publish),
         debugLog: SshDebugLog = SshDebugLog(),
+        snapshotBus: EndpointSnapshotBus = EndpointSnapshotBus(),
+        snapshotGate: PublishGate<ClientShellSnapshot> = PublishGate(snapshotBus::publish),
     ) = RealHerdrSshClient(
         localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = debugLog,
-        endpointSnapshotBus = EndpointSnapshotBus(),
+        endpointSnapshotBus = snapshotBus,
         paneSurfaceBus = surfaceBus,
         semanticNotificationBus = SemanticNotificationBus(),
         knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
         secretStore = InMemorySecretStore(),
         remoteBatchExecutor = { _, _, lane, commands -> fake.execute(lane, commands) },
         framePublisher = gate::publish,
+        snapshotPublisher = snapshotGate::publish,
     )
 
     private fun PaneSurfaceFrame.offset(paneId: String = "w1:p1"): Int =
@@ -266,7 +315,7 @@ class PaneScrollTest {
 
     /** Returns true when the frame shows [text] at the start of the first row of [paneId]. */
     private fun PaneSurfaceFrame.showsText(text: String, paneId: String = "w1:p1"): Boolean {
-        val rect = panes.single { it.paneId == paneId }.rect
+        val rect = panes.singleOrNull { it.paneId == paneId }?.rect ?: return false
         return text.indices.all { col ->
             frame.cellAt(rect.x.toInt() + col, rect.y.toInt())?.symbol == text[col].toString()
         }
@@ -277,6 +326,15 @@ class PaneScrollTest {
         withTimeout(TIMEOUT_MS) {
             surfaces.mapNotNull { it["box"] }.first { it.showsText(text, paneId) }
         }
+
+    /** Waits until [condition] is true. The time limit stops a test that cannot continue. */
+    private fun awaitCondition(message: String, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(TIMEOUT_MS)
+        while (!condition()) {
+            assertTrue(System.nanoTime() < deadline, message)
+            Thread.yield()
+        }
+    }
 
     /**
      * Starts [step] on a thread of [Dispatchers.IO]. Returns when the step is done, when its thread waits for a
@@ -300,17 +358,19 @@ class PaneScrollTest {
             step()
         }
         assertTrue(started.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "The step must start")
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(TIMEOUT_MS)
-        while (!job.isCompleted && stepThread.get().state != Thread.State.BLOCKED && !stopWhen()) {
-            assertTrue(
-                System.nanoTime() < deadline,
-                "The step must end, or wait for a lock. This function sees only Thread.State.BLOCKED, the state of a " +
-                    "thread that waits for a synchronized monitor. A lock of a different type gives a different state.",
-            )
-            Thread.yield()
-        }
+        awaitCondition(
+            "The step must end, or wait for a lock. This function sees only Thread.State.BLOCKED, the state of a " +
+                "thread that waits for a synchronized monitor. A lock of a different type gives a different state.",
+        ) { job.isCompleted || stepThread.get().state == Thread.State.BLOCKED || stopWhen() }
         return job
     }
+
+    /**
+     * Starts [step] at once on this thread, until the step suspends, for example to wait for a lane lock. Thus the step
+     * is in the queue of the lane when this function returns. The step then continues on [Dispatchers.IO].
+     */
+    private fun CoroutineScope.launchUntilSuspended(step: suspend () -> Unit): Job =
+        launch(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) { step() }
 
     @Test
     fun frameShowsTheScrollPositionFromTheSnapshot() = runBlocking {
@@ -370,20 +430,20 @@ class PaneScrollTest {
     @Test
     fun aPollFrameDoesNotReplaceTheFrameOfANewerScrollRequest() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val gate = FrameGate(surfaceBus)
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
         val fake = FakeHerdr()
         val client = client(fake, surfaceBus, gate)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
 
         // The poll builds its frame at the position of the snapshot, and the gate holds the frame.
-        gate.holdNextFrame()
+        gate.holdNext()
         val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
-        gate.awaitHeldFrame()
+        gate.awaitHeld()
         // The user scrolls before the poll frame goes to the bus.
         val scroll = launchUntilDoneOrBlocked {
             client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
         }
-        gate.publishHeldFrame()
+        gate.publishHeld()
         poll.join()
         scroll.join()
 
@@ -404,7 +464,7 @@ class PaneScrollTest {
 
         // Herdr holds the request, so the snapshot of this poll shows the old position.
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
-        assertEquals(30, surfaceBus.offset(), "A poll must not move the pane back while the request is in flight")
+        assertEquals(30, surfaceBus.offset(), "A poll must not move the pane back while Herdr holds the request")
 
         fake.answerScroll()
         val frame = surfaceBus.awaitFrameWithText("line at 30")
@@ -429,7 +489,7 @@ class PaneScrollTest {
         client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 5))
 
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
-        assertEquals(30, surfaceBus.offset("w1:p1"), "A poll must keep the position of the p1 request in flight")
+        assertEquals(30, surfaceBus.offset("w1:p1"), "A poll must keep the position of the p1 request that Herdr holds")
         assertEquals(5, surfaceBus.offset("w1:p2"), "A poll must keep the position of the queued p2 request")
 
         fake.answerScroll()
@@ -442,6 +502,26 @@ class PaneScrollTest {
         val p2Answer = surfaceBus.awaitFrameWithText("line at 5", "w1:p2")
         assertEquals(30, p2Answer.offset("w1:p1"), "The p2 answer frame must keep the p1 position")
         assertEquals(5, p2Answer.offset("w1:p2"), "The p2 answer frame must show the p2 request")
+    }
+
+    @Test
+    fun aDragOnOnePaneDoesNotStopTheQueuedRequestOfAnotherPane() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertEquals(ScrollCall("w1:p1", 30), fake.nextScrollCall(), "The p1 request must go to Herdr")
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 5))
+        // The user drags p1 while the p2 request is in the queue.
+        for (offset in 31..40) client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", offset))
+
+        fake.answerScroll()
+        assertEquals(ScrollCall("w1:p2", 5), fake.nextScrollCall(), "The older p2 request must go before the drag")
+        fake.answerScroll()
+        assertEquals(ScrollCall("w1:p1", 40), fake.nextScrollCall(), "The newest p1 request must go after p2")
+        fake.answerScroll()
     }
 
     @Test
@@ -496,6 +576,67 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aPollThatGetsTheLaneAfterAScrollAnswerShowsThePositionOfHerdr() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr()
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // A first poll holds the Poll lane. A second poll waits for the lane.
+        val held = fake.holdNextPoll(beforeRead = true)
+        val firstPoll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        held.awaitHeld()
+        val secondPoll = launchUntilSuspended { client.refreshSnapshotAndSurface(machine, route) }
+
+        // Herdr answers a scroll while the second poll waits. Then Herdr moves the pane, for example for a different
+        // client.
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertEquals(30, fake.nextScroll(), "The request must go to Herdr")
+        fake.answerScroll()
+        surfaceBus.awaitFrameWithText("line at 30")
+        fake.serverOffset = 7
+
+        held.release()
+        firstPoll.join()
+        secondPoll.join()
+        assertEquals(7, surfaceBus.offset(), "A poll that got the lane after the answer must show the Herdr position")
+    }
+
+    @Test
+    fun aPollAfterAnAnswerAndAFailureShowsTheTextThatItRead() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val debugLog = SshDebugLog()
+        val fake = FakeHerdr()
+        val client = client(fake, surfaceBus, debugLog = debugLog)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // The shell writes new output. Herdr reads its state for the poll, and holds the output.
+        fake.newOutput = " NEW"
+        val held = fake.holdNextPoll()
+        val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        held.awaitHeld()
+
+        // During the poll, Herdr answers one request with text. Then the next request fails.
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertEquals(30, fake.nextScroll(), "The first request must go to Herdr")
+        fake.answerScroll()
+        surfaceBus.awaitFrameWithText("line at 30")
+        fake.failScrolls = true
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 40))
+        assertEquals(40, fake.nextScroll(), "The second request must go to Herdr")
+        fake.answerScroll()
+        withTimeout(TIMEOUT_MS) {
+            debugLog.entries.first { entries -> entries.any { it.message.startsWith("pane.scroll for w1:p1 failed") } }
+        }
+
+        held.release()
+        poll.join()
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertEquals(12, frame.offset(), "After a failed request, the poll must show the position of its snapshot")
+        assertTrue(frame.showsText("line at 12 NEW"), "The poll must not show the text of the older answer")
+    }
+
+    @Test
     fun aPollDoesNotShowOlderTextAfterAFailedScrollRequest() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
         val debugLog = SshDebugLog()
@@ -522,6 +663,81 @@ class PaneScrollTest {
         val frame = assertNotNull(surfaceBus.surfaceFor("box"))
         assertEquals(12, frame.offset(), "After a failed request, a poll must show the position of Herdr")
         assertTrue(frame.showsText("line at 12 NEW"), "The poll must show the text that it read")
+    }
+
+    @Test
+    fun aDisconnectDuringAScrollRequestLogsNoFailure() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val debugLog = SshDebugLog()
+        val fake = FakeHerdr()
+        val client = client(fake, surfaceBus, debugLog = debugLog)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertEquals(30, fake.nextScroll(), "The request must go to Herdr")
+        client.disconnect(machine.id)
+
+        // The disconnect cancels the scroll worker. The worker ends when its thread goes back to the pool.
+        awaitCondition("The disconnect must cancel the request") { fake.cancelledScrollThread != null }
+        val worker = assertNotNull(fake.cancelledScrollThread)
+        awaitCondition("The cancelled worker must end") {
+            worker.state == Thread.State.WAITING || worker.state == Thread.State.TIMED_WAITING
+        }
+        assertTrue(
+            debugLog.entries.value.none { it.message.startsWith("pane.scroll for") },
+            "A cancelled request is not a failure",
+        )
+    }
+
+    @Test
+    fun aDisconnectDuringABlockingScrollReadLogsNoFailure() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val debugLog = SshDebugLog()
+        val fake = FakeHerdr()
+        val inScroll = CountDownLatch(1)
+        val channelClosed = CountDownLatch(1)
+        val scrollThread = AtomicReference<Thread>()
+        val readEnded = AtomicBoolean(false)
+        val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = surfaceBus,
+            semanticNotificationBus = SemanticNotificationBus(),
+            knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+            secretStore = InMemorySecretStore(),
+            remoteBatchExecutor = { _, _, lane, commands ->
+                val isScroll = commands.any { command ->
+                    command is RealHerdrSshClient.RemoteShellCommand.ApiBridgeLine &&
+                        command.ndjsonLine.contains("\"pane.scroll\"")
+                }
+                if (isScroll) {
+                    // A blocking read, as the worker of production does. The disconnect closes the channel, and the
+                    // read fails. A cancellation cannot stop this read.
+                    scrollThread.set(Thread.currentThread())
+                    inScroll.countDown()
+                    channelClosed.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    readEnded.set(true)
+                    throw IOException("Persistent SSH shell stream closed before sentinel")
+                }
+                fake.execute(lane, commands)
+            },
+        )
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertTrue(inScroll.await(TIMEOUT_MS, TimeUnit.MILLISECONDS), "The request must go to Herdr")
+        client.disconnect(machine.id)
+        channelClosed.countDown()
+
+        // The worker ends when its thread goes back to the pool.
+        val worker = assertNotNull(scrollThread.get())
+        awaitCondition("The cancelled worker must end") {
+            readEnded.get() && (worker.state == Thread.State.WAITING || worker.state == Thread.State.TIMED_WAITING)
+        }
+        assertTrue(
+            debugLog.entries.value.none { it.message.startsWith("pane.scroll for") },
+            "The error of a channel that a disconnect closed is not a failure of the request",
+        )
     }
 
     @Test
@@ -556,6 +772,84 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aSecondBatchShowsItsNewerTextWhenTheSnapshotShowsTheScroll() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        fake.layoutPaneIds = listOf("w1:p1")
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // Herdr moves p2 at once, but it holds the answer.
+        fake.layoutPaneIds = listOf("w1:p1", "w1:p2")
+        fake.applyScrollsAtOnce = true
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 30))
+        assertEquals(ScrollCall("w1:p2", 30), fake.nextScrollCall(), "The request must go to Herdr")
+
+        // The snapshot of the poll shows p2 at 30. Herdr holds the second batch of the poll before it reads p2.
+        val held = fake.holdNextPoll(beforeRead = true, snapshot = false)
+        val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        held.awaitHeld()
+
+        // The answer arrives during the second batch. Then the shell writes new output, and the second batch reads it.
+        val requestRevision = assertNotNull(surfaceBus.surfaceFor("box")).revision
+        fake.answerScroll()
+        withTimeout(TIMEOUT_MS) { surfaceBus.surfaces.first { it.getValue("box").revision > requestRevision } }
+        fake.newOutput = " NEW"
+        held.release()
+        poll.join()
+
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertEquals(30, frame.offset("w1:p2"), "The poll must show the position of the scroll")
+        assertTrue(frame.showsText("line at 30 NEW", "w1:p2"), "The second batch read after the scroll, so keep its text")
+    }
+
+    @Test
+    fun aSecondBatchKeepsTheAnswerTextWhenThePaneMovedAndCameBack() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        fake.layoutPaneIds = listOf("w1:p1")
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // The layout now shows p2, so the poll reads p2 in a second batch. The snapshot shows p2 at 12, and Herdr
+        // holds the output of the first batch.
+        fake.layoutPaneIds = listOf("w1:p1", "w1:p2")
+        val firstBatch = fake.holdNextPoll()
+        val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        firstBatch.awaitHeld()
+
+        // After the snapshot, the user moves p2 to 40, and Herdr answers.
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 40))
+        assertEquals(ScrollCall("w1:p2", 40), fake.nextScrollCall(), "The first request must go to Herdr")
+        val firstRevision = assertNotNull(surfaceBus.surfaceFor("box")).revision
+        fake.answerScroll()
+        withTimeout(TIMEOUT_MS) { surfaceBus.surfaces.first { it.getValue("box").revision > firstRevision } }
+
+        // The user moves p2 back to 12. Herdr holds that request.
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 12))
+        assertEquals(ScrollCall("w1:p2", 12), fake.nextScrollCall(), "The second request must go to Herdr")
+
+        // The second batch reads p2 at 40, and Herdr holds its output.
+        val secondBatch = fake.holdNextPoll(snapshot = false)
+        firstBatch.release()
+        secondBatch.awaitHeld()
+
+        // Herdr moves p2 back to 12, and answers with the text at 12.
+        val secondRevision = assertNotNull(surfaceBus.surfaceFor("box")).revision
+        fake.answerScroll()
+        withTimeout(TIMEOUT_MS) { surfaceBus.surfaces.first { it.getValue("box").revision > secondRevision } }
+        secondBatch.release()
+        poll.join()
+
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertEquals(12, frame.offset("w1:p2"), "The poll must show the position of the newest answer")
+        assertTrue(
+            frame.showsText("line at 12", "w1:p2"),
+            "The frame at 12 must not show the text that the second batch read at 40",
+        )
+    }
+
+    @Test
     fun aPollInFlightAtADisconnectPublishesNothing() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
         val fake = FakeHerdr()
@@ -576,30 +870,91 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aPollRemovesTheScrollRequestsOfAClosedPane() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2", "w1:p3"))
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // Herdr answers the p2 request, and holds the p3 request.
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 5))
+        assertEquals(ScrollCall("w1:p2", 5), fake.nextScrollCall(), "The p2 request must go to Herdr")
+        fake.answerScroll()
+        surfaceBus.awaitFrameWithText("line at 5", "w1:p2")
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p3", 7))
+        assertEquals(ScrollCall("w1:p3", 7), fake.nextScrollCall(), "The p3 request must go to Herdr")
+
+        // The user closes p2 and p3.
+        fake.openPaneIds = listOf("w1:p1")
+        fake.layoutPaneIds = listOf("w1:p1")
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+        assertEquals(
+            setOf("w1:p3"),
+            client.scrollRequestPaneIds(machine.id),
+            "The poll must remove the answered requests of a closed pane, and keep a request with no answer",
+        )
+        fake.answerScroll()
+    }
+
+    @Test
+    fun aClosedPaneGetsNoScrollPosition() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p2", 30))
+        assertEquals(ScrollCall("w1:p2", 30), fake.nextScrollCall(), "The p2 request must go to Herdr")
+        // The user closes p2 while Herdr holds its request. The poll must not give p2 a position.
+        fake.openPaneIds = listOf("w1:p1")
+        fake.layoutPaneIds = listOf("w1:p1")
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // A key for the closed pane must not request a scroll to the bottom.
+        client.sendPaneInput(machine, route, "w1:p2", ClientPaneInputEvent.TextCommit("x"))
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 5))
+        fake.answerScroll()
+        assertEquals(ScrollCall("w1:p1", 5), fake.nextScrollCall(), "A key for a closed pane must not request a scroll")
+        fake.answerScroll()
+    }
+
+    @Test
     fun anOlderPollDoesNotReplaceTheFrameOfANewerPoll() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val fake = FakeHerdr()
-        val client = client(fake, surfaceBus)
-
-        // The first poll has no cache, so it reads the pane in a second batch. Herdr holds the output of that batch.
-        val held = fake.holdNextPoll(snapshot = false)
-        val olderPoll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
-        held.awaitHeld()
-
-        // The shell writes new output, and a newer poll reads and publishes it.
-        fake.newOutput = " NEW"
+        val snapshotBus = EndpointSnapshotBus()
+        val snapshotGate = PublishGate<ClientShellSnapshot>(snapshotBus::publish)
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        fake.layoutPaneIds = listOf("w1:p1")
+        val client = client(fake, surfaceBus, snapshotBus = snapshotBus, snapshotGate = snapshotGate)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
-        assertTrue(
-            assertNotNull(surfaceBus.surfaceFor("box")).showsText("line at 12 NEW"),
-            "The newer poll must publish",
-        )
 
-        held.release()
+        // The older poll reads a layout with p2, so it reads p2 in a second batch. Herdr holds its first batch.
+        fake.layoutPaneIds = listOf("w1:p1", "w1:p2")
+        val olderFirstBatch = fake.holdNextPoll()
+        val olderPoll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        olderFirstBatch.awaitHeld()
+
+        // The newer poll waits for the lane, and gets it before the second batch of the older poll.
+        val newerBatch = fake.holdNextPoll(beforeRead = true)
+        val newerPoll = launchUntilSuspended { client.refreshSnapshotAndSurface(machine, route) }
+        val snapshotsBefore = snapshotGate.published.size
+        olderFirstBatch.release()
+        newerBatch.awaitHeld()
+        awaitCondition("The older poll must publish its snapshot") { snapshotGate.published.size > snapshotsBefore }
+
+        // The newer poll reads p1 only at offset 7, and publishes. Herdr holds the second batch of the older poll.
+        val olderSecondBatch = fake.holdNextPoll(snapshot = false)
+        fake.layoutPaneIds = listOf("w1:p1")
+        fake.serverOffset = 7
+        newerBatch.release()
+        newerPoll.join()
+        olderSecondBatch.awaitHeld()
+        olderSecondBatch.release()
         olderPoll.join()
-        assertTrue(
-            assertNotNull(surfaceBus.surfaceFor("box")).showsText("line at 12 NEW"),
-            "The older poll must not replace the frame of the newer poll",
-        )
+
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertEquals(listOf("w1:p1"), frame.panes.map { it.paneId }, "The older poll must not replace the newer layout")
+        assertEquals(7, frame.offset(), "The older poll must not replace the frame of the newer poll")
     }
 
     @Test
@@ -614,17 +969,17 @@ class PaneScrollTest {
         val olderPoll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
         heldReads.awaitHeld()
 
-        // The user focuses p2. Herdr holds the poll that follows the focus request, before it reads its state.
+        // The user focuses p2. The focus request waits for the lane. Herdr holds the poll that follows it.
         val heldRefresh = fake.holdNextPoll(beforeRead = true)
-        val focus = launch(Dispatchers.IO) {
+        val focus = launchUntilSuspended {
             client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneFocus("w1:p2"))
         }
-        heldRefresh.awaitHeld()
 
         heldReads.release()
         olderPoll.join()
         assertNull(surfaceBus.surfaceFor("box"), "The poll that read the old selection must not publish a frame")
 
+        heldRefresh.awaitHeld()
         heldRefresh.release()
         focus.join()
         val frame = assertNotNull(surfaceBus.surfaceFor("box"))
@@ -632,24 +987,58 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aPollThatGetsTheLaneAfterAFocusChangePublishes() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        val client = client(fake, surfaceBus)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // A first poll holds the Poll lane. A second poll waits for the lane.
+        val heldFirst = fake.holdNextPoll(beforeRead = true)
+        val firstPoll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        heldFirst.awaitHeld()
+        val secondPoll = launchUntilSuspended { client.refreshSnapshotAndSurface(machine, route) }
+
+        // The user focuses p2 while the second poll waits. Herdr holds the poll that follows the focus request.
+        val heldRefresh = fake.holdNextPoll(beforeRead = true, skip = 1)
+        val focus = launchUntilSuspended {
+            client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneFocus("w1:p2"))
+        }
+
+        // The second poll gets the lane after the client changed its selection, so it parses the snapshot with the new
+        // client selection. Herdr gets `pane.focus` only after this poll.
+        fake.newOutput = " NEW"
+        heldFirst.release()
+        firstPoll.join()
+        secondPoll.join()
+        val frame = assertNotNull(surfaceBus.surfaceFor("box"))
+        assertTrue(frame.showsText("line at 12 NEW"), "A poll that got the lane after the focus change must publish")
+        assertEquals("w1:p2", frame.panes.single { it.focused }.paneId, "The frame must show the new selection")
+
+        heldRefresh.awaitHeld()
+        heldRefresh.release()
+        focus.join()
+    }
+
+    @Test
     fun aPollFrameDoesNotReplaceTheFrameOfANewerFocus() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val gate = FrameGate(surfaceBus)
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
         val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
         val client = client(fake, surfaceBus, gate)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
 
         // The poll builds its frame with p1 focused, and the gate holds the frame.
-        gate.holdNextFrame()
+        gate.holdNext()
         val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
-        gate.awaitHeldFrame()
+        gate.awaitHeld()
         // The user focuses p2 before the poll frame goes to the bus. Herdr holds the poll that follows the focus
         // request, so that only the focus frame can show p2.
         val heldRefresh = fake.holdNextPoll(beforeRead = true)
         val focus = launchUntilDoneOrBlocked(stopWhen = { heldRefresh.isHeld }) {
             client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneFocus("w1:p2"))
         }
-        gate.publishHeldFrame()
+        gate.publishHeld()
         poll.join()
         heldRefresh.awaitHeld()
 
@@ -660,20 +1049,89 @@ class PaneScrollTest {
     }
 
     @Test
+    fun aPollSnapshotDoesNotReplaceTheSnapshotOfANewerFocus() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val snapshotBus = EndpointSnapshotBus()
+        val snapshotGate = PublishGate<ClientShellSnapshot>(snapshotBus::publish)
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        val client = client(fake, surfaceBus, snapshotBus = snapshotBus, snapshotGate = snapshotGate)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        // The poll parses the snapshot with p1 focused, and the gate holds the snapshot.
+        snapshotGate.holdNext()
+        val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
+        snapshotGate.awaitHeld()
+        // The user focuses p2 before the poll snapshot goes to the bus. Herdr holds the poll that follows the focus
+        // request.
+        val heldRefresh = fake.holdNextPoll(beforeRead = true)
+        val focus = launchUntilDoneOrBlocked(stopWhen = { heldRefresh.isHeld }) {
+            client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneFocus("w1:p2"))
+        }
+        snapshotGate.publishHeld()
+        poll.join()
+        heldRefresh.awaitHeld()
+
+        assertEquals(
+            "w1:p2",
+            snapshotBus.snapshotFor("box")?.focusedPaneId,
+            "The snapshot of the poll must not replace the snapshot of the newer focus",
+        )
+        heldRefresh.release()
+        focus.join()
+    }
+
+    @Test
+    fun aFocusCopyDoesNotReplaceANewerScrollAnswerFrame() = runBlocking {
+        val surfaceBus = PaneSurfaceBus()
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
+        val fake = FakeHerdr(paneIds = listOf("w1:p1", "w1:p2"))
+        val client = client(fake, surfaceBus, gate)
+        assertTrue(client.refreshSnapshotAndSurface(machine, route))
+
+        client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
+        assertEquals(ScrollCall("w1:p1", 30), fake.nextScrollCall(), "The request must go to Herdr")
+
+        // The focus request copies the frame on the bus, and the gate holds the copy. Herdr holds the poll that
+        // follows the focus request.
+        val heldRefresh = fake.holdNextPoll(beforeRead = true)
+        gate.holdNext()
+        val focus = launch(Dispatchers.IO) {
+            client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneFocus("w1:p2"))
+        }
+        gate.awaitHeld()
+
+        // Herdr answers the scroll before the copy goes to the bus.
+        fake.answerScroll()
+        awaitCondition("The answer step must publish its frame, or wait for the frame lock") {
+            gate.published.any { it.showsText("line at 30") } || fake.scrollThread?.state == Thread.State.BLOCKED
+        }
+        gate.publishHeld()
+        awaitCondition("The answer step must publish its frame") { gate.published.any { it.showsText("line at 30") } }
+
+        assertTrue(
+            assertNotNull(surfaceBus.surfaceFor("box")).showsText("line at 30"),
+            "The focus copy of an older frame must not replace the answer frame",
+        )
+        heldRefresh.awaitHeld()
+        heldRefresh.release()
+        focus.join()
+    }
+
+    @Test
     fun aPollFrameDoesNotReplaceTheFrameOfANewerViewportSize() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val gate = FrameGate(surfaceBus)
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
         val fake = FakeHerdr()
         val client = client(fake, surfaceBus, gate)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
 
         // The poll builds its frame at the size of the layout, and the gate holds the frame.
-        gate.holdNextFrame()
+        gate.holdNext()
         val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
-        gate.awaitHeldFrame()
+        gate.awaitHeld()
         // The view changes its size before the poll frame goes to the bus.
         val resize = launchUntilDoneOrBlocked { client.resizeViewport("box", 100u, 50u) }
-        gate.publishHeldFrame()
+        gate.publishHeld()
         poll.join()
         resize.join()
 
@@ -684,7 +1142,7 @@ class PaneScrollTest {
     @Test
     fun theEchoShowsTheTypedTextOneTime() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val gate = FrameGate(surfaceBus)
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
         val fake = FakeHerdr(holdInputs = true)
         // The pane is at the bottom, so the input requests no scroll. Thus the echo is the first step of the input
         // that waits for the frame lock.
@@ -693,14 +1151,14 @@ class PaneScrollTest {
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
 
         // The poll builds its frame with no edit, and the gate holds the frame.
-        gate.holdNextFrame()
+        gate.holdNext()
         val poll = launch(Dispatchers.IO) { client.refreshSnapshotAndSurface(machine, route) }
-        gate.awaitHeldFrame()
+        gate.awaitHeld()
         // The user types before the poll frame goes to the bus.
         val typing = launchUntilDoneOrBlocked {
             client.sendPaneInput(machine, route, "w1:p1", ClientPaneInputEvent.TextCommit("x"))
         }
-        gate.publishHeldFrame()
+        gate.publishHeld()
         poll.join()
         typing.join()
 
@@ -711,23 +1169,23 @@ class PaneScrollTest {
     @Test
     fun anInputFrameDoesNotReplaceTheFrameOfANewerScrollRequest() = runBlocking {
         val surfaceBus = PaneSurfaceBus()
-        val gate = FrameGate(surfaceBus)
+        val gate = PublishGate<PaneSurfaceFrame>(surfaceBus::publish)
         val fake = FakeHerdr(holdInputs = true)
+        // The pane is at the bottom, so the input requests no scroll, and only the input flush uses the Input lane.
+        fake.serverOffset = 0
         val client = client(fake, surfaceBus, gate)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
-
         client.sendPaneInput(machine, route, "w1:p1", ClientPaneInputEvent.TextCommit("x"))
-        assertEquals(0, fake.nextScroll(), "Herdr must get a request to go to the bottom")
 
         // The input flush builds its frame at the bottom, and the gate holds the frame.
-        gate.holdNextFrame()
+        gate.holdNext()
         fake.answerInput()
-        gate.awaitHeldFrame()
+        gate.awaitHeld()
         // The user scrolls up before the input frame goes to the bus.
         val scroll = launchUntilDoneOrBlocked {
             client.executeEndpointRpc(machine, route, HerdrRpcBuilder.paneScroll("w1:p1", 30))
         }
-        gate.publishHeldFrame()
+        gate.publishHeld()
         scroll.join()
 
         assertEquals(30, surfaceBus.offset(), "The input frame must not replace the frame of the newer request")

@@ -1,20 +1,11 @@
 package com.toxicbakery.app.bison.common.screen.workspace
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -25,9 +16,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import com.toxicbakery.app.bison.common.navigation.NavigationController
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyMachineFederation
@@ -39,22 +27,16 @@ import com.toxicbakery.app.bison.common.theme.BisonTheme
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.common.version.VersionCheck
 import com.toxicbakery.app.bison.model.HostMachine
-import com.toxicbakery.app.bison.resources.Res
-import com.toxicbakery.app.bison.resources.common_cancel
-import com.toxicbakery.app.bison.resources.hardware_key_key_type_label
-import com.toxicbakery.app.bison.resources.hardware_key_sheet_tap_nfc
-import com.toxicbakery.app.bison.resources.hardware_key_sheet_title
-import com.toxicbakery.app.bison.resources.hardware_key_sheet_touch_usb
-import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.version.AppVersion
-import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.viewmodel.rememberViewModel
 
 /**
  * Design 2 ("Zen Canvas") workspace terminal screen.
  *
- * A column holds the top HUD (two rows), the [TerminalSurfaceCanvas] with the slide-over Federated Agent Command
- * Center drawer, and the split-thumb bottom key clusters with the Native Prompt Composer pill when the setting is on.
+ * A column holds the top HUD (two rows) and the [TerminalSurfaceCanvas] with the slide-over Federated Agent Command
+ * Center drawer. When `AppSettings.splitThumbLayoutEnabled` is true, the column also holds the split-thumb bottom key
+ * clusters with the Native Prompt Composer pill. The Settings label of this setting is "Split-Thumb Left/Right
+ * Ergonomic Bottom Bar", and the setting is on by default.
  * The HUD sits above the canvas and the bottom bar sits below it, so they do not cover it. The canvas uses all of
  * the area between them. The design target is 96%+ of the screen for the canvas, and no code measures it.
  */
@@ -77,7 +59,6 @@ fun WorkspaceTerminalScreen(
     val queuedPrompts by viewModel.queuedPromptsForActiveMachine.collectAsState()
     val appSettings by viewModel.appSettings.collectAsState()
     val themePalette by viewModel.resolvedThemePalette.collectAsState()
-    val hardwareKeyPrompt by viewModel.hardwareKeyTouchPrompt.collectAsState()
 
     LaunchedEffect(machineId, workspaceId) {
         if (workspaceId != null) {
@@ -298,75 +279,6 @@ fun WorkspaceTerminalScreen(
                         viewModel.onEvent(WorkspaceTerminalViewModel.Event.SubmitPrompt(prompt, target))
                     },
                 )
-            }
-
-            // 4. YubiKey / FIDO2 Hardware Security Key Touch Sheet
-            val touchPrompt = hardwareKeyPrompt
-            if (touchPrompt != null) {
-                HardwareSecurityKeyPromptSheet(
-                    prompt = touchPrompt,
-                    onCancel = { viewModel.dismissHardwareKeyTouchSheet() },
-                )
-            }
-        }
-    }
-}
-
-@Composable
-internal fun HardwareSecurityKeyPromptSheet(
-    prompt: SshRequest.PromptHardwareKeyTouch,
-    onCancel: () -> Unit,
-) {
-    val palette = LocalBisonPalette.current
-    Dialog(onDismissRequest = onCancel) {
-        Surface(
-            modifier = Modifier
-                .widthIn(min = 340.dp, max = 460.dp)
-                .border(1.5.dp, palette.accent, RoundedCornerShape(20.dp))
-                .testTag("hardwareKeyPromptDialog"),
-            shape = RoundedCornerShape(20.dp),
-            color = palette.panelBg,
-            tonalElevation = 8.dp,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(
-                    text = "🔑 " + stringResource(Res.string.hardware_key_sheet_title),
-                    style = MaterialTheme.typography.titleLarge,
-                    color = palette.accent,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    text = stringResource(Res.string.hardware_key_key_type_label, prompt.keyType),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = palette.mauve,
-                )
-                Text(
-                    text = prompt.promptMessage.ifBlank {
-                        stringResource(Res.string.hardware_key_sheet_touch_usb)
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.text,
-                )
-                Text(
-                    text = stringResource(Res.string.hardware_key_sheet_tap_nfc),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.text.copy(alpha = 0.72f),
-                )
-                Button(
-                    onClick = onCancel,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = palette.red,
-                        contentColor = palette.terminalBg,
-                    ),
-                ) {
-                    Text(stringResource(Res.string.common_cancel))
-                }
             }
         }
     }

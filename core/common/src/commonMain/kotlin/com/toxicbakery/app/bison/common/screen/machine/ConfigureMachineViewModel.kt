@@ -2,16 +2,21 @@ package com.toxicbakery.app.bison.common.screen.machine
 
 import androidx.lifecycle.viewModelScope
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
+import com.toxicbakery.app.bison.model.FeatureFlags
+import com.toxicbakery.app.bison.model.HardwareKeyTransport
+import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.ssh.HardwareKeySigner
 import com.toxicbakery.app.bison.ssh.KeyCreationException
 import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import com.toxicbakery.app.bison.ssh.SecretRef
 import com.toxicbakery.app.bison.ssh.SecretStore
+import com.toxicbakery.app.bison.ssh.SecurityKeyPublicKeys
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.util.BaseViewModel
@@ -25,6 +30,10 @@ import kotlinx.coroutines.launch
  * - The password field never shows the stored password. When it is empty, "Save Host" keeps the stored password.
  * - A new password gets a new reference, and the save removes the old secret.
  * - A delete of the machine removes its secret.
+ *
+ * The FIDO2 security key method needs [FeatureFlags.hardwareSecurityKeys] and a [hardwareKeySigner] (issue #23).
+ * Without them, the screen does not offer the method, and a loaded machine with a security key can save but cannot
+ * connect. With them, [Event.EnrollHardwareKey] makes a credential on the key, and the screen shows its public key.
  */
 class ConfigureMachineViewModel(
     val machineId: String,
@@ -33,21 +42,27 @@ class ConfigureMachineViewModel(
     private val secretStore: SecretStore,
     keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
     private val sshPublicKeyProvider: SshPublicKeyProvider? = null,
+    featureFlags: FeatureFlags = FeatureFlags(),
+    private val hardwareKeySigner: HardwareKeySigner? = null,
 ) : BaseViewModel<ConfigureMachineViewModel.State, ConfigureMachineViewModel.Event, ConfigureMachineViewModel.Action>(
-    initialState = createInitialState(machineId, machineStore.getMachine(machineId), keystoreKeySupport)
-        .copy(canShowPublicKey = sshPublicKeyProvider != null),
+    initialState = createInitialState(
+        machineId = machineId,
+        existing = machineStore.getMachine(machineId),
+        keystoreKeySupport = keystoreKeySupport,
+        hardwareKeysEnabled = featureFlags.hardwareSecurityKeys && hardwareKeySigner != null,
+    ).copy(canShowPublicKey = sshPublicKeyProvider != null),
 ), MachineViewModelDelegate by machineViewModelDelegate {
 
-    /**
-     * The SSH login methods. [isSupported] is false for a method that this version cannot use. The screen
-     * does not offer such a method, but a loaded machine can still have it.
-     */
-    enum class AuthType(val isSupported: Boolean = true) {
+    /** The SSH login methods. The screen offers the methods of [State.authChoices]. */
+    enum class AuthType {
         KeystoreKey,
         Password,
 
-        /** This version does not support hardware security keys. See issue #23. */
-        HardwareSecurityKey(isSupported = false),
+        /**
+         * A FIDO2 security key. The screen offers it only when [State.hardwareKeysEnabled] is true (issue #23). A
+         * loaded machine can have it in all builds.
+         */
+        HardwareSecurityKey,
     }
 
     data class State(
@@ -81,10 +96,23 @@ class ConfigureMachineViewModel(
         /** Tells if the loaded machine has a stored password. The password field shows a hint for it. */
         val storedPassword: StoredPassword = StoredPassword.None,
         /**
-         * The hardware security key of a loaded machine. The screen cannot change it, so "Save Host" keeps
-         * it with all of its fields. This version does not support the method (issue #23).
+         * True when this build offers FIDO2 security keys: [FeatureFlags.hardwareSecurityKeys] is true, and the
+         * platform supplies a [HardwareKeySigner].
+         */
+        val hardwareKeysEnabled: Boolean = false,
+        /**
+         * The security key of a loaded machine, or the key from the last enrollment, with all of its fields. When
+         * [hardwareKeysEnabled] is false, the screen cannot change it, and "Save Host" keeps it as it is.
          */
         val hardwareKey: SshAuthMethod.HardwareSecurityKey? = null,
+        /** The key type for the next enrollment. A change to a different type removes the enrolled credential. */
+        val hardwareKeyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
+        /** The connections that the app accepts for the security key. */
+        val hardwareKeyTransport: HardwareKeyTransport = HardwareKeyTransport.UsbAndNfc,
+        /** True while [Event.EnrollHardwareKey] waits for the security key. */
+        val isEnrollingKey: Boolean = false,
+        /** The cause when the last enrollment failed. */
+        val enrollError: String? = null,
         val proxyJumpEnabled: Boolean = false,
         val bastionHost: String = "",
         val bastionPortText: String = "22",
@@ -96,16 +124,41 @@ class ConfigureMachineViewModel(
         val parsedPort: Int?
             get() = portText.trim().toIntOrNull()?.takeIf { it in 1..65535 }
 
+        /**
+         * False when [herdrSessionName] has text that Herdr does not accept. An empty field is valid: the machine
+         * then uses the default session. See [HostMachine.isValidHerdrSessionName].
+         */
+        val isHerdrSessionNameValid: Boolean
+            get() = herdrSessionName.trim().let { it.isEmpty() || HostMachine.isValidHerdrSessionName(it) }
+
         val canSave: Boolean
-            get() = hostname.isNotBlank() && username.isNotBlank() && parsedPort != null
+            get() = hostname.isNotBlank() && username.isNotBlank() && parsedPort != null && isHerdrSessionNameValid
 
         /** The login methods that the screen offers. */
         val authChoices: List<AuthType>
-            get() = AUTH_CHOICES
+            get() = if (hardwareKeysEnabled) AUTH_CHOICES_WITH_HARDWARE_KEYS else AUTH_CHOICES
 
-        /** False when this version cannot log in with [authType]. The screen then blocks the connect. */
+        /**
+         * False when this build cannot log in with [authType]: a security key needs [hardwareKeysEnabled] and a
+         * FIDO2 key type.
+         */
+        val isAuthTypeSupported: Boolean
+            get() = authType != AuthType.HardwareSecurityKey || (hardwareKeysEnabled && hardwareKeyType.isFido2)
+
+        /** The enrolled security key for [hardwareKeyType], or null when the user must enroll the key first. */
+        val enrolledHardwareKey: SshAuthMethod.HardwareSecurityKey?
+            get() = hardwareKey?.takeIf { it.isEnrolled && it.keyType == hardwareKeyType }
+
+        /** The `authorized_keys` line of [enrolledHardwareKey], or null when the key has incorrect values. */
+        val hardwareKeyPublicKeyLine: String?
+            get() = enrolledHardwareKey?.let { key ->
+                runCatching { SecurityKeyPublicKeys.authorizedKeyLine(key) }.getOrNull()
+            }
+
+        /** False when the app cannot log in with [authType]. The screen then blocks the connect. */
         val canConnect: Boolean
-            get() = canSave && authType.isSupported
+            get() = canSave && isAuthTypeSupported &&
+                (authType != AuthType.HardwareSecurityKey || hardwareKeyPublicKeyLine != null)
     }
 
     /** The state of the stored password of the loaded machine. */
@@ -149,6 +202,18 @@ class ConfigureMachineViewModel(
         data object DismissRegenerateKey : Event
         data class UpdateRequireBiometric(val require: Boolean) : Event
         data class UpdatePasswordRef(val passwordRef: String) : Event
+
+        /** Selects the key type for the next enrollment. Only a FIDO2 type has an effect. */
+        data class UpdateHardwareKeyType(val keyType: HardwareKeyType) : Event
+
+        /** Selects the connections that the app accepts for the security key. */
+        data class UpdateHardwareKeyTransport(val transport: HardwareKeyTransport) : Event
+
+        /**
+         * Makes a new credential on the security key while the touch sheet shows. The screen then shows the public
+         * key of the credential. "Save Host" keeps the credential.
+         */
+        data object EnrollHardwareKey : Event
         data class UpdateProxyJumpEnabled(val enabled: Boolean) : Event
         data class UpdateBastionHost(val host: String) : Event
         data class UpdateBastionPort(val portText: String) : Event
@@ -178,8 +243,8 @@ class ConfigureMachineViewModel(
             is Event.UpdateMoshServerPath -> updateState { it.copy(moshServerPath = event.path) }
             is Event.UpdateMoshUdpPortRange -> updateState { it.copy(moshUdpPortRange = event.range) }
             is Event.UpdateHerdrSessionName -> updateState { it.copy(herdrSessionName = event.sessionName) }
-            is Event.UpdateAuthType -> if (event.authType.isSupported) {
-                updateState { it.copy(authType = event.authType) }
+            is Event.UpdateAuthType -> updateState { current ->
+                if (event.authType in current.authChoices) current.copy(authType = event.authType) else current
             }
             is Event.UpdateKeystoreAlias -> updateState { it.copy(keystoreAlias = event.alias).withoutPublicKey() }
             is Event.UpdateKeyAlgorithm -> updateState { current ->
@@ -210,6 +275,17 @@ class ConfigureMachineViewModel(
             }
             Event.DismissRegenerateKey -> updateState { it.copy(showRegenerateKeyWarning = false) }
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
+            is Event.UpdateHardwareKeyType -> updateState { current ->
+                if (!current.hardwareKeysEnabled || !event.keyType.isFido2 || current.isEnrollingKey) {
+                    current
+                } else {
+                    current.copy(hardwareKeyType = event.keyType, enrollError = null)
+                }
+            }
+            is Event.UpdateHardwareKeyTransport -> updateState { current ->
+                if (current.hardwareKeysEnabled) current.copy(hardwareKeyTransport = event.transport) else current
+            }
+            Event.EnrollHardwareKey -> enrollHardwareKey()
             is Event.UpdateProxyJumpEnabled -> updateState { it.copy(proxyJumpEnabled = event.enabled) }
             is Event.UpdateBastionHost -> updateState { it.copy(bastionHost = event.host) }
             is Event.UpdateBastionPort -> updateState { it.copy(bastionPortText = event.portText) }
@@ -329,6 +405,59 @@ class ConfigureMachineViewModel(
         }
     }
 
+    /** Runs [HardwareKeySigner.enroll] for the selected key type and keeps the enrolled key in the state. */
+    private fun enrollHardwareKey() {
+        val signer = hardwareKeySigner ?: return
+        val request = state.value
+        if (!request.hardwareKeysEnabled || !request.hardwareKeyType.isFido2 || request.isEnrollingKey) return
+        updateState { it.copy(isEnrollingKey = true, enrollError = null) }
+        viewModelScope.launch {
+            val result = try {
+                Result.success(
+                    signer.enroll(
+                        machineId = request.id.ifBlank { NEW_MACHINE_ID },
+                        keyType = request.hardwareKeyType,
+                        transport = request.hardwareKeyTransport,
+                        applicationId = request.hardwareKey?.applicationId
+                            ?: SshAuthMethod.HardwareSecurityKey.DEFAULT_APPLICATION_ID,
+                    ),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+            updateState { current ->
+                val enrolled = result.getOrNull()
+                if (enrolled != null) {
+                    current.copy(isEnrollingKey = false, hardwareKey = enrolled, hardwareKeyType = enrolled.keyType)
+                } else {
+                    val error = result.exceptionOrNull()
+                    current.copy(
+                        isEnrollingKey = false,
+                        enrollError = "$ENROLL_ERROR ${error?.message ?: error?.let { it::class.simpleName }}",
+                    )
+                }
+            }
+        }
+    }
+
+    /** Returns the security key that "Save Host" keeps for the state [current]. */
+    private fun hardwareKeyToSave(current: State): SshAuthMethod.HardwareSecurityKey {
+        val base = current.hardwareKey ?: SshAuthMethod.HardwareSecurityKey()
+        return when {
+            // The screen cannot change the key, so keep the loaded key with all of its fields.
+            !current.hardwareKeysEnabled -> base
+            base.keyType == current.hardwareKeyType -> base.copy(transport = current.hardwareKeyTransport)
+            // The credential is for a different key type, so the machine must enroll the key again.
+            else -> SshAuthMethod.HardwareSecurityKey(
+                keyType = current.hardwareKeyType,
+                transport = current.hardwareKeyTransport,
+                applicationId = base.applicationId,
+            )
+        }
+    }
+
     private fun saveMachine(connectImmediately: Boolean) {
         val current = state.value
         val port = current.parsedPort
@@ -338,8 +467,15 @@ class ConfigureMachineViewModel(
             }
             return
         }
-        if (connectImmediately && !current.authType.isSupported) {
+        if (connectImmediately && !current.isAuthTypeSupported) {
             updateState { it.copy(validationError = UNSUPPORTED_AUTH_ERROR) }
+            return
+        }
+        // The session name field shows the error. This check comes before the check of canConnect, because
+        // canConnect is also false for a session name that Herdr does not accept.
+        if (!current.isHerdrSessionNameValid) return
+        if (connectImmediately && !current.canConnect) {
+            updateState { it.copy(validationError = HARDWARE_KEY_NOT_ENROLLED_ERROR) }
             return
         }
 
@@ -362,8 +498,7 @@ class ConfigureMachineViewModel(
             AuthType.Password -> SshAuthMethod.Password(
                 encryptedPasswordRef = previousPasswordValue,
             )
-            // The view model does not select this method, so it is the method of the loaded machine.
-            AuthType.HardwareSecurityKey -> current.hardwareKey ?: SshAuthMethod.HardwareSecurityKey()
+            AuthType.HardwareSecurityKey -> hardwareKeyToSave(current)
         }
 
         val proxyJump = if (current.proxyJumpEnabled && current.bastionHost.isNotBlank()) {
@@ -441,8 +576,20 @@ class ConfigureMachineViewModel(
         const val UNSUPPORTED_AUTH_ERROR: String =
             "$UNSUPPORTED_AUTH_LABEL: hardware security keys. Select a different authentication method to connect."
 
-        /** The login methods that the screen offers: only the methods that this version supports. */
-        val AUTH_CHOICES: List<AuthType> = AuthType.entries.filter { it.isSupported }
+        /** The error that "Save & Connect" shows for a security key with no enrolled credential. */
+        const val HARDWARE_KEY_NOT_ENROLLED_ERROR: String = "Enroll the security key before you connect to this host."
+
+        /** The start of the error when the enrollment of the security key failed. */
+        const val ENROLL_ERROR: String = "The security key was not enrolled:"
+
+        /** The machine ID of the enrollment prompt of a machine that has no ID yet. */
+        internal const val NEW_MACHINE_ID: String = "new-machine"
+
+        /** The login methods that the screen offers when the build has no security key support. */
+        val AUTH_CHOICES: List<AuthType> = listOf(AuthType.KeystoreKey, AuthType.Password)
+
+        /** The login methods that the screen offers when [State.hardwareKeysEnabled] is true. */
+        val AUTH_CHOICES_WITH_HARDWARE_KEYS: List<AuthType> = AuthType.entries.toList()
 
         /**
          * Returns the alias for a change from [previous] to [next]. A blank alias or the default
@@ -456,6 +603,7 @@ class ConfigureMachineViewModel(
             machineId: String,
             existing: HostMachine?,
             keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
+            hardwareKeysEnabled: Boolean = false,
         ): State {
             val available = keystoreKeySupport.supportedAlgorithms
             if (existing == null) {
@@ -466,8 +614,10 @@ class ConfigureMachineViewModel(
                     keyAlgorithm = algorithm,
                     keystoreAlias = algorithm.defaultKeystoreAlias,
                     availableKeyAlgorithms = available,
+                    hardwareKeysEnabled = hardwareKeysEnabled,
                 )
             }
+            val hardwareAuth = existing.authMethod as? SshAuthMethod.HardwareSecurityKey
             val authType = when (existing.authMethod) {
                 is SshAuthMethod.KeystoreKey -> AuthType.KeystoreKey
                 is SshAuthMethod.Password -> AuthType.Password
@@ -501,7 +651,10 @@ class ConfigureMachineViewModel(
                 availableKeyAlgorithms = available,
                 requireBiometric = keystoreAuth?.requireBiometric ?: false,
                 storedPassword = storedPasswordOf(existing),
-                hardwareKey = existing.authMethod as? SshAuthMethod.HardwareSecurityKey,
+                hardwareKeysEnabled = hardwareKeysEnabled,
+                hardwareKey = hardwareAuth,
+                hardwareKeyType = hardwareAuth?.keyType ?: HardwareKeyType.SkSshEd25519,
+                hardwareKeyTransport = hardwareAuth?.transport ?: HardwareKeyTransport.UsbAndNfc,
                 proxyJumpEnabled = pj != null,
                 bastionHost = pj?.bastionHost.orEmpty(),
                 bastionPortText = (pj?.bastionPort ?: 22).toString(),
