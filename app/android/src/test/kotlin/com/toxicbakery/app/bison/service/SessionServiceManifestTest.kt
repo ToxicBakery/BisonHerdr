@@ -45,6 +45,21 @@ class SessionServiceManifestTest {
         assertFalse("android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" in permissions)
     }
 
+    /**
+     * This version does not support hardware security keys, so the app does not ask for NFC or USB host
+     * access. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds them again with FIDO2 keys.
+     */
+    @Test
+    fun manifestDeclaresNoNfcPermissionAndNoHardwareKeyFeatures() {
+        val permissions = elements("uses-permission").map { element -> element.androidAttribute("name") }
+        val features = elements("uses-feature").map { element -> element.androidAttribute("name") }
+
+        assertTrue("android.permission.INTERNET" in permissions)
+        assertFalse("android.permission.NFC" in permissions)
+        assertFalse("android.hardware.nfc" in features)
+        assertFalse("android.hardware.usb.host" in features)
+    }
+
     private fun elements(tagName: String): List<Element> {
         val nodes = manifest.getElementsByTagName(tagName)
         return (0 until nodes.length).map { index -> nodes.item(index) as Element }
