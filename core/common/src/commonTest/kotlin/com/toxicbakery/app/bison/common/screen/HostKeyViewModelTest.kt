@@ -148,14 +148,15 @@ class HostKeyViewModelTest {
                 bastionHost = "bastion.example.com",
                 bastionPort = 22,
                 bastionUser = "ian",
-                tailscaleMagicDns = true,
             ),
         )
         machineStore.upsertMachine(machine)
-        val target = knownHost(host = "WorkBox.ts.net", port = 2222, fingerprint = "SHA256:target")
+        // The entry of the target has the host name that the user typed. The app adds no `.ts.net` suffix.
+        val target = knownHost(host = "WorkBox", port = 2222, fingerprint = "SHA256:target")
         val bastion = knownHost(host = "bastion.example.com", port = 22, fingerprint = "SHA256:bastion")
-        val otherPort = knownHost(host = "workbox.ts.net", port = 22, fingerprint = "SHA256:other-port")
-        listOf(target, otherPort, bastion).forEach { knownHostsStore.put(it) }
+        val otherPort = knownHost(host = "workbox", port = 22, fingerprint = "SHA256:other-port")
+        val suffixed = knownHost(host = "workbox.ts.net", port = 2222, fingerprint = "SHA256:suffixed")
+        listOf(target, otherPort, suffixed, bastion).forEach { knownHostsStore.put(it) }
 
         val viewModel = KnownHostsViewModel(
             machineId = MACHINE_ID,
@@ -167,7 +168,7 @@ class HostKeyViewModelTest {
         viewModel.onEvent(KnownHostsViewModel.Event.Delete(target))
 
         assertEquals(listOf(bastion), viewModel.state.value.entries)
-        assertEquals(listOf(otherPort, bastion), knownHostsStore.knownHosts.value)
+        assertEquals(listOf(otherPort, suffixed, bastion), knownHostsStore.knownHosts.value)
     }
 
     @Test

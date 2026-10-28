@@ -33,7 +33,7 @@ data class ResolvedSshRoute(
 
 /**
  * Multi-hop SSH bastion tunneling (`ProxyJump` / RFC 4254 `direct-tcpip` channel forwarding)
- * and Tailscale `100.x.y.z` CGNAT / MagicDNS (`*.ts.net`) resolution helper.
+ * and Tailscale `100.x.y.z` CGNAT / MagicDNS (`*.ts.net`) detection helper.
  */
 class ProxyJumpTunnel(
     private val sshDebugLog: SshDebugLog? = null,
@@ -43,11 +43,15 @@ class ProxyJumpTunnel(
      * Resolves the SSH transport route for [machine], including Tailscale CGNAT/MagicDNS detection.
      * When [HostMachine.proxyJump] has a bastion host, the entry fields of the route are the bastion. A blank
      * bastion user gives the user of [machine].
+     *
+     * The target host is the host name that the user typed, with no change. Through a bastion, the bastion resolves
+     * the name in the `direct-tcpip` request. Thus a bastion on a tailnet resolves a MagicDNS short name, for example
+     * `devbox`, with its own DNS search domain. The known hosts also use this name.
      */
     fun resolveRoute(machine: HostMachine): ResolvedSshRoute {
         val proxy = machine.proxyJump
-        val normalizedTargetHost = normalizeHost(machine.hostname, proxy?.tailscaleMagicDns == true)
-        val isTailscale = isTailscaleAddress(normalizedTargetHost) ||
+        val targetHost = machine.hostname.trim()
+        val isTailscale = isTailscaleAddress(targetHost) ||
             (proxy != null && isTailscaleAddress(proxy.bastionHost))
 
         return if (proxy != null && proxy.bastionHost.isNotBlank()) {
@@ -55,14 +59,14 @@ class ProxyJumpTunnel(
             sshDebugLog?.record(
                 machineId = machine.id,
                 tag = "ProxyJump",
-                message = "Routing ${machine.username}@$normalizedTargetHost:${machine.port} via bastion " +
+                message = "Routing ${machine.username}@$targetHost:${machine.port} via bastion " +
                     "$bastionUser@${proxy.bastionHost}:${proxy.bastionPort}",
             )
             ResolvedSshRoute(
                 entryHost = proxy.bastionHost.trim(),
                 entryPort = proxy.bastionPort,
                 entryUsername = bastionUser,
-                targetHost = normalizedTargetHost,
+                targetHost = targetHost,
                 targetPort = machine.port,
                 targetUsername = machine.username,
                 viaBastion = true,
@@ -73,14 +77,14 @@ class ProxyJumpTunnel(
                 sshDebugLog?.record(
                     machineId = machine.id,
                     tag = "Tailscale",
-                    message = "Detected Tailscale mesh endpoint $normalizedTargetHost:${machine.port}",
+                    message = "Detected Tailscale mesh endpoint $targetHost:${machine.port}",
                 )
             }
             ResolvedSshRoute(
-                entryHost = normalizedTargetHost,
+                entryHost = targetHost,
                 entryPort = machine.port,
                 entryUsername = machine.username,
-                targetHost = normalizedTargetHost,
+                targetHost = targetHost,
                 targetPort = machine.port,
                 targetUsername = machine.username,
                 viaBastion = false,
@@ -111,14 +115,6 @@ class ProxyJumpTunnel(
 
     fun toSocketAddress(route: ResolvedSshRoute): InetSocketAddress =
         InetSocketAddress.createUnresolved(route.entryHost, route.entryPort)
-
-    private fun normalizeHost(host: String, tailscaleMagicDns: Boolean): String {
-        val trimmed = host.trim()
-        if (tailscaleMagicDns && '.' !in trimmed && trimmed.isNotEmpty()) {
-            return "$trimmed.ts.net"
-        }
-        return trimmed
-    }
 
     companion object {
         fun describeProxyJump(config: ProxyJumpConfig): String =

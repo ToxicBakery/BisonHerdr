@@ -69,6 +69,7 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
+import com.toxicbakery.app.bison.resources.machine_bastion_host_name_hint
 import com.toxicbakery.app.bison.resources.machine_field_mosh_ports_label
 import com.toxicbakery.app.bison.resources.machine_field_transport_mode_label
 import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
@@ -465,8 +466,8 @@ fun ConfigureMachineScreen(
                     }
                 }
 
-                // 4. ProxyJump / Bastion & Tailscale MagicDNS
-                SectionCard(title = "ProxyJump Bastion & Tailscale MagicDNS") {
+                // 4. ProxyJump / Bastion
+                SectionCard(title = "ProxyJump Bastion") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -521,22 +522,11 @@ fun ConfigureMachineScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = "Resolve hostnames via Tailscale MagicDNS",
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                            Switch(
-                                checked = state.tailscaleMagicDns,
-                                onCheckedChange = {
-                                    viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateTailscaleMagicDns(it))
-                                },
-                            )
-                        }
+                        Text(
+                            text = stringResource(Res.string.machine_bastion_host_name_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
 

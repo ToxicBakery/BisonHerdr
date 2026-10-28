@@ -375,7 +375,6 @@ class ConnectionPathsE2ETest {
                 bastionHost = "bastion.example.com",
                 bastionPort = 2222,
                 bastionUser = "jump",
-                tailscaleMagicDns = false,
             ),
         )
         val bastionRoute = hBastion.transport.proxyJumpTunnel.resolveRoute(bastionHost)
@@ -389,7 +388,7 @@ class ConnectionPathsE2ETest {
         assertTrue(hBastion.transport.connect(bastionHost))
         assertEquals(ConnectionProgress.Connected, hBastion.stateManager.connectionProgress.value["route-bastion"])
 
-        // Path 5C (part 1): Tailscale MagicDNS + CGNAT bastion
+        // Path 5C (part 1): A MagicDNS short name behind a CGNAT bastion. The bastion resolves the name.
         val hTailscale = Harness()
         val tailscaleHost = HostMachine(
             id = "route-tailscale",
@@ -401,14 +400,13 @@ class ConnectionPathsE2ETest {
                 bastionHost = "100.64.0.1",
                 bastionPort = 22,
                 bastionUser = "ts",
-                tailscaleMagicDns = true,
             ),
         )
         val tsRoute = hTailscale.transport.proxyJumpTunnel.resolveRoute(tailscaleHost)
         assertTrue(tsRoute.viaBastion)
         assertTrue(tsRoute.isTailscaleMesh)
         assertEquals("100.64.0.1", tsRoute.entryHost)
-        assertEquals("workbox.ts.net", tsRoute.targetHost)
+        assertEquals("workbox", tsRoute.targetHost)
         assertTrue(hTailscale.transport.connect(tailscaleHost))
         assertEquals(ConnectionProgress.Connected, hTailscale.stateManager.connectionProgress.value["route-tailscale"])
 
