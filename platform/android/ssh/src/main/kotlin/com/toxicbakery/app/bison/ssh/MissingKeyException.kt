@@ -10,7 +10,7 @@ package com.toxicbakery.app.bison.ssh
 class MissingKeyException(val keyAlias: String) : RuntimeException(messageFor(keyAlias)) {
 
     companion object {
-        /** Returns the text that the debug log and the connect error show for the missing [keyAlias]. */
+        /** Returns the text that the debug log and the connect error show when [keyAlias] has no key. */
         fun messageFor(keyAlias: String): String =
             "The key $keyAlias does not exist. Open the machine settings and copy the public key."
     }

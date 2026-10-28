@@ -66,15 +66,20 @@ internal fun interface KeystoreKeyGenerator {
  * cause. When [allowSoftwareKeys] is true, the manager makes a software JCA key in memory instead. Only JVM
  * tests set it, because the JVM has no AndroidKeyStore. A device must not use a software key.
  */
-class AndroidKeystoreKeyManager(
-    private val allowSoftwareKeys: Boolean = false,
+class AndroidKeystoreKeyManager internal constructor(
+    private val allowSoftwareKeys: Boolean,
+    /** Makes a key in AndroidKeyStore. A JVM test can give a generator that fails in a known way. */
+    private val keystoreKeyGenerator: KeystoreKeyGenerator = androidKeystoreGenerator,
+    /** The key types that AndroidKeyStore supports on this device. A JVM test can give a different list. */
+    private val keySupport: KeystoreKeySupport = AndroidKeystoreKeySupport,
 ) : SshPublicKeyProvider {
 
-    /** Makes a key in AndroidKeyStore. A JVM test can set a generator that fails in a known way. */
-    internal var keystoreKeyGenerator: KeystoreKeyGenerator = KeystoreKeyGenerator(::generateInAndroidKeystore)
-
-    /** The key types that AndroidKeyStore supports on this device. A JVM test can set a different list. */
-    internal var keySupport: KeystoreKeySupport = AndroidKeystoreKeySupport
+    /** Makes a manager that uses AndroidKeyStore. Set [allowSoftwareKeys] to true only in JVM tests. */
+    constructor(allowSoftwareKeys: Boolean = false) : this(
+        allowSoftwareKeys = allowSoftwareKeys,
+        keystoreKeyGenerator = androidKeystoreGenerator,
+        keySupport = AndroidKeystoreKeySupport,
+    )
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
     private val exportedPublicKeys = ConcurrentHashMap<String, ExportedSshPublicKey>()
@@ -322,51 +327,6 @@ class AndroidKeystoreKeyManager(
         }
     }
 
-    private fun generateInAndroidKeystore(
-        keyAlias: String,
-        algorithm: KeyAlgorithm,
-        requireBiometric: Boolean,
-    ): KeyPair {
-        val purposes = KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
-        return when (algorithm) {
-            KeyAlgorithm.Ed25519 -> {
-                // AndroidKeyStore (API 33+) makes Ed25519 keys with the EC generator and the "ed25519"
-                // curve. Ed25519 hashes the message itself, so the key must allow DIGEST_NONE.
-                val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
-                val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
-                    .setAlgorithmParameterSpec(ECGenParameterSpec(ED25519_CURVE))
-                    .setDigests(KeyProperties.DIGEST_NONE)
-                    .setUserAuthenticationRequired(requireBiometric)
-                    .build()
-                generator.initialize(spec)
-                generator.generateKeyPair()
-            }
-
-            KeyAlgorithm.Rsa4096 -> {
-                val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE_PROVIDER)
-                val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
-                    .setKeySize(4096)
-                    .setDigests(KeyProperties.DIGEST_SHA512, KeyProperties.DIGEST_SHA256)
-                    .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
-                    .setUserAuthenticationRequired(requireBiometric)
-                    .build()
-                generator.initialize(spec)
-                generator.generateKeyPair()
-            }
-
-            KeyAlgorithm.EcdsaP256 -> {
-                val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
-                val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
-                    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                    .setDigests(KeyProperties.DIGEST_SHA256)
-                    .setUserAuthenticationRequired(requireBiometric)
-                    .build()
-                generator.initialize(spec)
-                generator.generateKeyPair()
-            }
-        }
-    }
-
     /**
      * Returns the cause of the AndroidKeyStore [error]. AndroidKeyStore gives an [IllegalStateException]
      * when a key needs user authentication and the device has no secure screen lock or no biometric.
@@ -562,5 +522,53 @@ class AndroidKeystoreKeyManager(
         /** The maximum number of causes that [keyCreationFailure] examines. */
         private const val MAX_CAUSE_DEPTH = 16
         private val log = Arbor.tag("AndroidKeystoreKeyManager")
+
+        /** The [KeystoreKeyGenerator] of a device. */
+        private val androidKeystoreGenerator = KeystoreKeyGenerator(::generateInAndroidKeystore)
+
+        private fun generateInAndroidKeystore(
+            keyAlias: String,
+            algorithm: KeyAlgorithm,
+            requireBiometric: Boolean,
+        ): KeyPair {
+            val purposes = KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
+            return when (algorithm) {
+                KeyAlgorithm.Ed25519 -> {
+                    // AndroidKeyStore (API 33+) makes Ed25519 keys with the EC generator and the "ed25519"
+                    // curve. Ed25519 hashes the message itself, so the key must allow DIGEST_NONE.
+                    val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
+                    val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
+                        .setAlgorithmParameterSpec(ECGenParameterSpec(ED25519_CURVE))
+                        .setDigests(KeyProperties.DIGEST_NONE)
+                        .setUserAuthenticationRequired(requireBiometric)
+                        .build()
+                    generator.initialize(spec)
+                    generator.generateKeyPair()
+                }
+
+                KeyAlgorithm.Rsa4096 -> {
+                    val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE_PROVIDER)
+                    val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
+                        .setKeySize(4096)
+                        .setDigests(KeyProperties.DIGEST_SHA512, KeyProperties.DIGEST_SHA256)
+                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                        .setUserAuthenticationRequired(requireBiometric)
+                        .build()
+                    generator.initialize(spec)
+                    generator.generateKeyPair()
+                }
+
+                KeyAlgorithm.EcdsaP256 -> {
+                    val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
+                    val spec = KeyGenParameterSpec.Builder(keyAlias, purposes)
+                        .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                        .setUserAuthenticationRequired(requireBiometric)
+                        .build()
+                    generator.initialize(spec)
+                    generator.generateKeyPair()
+                }
+            }
+        }
     }
 }

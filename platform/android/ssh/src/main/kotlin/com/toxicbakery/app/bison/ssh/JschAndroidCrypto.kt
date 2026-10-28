@@ -170,7 +170,7 @@ class AndroidJschXdh : XDH {
  *
  * The identity does not make a key. When [keyAlias] has no key, [getPublicKeyBlob] and [getSignature]
  * throw a [MissingKeyException]. JSch lets this [RuntimeException] go through `JSch.addIdentity` and
- * `Session.connect`, so the login error names the missing key.
+ * `Session.connect`, so the login error names the key that does not exist.
  */
 internal class AndroidKeystoreJschIdentity(
     private val keystoreKeyManager: AndroidKeystoreKeyManager,

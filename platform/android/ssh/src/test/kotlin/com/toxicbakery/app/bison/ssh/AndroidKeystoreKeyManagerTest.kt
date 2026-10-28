@@ -34,12 +34,13 @@ class AndroidKeystoreKeyManagerTest {
         keystore: KeystoreKeyGenerator,
         allowSoftwareKeys: Boolean = false,
         supportedAlgorithms: List<KeyAlgorithm> = KeyAlgorithm.entries.toList(),
-    ) = AndroidKeystoreKeyManager(allowSoftwareKeys = allowSoftwareKeys).apply {
-        keystoreKeyGenerator = keystore
+    ) = AndroidKeystoreKeyManager(
+        allowSoftwareKeys = allowSoftwareKeys,
+        keystoreKeyGenerator = keystore,
         keySupport = object : KeystoreKeySupport {
             override val supportedAlgorithms: List<KeyAlgorithm> = supportedAlgorithms
-        }
-    }
+        },
+    )
 
     @Test
     fun aFailedKeystoreThrowsAndMakesNoSoftwareKey() {
