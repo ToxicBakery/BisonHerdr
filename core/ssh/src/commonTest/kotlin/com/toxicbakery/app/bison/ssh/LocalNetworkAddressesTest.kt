@@ -13,14 +13,17 @@ import kotlin.test.assertTrue
  */
 class LocalNetworkAddressesTest {
 
-    /** The prefixes of a device on a Wi-Fi network with IPv4 and IPv6, and with Tailscale on. */
-    private val wifiAndTailscale = listOfNotNull(
-        prefix("192.168.1.5", 24), // wlan0
-        prefix("2001:db8:1:2::5", 64), // wlan0, global
-        prefix("fe80::5", 64), // wlan0, link-local
-        prefix("100.64.0.7", 32), // tun0, Tailscale
-        prefix("fd7a:115c:a1e0::7", 128), // tun0, Tailscale
+    /** The own addresses of a device on a Wi-Fi network with IPv4 and IPv6, and with Tailscale on. */
+    private val ownAddresses = listOf(
+        "192.168.1.5" to 24, // wlan0
+        "2001:db8:1:2::5" to 64, // wlan0, global
+        "fe80::5" to 64, // wlan0, link-local
+        "100.64.0.7" to 32, // tun0, Tailscale
+        "fd7a:115c:a1e0::7" to 128, // tun0, Tailscale
     )
+
+    /** The lists of the device of [ownAddresses]. */
+    private val wifiAndTailscale = view(ownAddresses)
 
     @Test
     fun anIpv4PrefixIsLocalOnlyInsideTheFiveRanges() {
@@ -56,14 +59,28 @@ class LocalNetworkAddressesTest {
     @Test
     fun aTailscalePeerIsNotLocalBecauseTheVpnInterfaceHasOnlyItsOwnAddress() {
         assertNotLocal("100.101.102.103", "100.64.0.8", "fd7a:115c:a1e0::9")
-        // The own addresses of the VPN interface are local.
-        assertLocal("100.64.0.7", "fd7a:115c:a1e0::7")
+    }
+
+    @Test
+    fun anOwnAddressOfTheDeviceIsNotLocal() {
+        // Linux sends a packet to an own address through the loopback interface, which has no list.
+        assertNotLocal("100.64.0.7", "fd7a:115c:a1e0::7", "192.168.1.5", "2001:db8:1:2::5", "fe80::5")
+        assertNotLocal("::ffff:192.168.1.5")
     }
 
     @Test
     fun aWireGuardPeerIsLocalOnlyWhenTheInterfaceHasItsSubnet() {
-        assertFalse(LocalNetworkAddresses.isLocal(address("10.20.30.40"), listOfNotNull(prefix("10.20.30.2", 32))))
-        assertTrue(LocalNetworkAddresses.isLocal(address("10.20.30.40"), listOfNotNull(prefix("10.20.30.2", 24))))
+        assertFalse(LocalNetworkAddresses.isLocal(address("10.20.30.40"), view(listOf("10.20.30.2" to 32))))
+        assertTrue(LocalNetworkAddresses.isLocal(address("10.20.30.40"), view(listOf("10.20.30.2" to 24))))
+    }
+
+    @Test
+    fun withNoProtectedNetworkNoAddressIsLocal() {
+        val proxied = LocalNetworkView(wifiAndTailscale.prefixes, emptyList(), isProtected = false)
+
+        listOf("192.168.1.42", "224.0.0.251", "255.255.255.255", "ff02::fb").forEach { text ->
+            assertFalse(LocalNetworkAddresses.isLocal(address(text), proxied), "$text must not be local")
+        }
     }
 
     @Test
@@ -79,9 +96,9 @@ class LocalNetworkAddressesTest {
     }
 
     @Test
-    fun multicastAndBroadcastAddressesAreAlwaysLocal() {
+    fun multicastAndBroadcastAddressesAreLocalWhileANetworkHasTheProtection() {
         listOf("224.0.0.251", "239.255.255.250", "255.255.255.255", "ff02::fb", "ff05::c").forEach { text ->
-            assertTrue(LocalNetworkAddresses.isLocal(address(text), emptyList()), "$text must be local")
+            assertTrue(LocalNetworkAddresses.isLocal(address(text), LocalNetworkView.EMPTY), "$text must be local")
             assertTrue(LocalNetworkAddresses.isPrivate(address(text)), "$text must be private")
         }
     }
@@ -93,7 +110,7 @@ class LocalNetworkAddressesTest {
 
     @Test
     fun anIpv4MappedIpv6AddressHasTheResultOfItsIpv4Address() {
-        assertLocal("::ffff:192.168.1.5")
+        assertLocal("::ffff:192.168.1.42")
         assertNotLocal("::ffff:192.168.2.5", "::ffff:8.8.8.8")
         assertTrue(LocalNetworkAddresses.isPrivate(address("::ffff:10.0.0.1")))
         assertFalse(LocalNetworkAddresses.isPrivate(address("::ffff:8.8.8.8")))
@@ -140,6 +157,14 @@ class LocalNetworkAddressesTest {
 
     private fun prefix(text: String, length: Int): AddressPrefix? =
         LocalNetworkAddresses.localPrefixOf(address(text), length)
+
+    /** Returns the lists of a device with the own addresses [addresses] and their prefix lengths. */
+    private fun view(addresses: List<Pair<String, Int>>): LocalNetworkView =
+        LocalNetworkView(
+            prefixes = addresses.mapNotNull { (text, length) -> prefix(text, length) },
+            ownAddresses = addresses.map { (text, _) -> address(text) },
+            isProtected = true,
+        )
 
     private fun assertPrefix(text: String, length: Int) {
         assertNotNull(prefix(text, length), "$text/$length must give a local prefix")

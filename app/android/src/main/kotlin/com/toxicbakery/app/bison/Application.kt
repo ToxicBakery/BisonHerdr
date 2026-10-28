@@ -38,7 +38,7 @@ class Application : android.app.Application(), DIAware {
             val application = instance<Application>()
             StoreIOProviderAndroid(directory = { File(application.noBackupFilesDir, SECRETS_DIRECTORY) })
         }
-        // The guard reads the local network permission and the default network of the device.
+        // The guard reads the local network permission and all networks of the device.
         bindSingleton<LocalNetworkGuard> {
             androidLocalNetworkGuard(instance<Application>())
         }
