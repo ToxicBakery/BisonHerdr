@@ -203,6 +203,47 @@ class HerdrCommandTest {
     }
 
     @Test
+    fun theJsonErrorOfHerdrComesBeforeALineOfText() = runTest {
+        val debugLog = SshDebugLog()
+        val machine = machine(sessionName = null)
+        val output = "warning: unknown key in config\n$SERVER_NOT_RUNNING_JSON"
+        val client = client(debugLog) { batch -> snapshotOutput(batch, output) }
+
+        assertFalse(client.refreshSnapshotAndSurface(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        val expected = "No snapshot from `herdr api snapshot`: no herdr server is running"
+        assertEquals(listOf(expected), snapshotErrors(debugLog))
+    }
+
+    @Test
+    fun theDebugLogKeepsAtMost512CharactersOfALineOfText() = runTest {
+        val debugLog = SshDebugLog()
+        val machine = machine(sessionName = null)
+        val client = client(debugLog) { batch -> snapshotOutput(batch, "t".repeat(2_000)) }
+
+        assertFalse(client.refreshSnapshotAndSurface(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        assertEquals(listOf("No snapshot from `herdr api snapshot`: ${"t".repeat(512)}"), snapshotErrors(debugLog))
+    }
+
+    @Test
+    fun theDebugLogKeepsAtMost512CharactersOfTheCauseForALongInvalidName() = runTest {
+        val debugLog = SshDebugLog()
+        // A machine from an earlier version can have a long name that Herdr does not accept.
+        val name = "a b".repeat(1_000)
+        val machine = machine(sessionName = name)
+        val client = client(debugLog) { batch -> snapshotOutput(batch, INVALID_NAME_ERROR) }
+
+        assertFalse(client.refreshSnapshotAndSurface(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        val cause = "Herdr does not accept the session name \"$name\". Change the name in the machine settings."
+        assertEquals(
+            listOf("No snapshot from `${HerdrCommand.forSession(name)} api snapshot`: ${cause.take(512)}"),
+            snapshotErrors(debugLog),
+        )
+    }
+
+    @Test
     fun theMoshStartCommandQuotesTheSessionName() {
         val prefix = "command -v mosh-server >/dev/null 2>&1 && mosh-server new -s -c 256 -l LANG=en_US.UTF-8 " +
             "-p 60000:61000 -- env HERDR_CONFIG_PATH=/tmp/herdr-bison-tablet.toml "

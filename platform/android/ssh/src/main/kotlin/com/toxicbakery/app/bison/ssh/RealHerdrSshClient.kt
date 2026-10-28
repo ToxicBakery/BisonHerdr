@@ -235,6 +235,13 @@ internal class RealHerdrSshClient(
         val ansiByPane: Map<String, String>,
     )
 
+    /** Drops all bytes. `OutputStream.nullOutputStream()` needs API 33, and the minimum SDK of the app is 31. */
+    private object DiscardOutputStream : OutputStream() {
+        override fun write(b: Int) = Unit
+
+        override fun write(b: ByteArray, off: Int, len: Int) = Unit
+    }
+
     private class PersistentShellWorker(
         val channel: ChannelExec,
         val stdin: OutputStream,
@@ -1965,6 +1972,8 @@ internal class RealHerdrSshClient(
      * - the `error.message` of a JSON answer in [output], for example for `server_not_running`.
      * - the last line of [output] that is not JSON, for example `sh: 1: herdr: not found`.
      *
+     * The cause has at most [MAX_LOGGED_CAUSE_LENGTH] characters.
+     *
      * The client writes only the first error of each series of polls with no snapshot. A poll with a snapshot, a new
      * [connectAndVerify], or a [disconnect] ends the series. Thus a host that stays in this state does not fill the
      * debug log.
@@ -1972,11 +1981,11 @@ internal class RealHerdrSshClient(
     private fun recordMissingSnapshot(machine: HostMachine, output: String) {
         if (!machinesWithoutSnapshot.add(machine.id)) return
         val sessionName = machine.herdrSessionName?.trim()?.takeIf { it.isNotEmpty() }
-        val cause = sessionName?.takeIf { !HostMachine.isValidHerdrSessionName(it) }
+        val cause = (sessionName?.takeIf { !HostMachine.isValidHerdrSessionName(it) }
             ?.let { "Herdr does not accept the session name \"$it\". Change the name in the machine settings." }
             ?: herdrErrorMessage(output)
             ?: lastTextLine(output)
-            ?: "Herdr gave no output."
+            ?: "Herdr gave no output.").take(MAX_LOGGED_CAUSE_LENGTH)
         sshDebugLog.record(
             machineId = machine.id,
             tag = "RealSSH",
@@ -1985,10 +1994,7 @@ internal class RealHerdrSshClient(
         )
     }
 
-    /**
-     * Returns the `error.message` of the first Herdr answer in [output] that has an error, or null. The result has at
-     * most [MAX_LOGGED_CAUSE_LENGTH] characters.
-     */
+    /** Returns the `error.message` of the first Herdr answer in [output] that has an error, or null. */
     private fun herdrErrorMessage(output: String): String? =
         output.lineSequence()
             .map { it.trim() }
@@ -1999,17 +2005,12 @@ internal class RealHerdrSshClient(
                     error?.get("message")?.jsonPrimitive?.content
                 }.getOrNull()
             }
-            ?.take(MAX_LOGGED_CAUSE_LENGTH)
 
-    /**
-     * Returns the last line of [output] that has text and is not a JSON object, or null. The result has at most
-     * [MAX_LOGGED_CAUSE_LENGTH] characters.
-     */
+    /** Returns the last line of [output] that has text and is not a JSON object, or null. */
     private fun lastTextLine(output: String): String? =
         output.lineSequence()
             .map { it.trim() }
             .lastOrNull { it.isNotEmpty() && !(it.startsWith("{") && it.endsWith("}")) }
-            ?.take(MAX_LOGGED_CAUSE_LENGTH)
 
     private fun parsePaneReadLinesInto(
         rawResponse: String,
@@ -2511,8 +2512,8 @@ internal class RealHerdrSshClient(
         channel.setCommand(initCmd)
         val rawIn = channel.inputStream
         val rawOut = channel.outputStream
-        // The worker keeps only the last bytes of its standard error. See StderrTail.
-        channel.setErrStream(StderrTail(WORKER_STDERR_TAIL_BYTES))
+        // No code reads the standard error of a worker. A buffer would grow with each command that fails.
+        channel.setErrStream(DiscardOutputStream)
         channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
         val worker = PersistentShellWorker(
             channel = channel,
@@ -3396,9 +3397,6 @@ internal class RealHerdrSshClient(
         private const val SERVER_ALIVE_INTERVAL_MS = 10_000
         private const val SERVER_ALIVE_COUNT_MAX = 3
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
-
-        /** The number of bytes of standard error that each persistent worker keeps. See [StderrTail]. */
-        private const val WORKER_STDERR_TAIL_BYTES = 4 * 1024
 
         /** The maximum length of a cause from the host in the debug log. See [recordMissingSnapshot]. */
         private const val MAX_LOGGED_CAUSE_LENGTH = 512
