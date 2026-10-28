@@ -111,6 +111,45 @@ class ModelSerializationTest {
         assertEquals(passwordHost, json.decodeFromString<HostMachine>(json.encodeToString(passwordHost)))
     }
 
+    /**
+     * An old version could save a machine with a hardware security key. This version does not support the
+     * method (issue #23), but the file must still load, and the method must not change.
+     */
+    @Test
+    fun oldMachinesFileWithAHardwareSecurityKeyStillLoads() {
+        val oldMachinesFile = """
+            [
+              {"id":"workbox","name":"Workbox","hostname":"100.64.0.12","port":22,"username":"ian",
+               "authMethod":{"type":"keystore_key","keyAlias":"bison_default_ed25519","algorithm":"Ed25519",
+                 "requireBiometric":false},
+               "transportMode":"AutoPreferMosh","moshServerPath":null,"moshUdpPortRange":"60000:61000",
+               "herdrSessionName":null,"proxyJump":null,"themeOverrideId":null,"fontSizeSp":13.0},
+              {"id":"gpu-rig","name":"GPU Rig","hostname":"100.64.0.25","port":2222,"username":"ian",
+               "authMethod":{"type":"hardware_security_key","keyType":"SkEcdsaSha2Nistp256","transport":"NfcOnly",
+                 "applicationId":"ssh:"},
+               "transportMode":"SshEndpointOnly","moshServerPath":null,"moshUdpPortRange":"60000:61000",
+               "herdrSessionName":null,"proxyJump":null,"themeOverrideId":null,"fontSizeSp":13.0}
+            ]
+        """.trimIndent()
+
+        val machines = json.decodeFromString<List<HostMachine>>(oldMachinesFile)
+
+        assertEquals(listOf("workbox", "gpu-rig"), machines.map { it.id })
+        assertTrue(machines[0].authMethod.isSupported)
+        val hardwareKey = machines[1].authMethod
+        assertEquals(
+            SshAuthMethod.HardwareSecurityKey(
+                keyType = HardwareKeyType.SkEcdsaSha2Nistp256,
+                transport = HardwareKeyTransport.NfcOnly,
+                applicationId = "ssh:",
+            ),
+            hardwareKey,
+        )
+        assertFalse(hardwareKey.isSupported)
+        assertTrue(SshAuthMethod.Password().isSupported)
+        assertEquals(machines, json.decodeFromString<List<HostMachine>>(json.encodeToString(machines)))
+    }
+
     @Test
     fun activeBackboneAndEnumsRoundTrip() {
         val mosh: ActiveBackbone = ActiveBackbone.MoshUdp(

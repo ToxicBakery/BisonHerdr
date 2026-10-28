@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
+import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.protocol.ClientSurfaceSize
@@ -21,7 +22,8 @@ import kotlinx.coroutines.sync.withLock
  * Android SSH2 + Mosh UDP SSP + Herdr Endpoint Generation 1 transport coordinator.
  *
  * Implements the 4-phase Connection Lifecycle State Machine (`Part IV.1 & IV.2` of `01-core-app-design.md`):
- * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager], `Password`, or [YubiKeyFido2Manager], optionally via [ProxyJumpTunnel]).
+ * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
+ *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
  * 2. `BootstrappingMoshOrBridge`: Probes `command -v mosh-server` and launches
  *    `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`,
  *    parsing `MOSH CONNECT <port> <key>` and running the `1,500 ms` UDP reachability handshake.
@@ -124,6 +126,17 @@ class SshTransportManager(
 
     private suspend fun connectInternal(machine: HostMachine): Boolean {
         val machineId = machine.id
+        if (!machine.authMethod.isSupported) {
+            // The backend does not get the machine, so the app makes no network connection.
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "SSHAuth",
+                message = "Did not connect to ${machine.displayAddress}: $HARDWARE_KEY_NOT_SUPPORTED",
+                isError = true,
+            )
+            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            return false
+        }
         activeMachines[machineId] = machine
         surfaceLeaseActive[machineId] = true
 
@@ -468,6 +481,13 @@ class SshTransportManager(
         internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
+
+        /**
+         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey]. This version does not
+         * support that method. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+         */
+        internal const val HARDWARE_KEY_NOT_SUPPORTED: String =
+            "This version does not support hardware security keys (issue #23)"
 
         /**
          * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet

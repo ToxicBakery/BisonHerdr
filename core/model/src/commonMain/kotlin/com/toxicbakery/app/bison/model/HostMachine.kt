@@ -70,6 +70,14 @@ enum class TransportMode {
  */
 @Serializable
 sealed interface SshAuthMethod {
+
+    /**
+     * True when this version of the app can log in with this method. This version cannot log in with
+     * [HardwareSecurityKey]. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+     */
+    val isSupported: Boolean
+        get() = this !is HardwareSecurityKey
+
     @Serializable
     @SerialName("keystore_key")
     data class KeystoreKey(
@@ -85,6 +93,14 @@ sealed interface SshAuthMethod {
         val keyPassphraseRef: String? = null,
     ) : SshAuthMethod
 
+    /**
+     * A FIDO2 or PIV hardware security key.
+     *
+     * This version does not support this method, and [isSupported] is false. The configure screen does
+     * not offer it, and the transport does not connect a machine that uses it. The model stays, so that
+     * an old `machines.json` file still loads. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23)
+     * adds FIDO2 security keys.
+     */
     @Serializable
     @SerialName("hardware_security_key")
     data class HardwareSecurityKey(

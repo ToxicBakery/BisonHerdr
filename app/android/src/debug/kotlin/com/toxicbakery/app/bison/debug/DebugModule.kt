@@ -29,7 +29,6 @@ internal val debugModule = DI.Module("debugModule") {
                 paneSurfaceBus = instance(),
                 semanticNotificationBus = instance(),
                 keystoreKeyManager = instance(),
-                yubiKeyFido2Manager = instance(),
             ),
             isSimulated = fakeServer::isFakeMachine,
         )
