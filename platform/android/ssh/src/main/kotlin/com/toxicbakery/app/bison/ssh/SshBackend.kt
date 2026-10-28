@@ -26,7 +26,7 @@ interface SshBackend {
 
     /**
      * Selects the backbone for [machine]. This version has no Mosh transport (issue #22), so a backend returns the
-     * SSH endpoint bridge ([ActiveBackbone.SshEndpoint]). A backend can return null when no backbone that
+     * SSH session ([ActiveBackbone.SshEndpoint]). A backend can return null when no backbone that
      * [HostMachine.transportMode] permits is available.
      */
     suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone?

@@ -37,7 +37,7 @@ import kotlinx.coroutines.test.runTest
  * [AndroidKeystoreKeyManager], [SshStateManager], [EndpointSnapshotBus],
  * [PaneSurfaceBus], and [SemanticNotificationBus].
  *
- * This version has no Mosh transport (issue #22). Each path thus connects over the SSH endpoint bridge, and the
+ * This version has no Mosh transport (issue #22). Each path thus connects over the SSH session backbone, and the
  * Mosh engine starts no session.
  *
  * [SimulatedSshBackend] is in the `src/debug` source set, so these tests are in `src/testDebug`.
@@ -76,7 +76,7 @@ class ConnectionPathsE2ETest {
         )
     }
 
-    /** Returns the lane of [request] on the SSH endpoint bridge while the surface lease is on. */
+    /** Returns the lane that the target design gives [request] while the surface lease is on. */
     private fun expectedLane(request: ClientShellEndpointRequest): String =
         if (MoshBootstrapConfig.isClientShellSupportedMethod(request.method)) {
             SshTransportManager.CLIENT_BRIDGE_LANE
@@ -84,7 +84,7 @@ class ConnectionPathsE2ETest {
             SshTransportManager.API_BRIDGE_LANE
         }
 
-    /** Sends [request] to [machineId] and asserts that it went on the lane of the SSH endpoint bridge. */
+    /** Sends [request] to [machineId] and asserts that the response names the lane of the target design. */
     private suspend fun Harness.assertSentOnSshEndpointLane(machineId: String, request: ClientShellEndpointRequest) {
         val response = transport.sendEndpointCommand(machineId, request)
         assertTrue(response?.contains(expectedLane(request)) == true, "Wrong lane for ${request.method}: $response")
@@ -140,7 +140,7 @@ class ConnectionPathsE2ETest {
         val initialSurface = assertNotNull(h.surfaceBus.surfaceFor("workbox-1a"))
         assertEquals(2, initialSurface.panes.size)
 
-        // 3. Focus RPCs go on the lanes of the SSH endpoint bridge and update the snapshot and the surface.
+        // 3. Focus RPCs get the lanes of the target design and update the snapshot and the surface.
         h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.workspaceFocus("w2"))
         assertEquals("w2", h.snapshotBus.snapshotFor("workbox-1a")?.focusedWorkspaceId)
 
@@ -535,7 +535,7 @@ class ConnectionPathsE2ETest {
         )
         assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, workboxBackbone.fallbackReason)
 
-        // A focus RPC goes on the lane of the SSH endpoint bridge.
+        // A focus RPC gets the lane of the target design.
         h.assertSentOnSshEndpointLane("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
 
         // Verify background surface parking and wakeup presentation fence

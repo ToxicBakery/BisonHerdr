@@ -38,7 +38,7 @@ import kotlinx.serialization.json.jsonPrimitive
  * The debug bindings use this backend only for the machines that the fake server made. This class is in
  * the `src/debug` source set, so the release variant does not compile it and release builds do not contain it.
  *
- * The backend gives the same backbone as [RealSshBackend]: the SSH endpoint bridge, because this version has no Mosh
+ * The backend gives the same backbone as [RealSshBackend]: the SSH session backbone, because this version has no Mosh
  * transport (issue #22). The round trip time is [SIMULATED_RTT_MS].
  *
  * The test hooks [moshServerProbe], [sshRouteProbe], and [passwordAuthenticator] change the simulated results.
@@ -132,7 +132,7 @@ class SimulatedSshBackend(
     }
 
     /**
-     * Returns the SSH endpoint bridge with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
+     * Returns the SSH session backbone with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
      * transport (issue #22). [moshServerProbe] tells if the simulated host has `mosh-server`. The fallback reason
      * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
      */
