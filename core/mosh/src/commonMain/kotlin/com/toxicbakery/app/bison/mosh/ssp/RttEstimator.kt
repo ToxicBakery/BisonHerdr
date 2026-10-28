@@ -46,7 +46,7 @@ class RttEstimator {
             MAX_FRAME_INTERVAL_MS
         }
 
-    /** Adds one RTT sample of [sampleMs] milliseconds. A sample also ends the back-off (RFC 6298, section 5.7). */
+    /** Adds one RTT sample of [sampleMs] milliseconds. A sample also ends the back-off (RFC 6298, section 5). */
     fun addSample(sampleMs: Long) {
         require(sampleMs >= 0) { "The RTT sample $sampleMs is negative." }
         val sample = sampleMs.toDouble()

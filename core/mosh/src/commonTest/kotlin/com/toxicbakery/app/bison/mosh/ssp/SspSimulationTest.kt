@@ -1,5 +1,6 @@
 package com.toxicbakery.app.bison.mosh.ssp
 
+import com.toxicbakery.app.bison.mosh.wire.MoshCipher
 import com.toxicbakery.app.bison.mosh.wire.UserEvent
 import kotlin.random.Random
 import kotlin.test.Test
@@ -68,6 +69,27 @@ class SspSimulationTest {
     }
 
     @Test
+    fun aPasteOf128KiBCompletesWithLossInEachDirectionAndAKeyAfterItFollowsSoon() {
+        for (delayMs in listOf(50L, 150L)) {
+            for (seed in 1..3) {
+                val simulation = Simulation(seed, lossRate = 0.1, delayMs = delayMs, jitterMs = delayMs / 2)
+                val random = Random(seed)
+                val paste = String(CharArray(PASTE_SIZE) { 'a' + random.nextInt(LETTERS) })
+                simulation.at(1000) { simulation.transport.push(UserEvent.Keys(paste.encodeToByteArray())) }
+                simulation.at(1100) { simulation.transport.push(UserEvent.Keys("Z".encodeToByteArray())) }
+                val text = { simulation.server.applicationText }
+                val run = "delay $delayMs, seed $seed"
+                val pasted = assertNotNull(simulation.runUntil(31_000) { text().length >= PASTE_SIZE }, run)
+                val keyed = assertNotNull(simulation.runUntil(pasted + 2000) { text().endsWith("Z") }, run)
+                assertEquals(paste + "Z", text())
+                assertTrue(pasted - 1000 <= 30_000, "$run: the paste took ${pasted - 1000} ms")
+                assertTrue(keyed - pasted <= 2000, "$run: the key took ${keyed - pasted} ms more")
+                assertEquals(emptyList(), simulation.server.errors)
+            }
+        }
+    }
+
+    @Test
     fun aClientThatTypesWithNoLossSendsFewDatagrams() {
         val simulation = Simulation(seed = 7, delayMs = 25)
         simulation.typeRandomKeys(count = 100, fromMs = 500, toMs = 10_500)
@@ -86,7 +108,7 @@ class SspSimulationTest {
     ) {
         private val random = Random(seed)
         val network = SimulatedNetwork(random, lossRate, duplicateRate, delayMs, jitterMs)
-        val transport = textTransport()
+        val transport = SspTransport(MoshCipher(TEST_KEY), screenStore(), startMs = 0)
         val server = FakeMoshServer()
         private val actions = HashMap<Long, MutableList<() -> Unit>>()
         var address = 1
@@ -111,32 +133,70 @@ class SspSimulationTest {
             return keys.joinToString("")
         }
 
+        /** The time of the next step. */
+        var nowMs = 0L
+            private set
+
+        // The deadline after the last poll, and true when an input came to the transport after that poll.
+        private var lastDeadline = 0L
+        private var inputSinceDeadline = true
+
         fun run(untilMs: Long) {
-            for (now in 0L..untilMs) {
-                actions[now]?.forEach { action -> action() }
-                network.deliver(
-                    nowMs = now,
-                    toServer = { packet, from -> server.receive(packet, from, now) },
-                    toClient = { packet, to -> if (to == address) transport.receive(packet, now) },
-                )
-                maxKeptStates = maxOf(maxKeptStates, transport.hostStates.size)
-                if (transport.isRoamDue(now)) {
-                    address++
-                    roamTimes += now
-                    transport.onRoamed(now)
-                }
-                val deadline = transport.nextDeadlineMs(now)
-                val packets = transport.poll(now)
-                // The transport never sends before its own deadline.
-                check(packets.isEmpty() || now >= deadline) { "A send at $now came before the deadline $deadline." }
-                packets.forEach { packet -> network.sendToServer(packet, address, now) }
-                server.poll(now).forEach { packet -> network.sendToClient(packet, server.target, now) }
+            runUntil(untilMs) { false }
+        }
+
+        /** Runs until [done] is true after a step, or until [untilMs]. Returns the time of that step, or null. */
+        fun runUntil(untilMs: Long, done: () -> Boolean): Long? {
+            while (nowMs <= untilMs) {
+                val now = nowMs++
+                step(now)
+                if (done()) return now
             }
+            return null
+        }
+
+        private fun step(now: Long) {
+            actions[now]?.let { list ->
+                list.forEach { action -> action() }
+                inputSinceDeadline = true
+            }
+            network.deliver(
+                nowMs = now,
+                toServer = { packet, from -> server.receive(packet, from, now) },
+                toClient = { packet, to ->
+                    if (to == address) {
+                        transport.receive(packet, now)
+                        inputSinceDeadline = true
+                    }
+                },
+            )
+            maxKeptStates = maxOf(maxKeptStates, transport.hostStates.size)
+            if (transport.isRoamDue(now)) {
+                address++
+                roamTimes += now
+                transport.onRoamed(now)
+                inputSinceDeadline = true
+            }
+            val deadline = transport.nextDeadlineMs(now)
+            val packets = transport.poll(now)
+            // The transport never sends before its own deadline.
+            check(packets.isEmpty() || now >= deadline) { "A send at $now came before the deadline $deadline." }
+            // With no input since the last poll, the deadline of that poll still holds.
+            check(packets.isEmpty() || inputSinceDeadline || now >= lastDeadline) {
+                "A send at $now came before the earlier deadline $lastDeadline."
+            }
+            // A deadline that is not in the future gives a send, so that a loop on the deadline does not spin.
+            check(deadline > now || packets.isNotEmpty()) { "No send at $now, but the deadline was $deadline." }
+            packets.forEach { packet -> network.sendToServer(packet, address, now) }
+            server.poll(now).forEach { packet -> network.sendToClient(packet, server.target, now) }
+            lastDeadline = transport.nextDeadlineMs(now)
+            inputSinceDeadline = false
         }
     }
 
     private companion object {
         val SEEDS = listOf(1, 2, 3, 4)
         const val LETTERS = 26
+        const val PASTE_SIZE = 128 * 1024
     }
 }

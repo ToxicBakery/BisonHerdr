@@ -16,7 +16,9 @@ import com.toxicbakery.app.bison.mosh.wire.Zlib
  * A server for the simulation tests. Its rules come from the black-box facts of decision 4:
  * - It replies to the address of the newest authentic datagram (wire fact 10).
  * - It applies a user diff only when it has the `fromState` and not the `toState`. Its application gets each key one
- *   time. The screen is the text of all keys that the application got.
+ *   time. It does not answer a copy of a user state that it has. A real server does the same.
+ * - The screen is small, as on a real terminal: the count of keys and the last keys. Each diff holds the full
+ *   screen, and the client screen is the text of the last diff ([screenStore]).
  * - It chains each diff from its newest sent state. When the client does not acknowledge in [RESEND_MS], it sends
  *   a diff from the state that the client acknowledged (wire fact 17). Its `keepState` is that state.
  * - The echo ack is the newest user state that the application got at least 50 ms before (wire fact 15).
@@ -70,6 +72,8 @@ internal class FakeMoshServer {
 
     /** The screen of the newest host state. */
     val screen: String get() = hostStates.getValue(currentHost).text
+
+    private val applicationScreen: String get() = "${applicationText.length}:${applicationText.takeLast(SCREEN_TAIL)}"
 
     /** The time at which the client acknowledged the end state, or null. */
     var endAcknowledgedAtMs: Long? = null
@@ -129,7 +133,7 @@ internal class FakeMoshServer {
             echoAck = maxOf(echoAck, deliveries.removeFirst().second)
         }
         val current = hostStates.getValue(currentHost)
-        val changed = applicationText != current.text || echoAck != current.echoAck
+        val changed = applicationScreen != current.text || echoAck != current.echoAck
         if (changed && changeAtMs == null) changeAtMs = nowMs
         val collected = changed &&
             nowMs >= (changeAtMs ?: nowMs) + COLLECTION_MS &&
@@ -157,7 +161,7 @@ internal class FakeMoshServer {
     }
 
     private fun newHostState(number: ULong, nowMs: Long) {
-        hostStates[number] = HostSnapshot(applicationText, echoAck)
+        hostStates[number] = HostSnapshot(applicationScreen, echoAck)
         currentHost = number
         lastNewHostAtMs = nowMs
         changeAtMs = null
@@ -168,8 +172,7 @@ internal class FakeMoshServer {
         val from = hostStates.getValue(base)
         val to = hostStates.getValue(currentHost)
         val events = buildList {
-            val text = to.text.substring(from.text.length)
-            if (text.isNotEmpty()) add(HostEvent.HostBytes(text.encodeToByteArray()))
+            if (to.text != from.text) add(HostEvent.HostBytes(to.text.encodeToByteArray()))
             if (to.echoAck != from.echoAck) add(HostEvent.EchoAck(to.echoAck))
         }
         val instruction = Instruction(
@@ -209,7 +212,8 @@ internal class FakeMoshServer {
         const val COLLECTION_MS = 8L
         const val FRAME_MS = 20L
         const val HEARTBEAT_MS = 3000L
-        const val RESEND_MS = 300L
+        const val RESEND_MS = 200L
+        const val SCREEN_TAIL = 40
         const val TIMESTAMP_MASK = 0xFFFFL
     }
 }

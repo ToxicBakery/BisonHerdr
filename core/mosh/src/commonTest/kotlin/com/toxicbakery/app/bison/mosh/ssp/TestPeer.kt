@@ -21,6 +21,11 @@ internal fun textStore(): HostStateStore<String> = HostStateStore("") { state, e
     state + events.filterIsInstance<HostEvent.HostBytes>().joinToString("") { event -> event.bytes.decodeToString() }
 }
 
+/** A host state store whose screen is the text of the last host bytes event, as [FakeMoshServer] sends it. */
+internal fun screenStore(): HostStateStore<String> = HostStateStore("") { state, events ->
+    events.filterIsInstance<HostEvent.HostBytes>().lastOrNull()?.bytes?.decodeToString() ?: state
+}
+
 /** A transport with a text screen that starts at the time 0. */
 internal fun textTransport(): SspTransport<String> = SspTransport(MoshCipher(TEST_KEY), textStore(), startMs = 0)
 

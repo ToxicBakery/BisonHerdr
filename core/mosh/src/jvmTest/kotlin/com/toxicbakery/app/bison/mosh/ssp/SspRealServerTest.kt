@@ -1,8 +1,13 @@
 package com.toxicbakery.app.bison.mosh.ssp
 
+import com.toxicbakery.app.bison.mosh.wire.Datagram
+import com.toxicbakery.app.bison.mosh.wire.Direction
+import com.toxicbakery.app.bison.mosh.wire.HostEvent
+import com.toxicbakery.app.bison.mosh.wire.Instruction
 import com.toxicbakery.app.bison.mosh.wire.MoshCipher
 import com.toxicbakery.app.bison.mosh.wire.MoshServerFixture
 import com.toxicbakery.app.bison.mosh.wire.UserEvent
+import com.toxicbakery.app.bison.mosh.wire.Zlib
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -31,13 +36,13 @@ class SspRealServerTest {
         val output = createTempFile("bison-ssp", ".txt")
         try {
             // The program writes each byte that it gets to the file, with no change.
-            val server = MoshServerFixture.start("sh", "-c", "stty raw -echo && exec cat > \"$1\"", "sh", "$output")
+            val server = MoshServerFixture.start("sh", "-c", RAW_CAT, "sh", "$output")
             val typed = StringBuilder()
             server.use {
                 Driver(server, lossRate = 0.25, duplicateRate = 0.1, seed = 22).use { driver ->
                     val random = Random(SEED)
                     driver.transport.push(UserEvent.Resize(80, 24))
-                    assertTrue(driver.runUntil(TIMEOUT) { driver.transport.lastContactAtMs != null })
+                    assertTrue(driver.runUntil(TIMEOUT) { driver.isReady }, driver.report())
                     repeat(CHUNKS) {
                         val chunk = buildString { repeat(random.nextInt(1, 40)) { append('a' + random.nextInt(26)) } }
                         typed.append(chunk)
@@ -47,7 +52,7 @@ class SspRealServerTest {
                     val stream = driver.transport.userStream
                     assertTrue(driver.runUntil(TIMEOUT) { stream.echoedCount == stream.pushedCount }, driver.report())
                     assertEquals(stream.pushedCount, stream.acknowledgedCount)
-                assertTrue(driver.transport.hostStates.newest.state > 1, driver.report())
+                    assertTrue(driver.transport.hostStates.newest.number > 1uL, driver.report())
                     assertTrue(driver.droppedCount > 0 && driver.duplicatedCount > 0, driver.report())
                     assertEquals(0, driver.rejectedCount)
                     // Give cat time to write the last bytes of the echo ack.
@@ -57,6 +62,59 @@ class SspRealServerTest {
             assertEquals(typed.toString(), output.readText())
         } finally {
             output.deleteIfExists()
+        }
+    }
+
+    @Test
+    fun aPasteOf128KiBCompletesWhenTheNetworkDropsTenPercentOfTheDatagrams() {
+        val output = createTempFile("bison-ssp", ".txt")
+        try {
+            val server = MoshServerFixture.start("sh", "-c", RAW_CAT, "sh", "$output")
+            val random = Random(SEED)
+            val paste = String(CharArray(PASTE_SIZE) { 'a' + random.nextInt(26) })
+            server.use {
+                Driver(server, lossRate = 0.1, seed = 3).use { driver ->
+                    driver.transport.push(UserEvent.Resize(80, 24))
+                    assertTrue(driver.runUntil(TIMEOUT) { driver.isReady }, driver.report())
+                    val stream = driver.transport.userStream
+                    val pasteIndex = driver.transport.push(UserEvent.Keys(paste.encodeToByteArray()))
+                    driver.runFor(100.milliseconds)
+                    // A key after the paste, for example Ctrl+C. It must not wait long behind the paste.
+                    val keyIndex = driver.transport.push(UserEvent.Keys("Z".encodeToByteArray()))
+                    assertTrue(driver.runUntil(PASTE_TIMEOUT) { stream.echoedCount >= pasteIndex }, driver.report())
+                    assertTrue(driver.runUntil(2.seconds) { stream.echoedCount >= keyIndex }, driver.report())
+                    assertTrue(driver.droppedCount > 0, driver.report())
+                    driver.runFor(300.milliseconds)
+                }
+            }
+            assertEquals(paste + "Z", output.readText())
+        } finally {
+            output.deleteIfExists()
+        }
+    }
+
+    @Test
+    fun aLostAckGetsAnAnswerAtTheFirstResendOfTheServer() {
+        val server = MoshServerFixture.start("sh", "-c", RAW_CAT, "sh", "/dev/null")
+        server.use {
+            Driver(server).use { driver ->
+                driver.transport.push(UserEvent.Resize(80, 24))
+                assertTrue(driver.runUntil(TIMEOUT) { driver.isReady }, driver.report())
+                driver.runFor(500.milliseconds)
+                // The echo ack of the key makes a new host state. The driver drops the delayed ack of that state.
+                driver.dropNextAck = true
+                driver.transport.push(UserEvent.Keys("a".encodeToByteArray()))
+                assertTrue(driver.runUntil(TIMEOUT) { driver.droppedAckAtMs != null }, driver.report())
+                val droppedAt = checkNotNull(driver.droppedAckAtMs)
+                driver.runFor(2.seconds)
+                // The server sends its state again about 150 ms to 250 ms later, and the client answers it at once.
+                // With no answer, the server sends a copy about each 150 ms until the 3 s heartbeat of the client.
+                val copies = driver.receivedCopies.filter { time -> time > droppedAt }
+                val nextSend = driver.sendTimes.first { time -> time > droppedAt }
+                assertTrue(copies.size in 1..2, "copies at $copies after the drop at $droppedAt")
+                assertTrue(nextSend - copies.first() <= 20, "copy at ${copies.first()}, next send at $nextSend")
+                assertTrue(nextSend - droppedAt < 500, "drop at $droppedAt, next send at $nextSend")
+            }
         }
     }
 
@@ -97,7 +155,8 @@ class SspRealServerTest {
                 val sent = driver.transport.sentDatagramCount - sentBefore
                 assertTrue(sent in 2L..6L, "$sent client datagrams in $IDLE_TIME")
                 assertTrue(!driver.transport.isRoamDue(driver.nowMs()))
-                // The first reply of the server gives a sample. An idle server sends no timestamp reply.
+                // The first reply of the server gives a sample. The server drops a client timestamp that it held for
+                // about 1 s to 3 s, so an idle session can give no other sample.
                 assertNotNull(driver.transport.smoothedRttMs)
             }
         }
@@ -115,9 +174,27 @@ class SspRealServerTest {
         private val clock = TimeSource.Monotonic.markNow()
         private val random = Random(seed)
         private val buffer = ByteArray(MAX_DATAGRAM_SIZE)
+        private val cipher = MoshCipher(server.key)
+        private val zlib = Zlib()
 
-        // The screen of a host state is the count of diffs that made it. The emulator comes in a later change.
-        val transport = SspTransport(MoshCipher(server.key), HostStateStore(0) { count, _ -> count + 1 }, nowMs())
+        /** When true, the driver drops the next ack of the client. */
+        var dropNextAck = false
+
+        /** The time of the dropped ack, or null. */
+        var droppedAckAtMs: Long? = null
+            private set
+
+        /** The times of the client datagrams that went out. */
+        val sendTimes = mutableListOf<Long>()
+
+        /** The times of the authentic server datagrams that gave no new host state. */
+        val receivedCopies = mutableListOf<Long>()
+
+        // The host state is the text of all host bytes that made it. The emulator comes in a later change.
+        val transport = SspTransport(cipher, HostStateStore("") { text, events -> text + hostText(events) }, nowMs())
+
+        /** True when the program printed [READY], so that the terminal is in raw mode. */
+        val isReady: Boolean get() = transport.hostStates.newest.state.contains(READY)
 
         var droppedCount = 0
             private set
@@ -150,10 +227,16 @@ class SspRealServerTest {
         private fun step() {
             val now = nowMs()
             for (packet in transport.poll(now)) {
+                if (dropNextAck && isAck(packet)) {
+                    dropNextAck = false
+                    droppedAckAtMs = now
+                    continue
+                }
                 if (random.nextDouble() < lossRate) {
                     droppedCount++
                     continue
                 }
+                sendTimes += now
                 val copies = if (random.nextDouble() < duplicateRate) 2 else 1
                 if (copies == 2) duplicatedCount++
                 repeat(copies) { socket.send(DatagramPacket(packet, packet.size, address)) }
@@ -172,15 +255,41 @@ class SspRealServerTest {
             val copies = if (random.nextDouble() < duplicateRate) 2 else 1
             if (copies == 2) duplicatedCount++
             repeat(copies) {
-                if (!transport.receive(buffer, nowMs(), packet.length).isAuthentic) rejectedCount++
+                val now = nowMs()
+                val result = transport.receive(buffer, now, packet.length)
+                if (!result.isAuthentic) rejectedCount++
+                if (result.isAuthentic && !result.hasNewHostState) receivedCopies += now
             }
+        }
+
+        // An ack or a heartbeat: one fragment with no diff, and the same fromState and toState.
+        private fun isAck(packet: ByteArray): Boolean {
+            val fragment = Datagram.open(packet, cipher, Direction.ToServer)?.fragment ?: return false
+            if (fragment.number != 0 || !fragment.isFinal) return false
+            val instruction = zlib.decompress(fragment.content, Instruction.MAX_SIZE)?.let(Instruction::decode)
+            return instruction != null && instruction.diff.isEmpty() && instruction.fromState == instruction.toState
         }
 
         override fun close() = socket.close()
     }
 
     private companion object {
+        /** The text that [RAW_CAT] prints when its terminal is in raw mode. */
+        const val READY = "BISON-READY"
+
+        /**
+         * Writes each byte that it gets to the file "$1", with no change. A terminal in canonical mode holds at most
+         * 4095 bytes of a line and drops the others, so the program prints [READY] after stty. A test sends no key
+         * before it sees [READY].
+         */
+        const val RAW_CAT = "stty raw -echo && printf $READY && exec cat > \"$1\""
+
+        fun hostText(events: List<HostEvent>): String =
+            events.filterIsInstance<HostEvent.HostBytes>().joinToString("") { event -> event.bytes.decodeToString() }
+
         val TIMEOUT = 10.seconds
+        val PASTE_TIMEOUT = 30.seconds
+        const val PASTE_SIZE = 128 * 1024
         val IDLE_TIME = 7.seconds
         const val SEED = 7
         const val CHUNKS = 60

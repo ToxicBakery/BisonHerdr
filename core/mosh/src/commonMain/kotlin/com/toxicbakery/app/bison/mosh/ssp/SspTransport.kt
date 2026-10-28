@@ -43,6 +43,8 @@ data class ReceiveResult(
  * - A heartbeat or an ack has the acknowledged state as `fromState` and `toState`, and an empty diff.
  * - Each datagram acknowledges the newest host state. A new host state gets an ack after [DELAYED_ACK_MS], or
  *   earlier with the next datagram.
+ * - A copy of a host state that the client has, or a diff that the client cannot apply, gets an ack at once. The
+ *   server sends its newest state again until it gets an ack, so a lost ack costs only one resend of the server.
  * - The transport sends a heartbeat when it sent nothing for [HEARTBEAT_INTERVAL_MS].
  * - The first datagram, and the first datagram after a new socket, go out at once. Such a datagram holds the diff
  *   when the server did not acknowledge the newest state.
@@ -192,19 +194,26 @@ class SspTransport<S>(
         val diff = HostDiff.decode(instruction.diff)
         val applied = diff != null && hostStates.apply(instruction.fromState, instruction.toState, diff)
         hostStates.removeBefore(instruction.keepState)
-        if (applied) {
-            userStream.echo(hostStates.newest.echoAck)
-            if (!ackPending) {
+        if (applied) userStream.echo(hostStates.newest.echoAck)
+        when {
+            // The server stops at once when it gets the ack of the end state (wire fact 27).
+            applied && isEnded -> ackNow(nowMs)
+            applied -> if (!ackPending) {
                 ackPending = true
                 ackDueAtMs = nowMs + DELAYED_ACK_MS
             }
-        }
-        // The server stops at once when it gets the ack of the end state. It sends the end state again without it.
-        if (isEnded && instruction.toState == END_STATE) {
-            ackPending = true
-            ackDueAtMs = nowMs
+            // A copy of a state that the client has, or a diff from a state that it does not have. The server sends
+            // its state again until it gets an ack, so the client acknowledges its newest state at once. A pure ack
+            // of the server (fromState equal to toState) gets no answer, so the two sides do not answer each other
+            // with no end.
+            instruction.toState > instruction.fromState -> ackNow(nowMs)
         }
         return applied
+    }
+
+    private fun ackNow(nowMs: Long) {
+        ackDueAtMs = if (ackPending) minOf(ackDueAtMs, nowMs) else nowMs
+        ackPending = true
     }
 
     private fun send(nowMs: Long, withDiff: Boolean): List<ByteArray> {

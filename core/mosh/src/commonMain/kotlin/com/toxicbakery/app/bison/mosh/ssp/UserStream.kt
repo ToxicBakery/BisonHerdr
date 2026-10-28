@@ -11,15 +11,26 @@ import com.toxicbakery.app.bison.mosh.wire.UserEvent
  * diff of the next client instruction holds all events after the acknowledged state (sender rule 1).
  *
  * The events after the acknowledged state have at most [maxDiffSize] bytes. More events wait until the server
- * acknowledges a state. Thus one instruction stays in the fragment limit and in the receive buffer of the server.
- * [push] cuts a large key event into parts of at most [MAX_KEYS_PART_SIZE] bytes, so that each part fits.
+ * acknowledges a state. The transport sends the full diff again after each RTO, and one lost fragment loses the
+ * full instruction. A small limit thus keeps each instruction to a few fragments, so that a large paste completes on
+ * a network that drops datagrams. [push] cuts a large key event into parts of at most [maxKeysPartSize] bytes. By
+ * default, one part fills one state.
  *
  * Each event gets an index: the first event has the index 1. [acknowledgedCount] and [echoedCount] give the count of
  * events that the server has, and that the application on the server got.
  *
  * Not safe for use by two threads at the same time.
  */
-class UserStream(private val maxDiffSize: Int = MAX_DIFF_SIZE) {
+class UserStream(
+    private val maxDiffSize: Int = MAX_DIFF_SIZE,
+    private val maxKeysPartSize: Int = maxDiffSize - EVENT_OVERHEAD,
+) {
+    init {
+        // With a smaller limit, no state could take a key part, and the input would stop for ever.
+        require(maxKeysPartSize >= 1 && maxDiffSize >= maxKeysPartSize + EVENT_OVERHEAD) {
+            "The diff limit $maxDiffSize does not hold a key part of $maxKeysPartSize bytes."
+        }
+    }
 
     private class State(val number: ULong, val events: List<UserEvent>, val size: Int, val eventCount: Long)
 
@@ -67,13 +78,13 @@ class UserStream(private val maxDiffSize: Int = MAX_DIFF_SIZE) {
         get() = pending.isNotEmpty() && unacknowledgedSize + sizeOf(pending.first()) <= maxDiffSize
 
     /**
-     * Adds [event]. Returns the index of the event. A key event with more than [MAX_KEYS_PART_SIZE] bytes becomes
-     * more than one event, and the result is the index of the last part.
+     * Adds [event]. Returns the index of the event. A key event with more bytes than the part size becomes more than
+     * one event, and the result is the index of the last part.
      */
     fun push(event: UserEvent): Long {
-        if (event is UserEvent.Keys && event.bytes.size > MAX_KEYS_PART_SIZE) {
-            for (start in event.bytes.indices step MAX_KEYS_PART_SIZE) {
-                val end = minOf(event.bytes.size, start + MAX_KEYS_PART_SIZE)
+        if (event is UserEvent.Keys && event.bytes.size > maxKeysPartSize) {
+            for (start in event.bytes.indices step maxKeysPartSize) {
+                val end = minOf(event.bytes.size, start + maxKeysPartSize)
                 pending.addLast(UserEvent.Keys(event.bytes.copyOfRange(start, end)))
                 pushedCount++
             }
@@ -165,17 +176,17 @@ class UserStream(private val maxDiffSize: Int = MAX_DIFF_SIZE) {
 
     companion object {
         /**
-         * The largest size of the events after the acknowledged state: 192 KiB. This is a choice of this client. It
-         * holds a paste of 128 KiB and more keys. In a black-box test, the server joined one burst of 220 fragments
-         * (256 KiB of random bytes) on the loopback.
+         * The largest size of the events after the acknowledged state: 8 KiB. This is a choice of this client. Such a
+         * diff is at most 7 fragments, so about half of its sends arrive whole when the network drops 10 percent of
+         * the datagrams. The simulation used 10 percent loss in each direction and 10 seeds. There, a paste of 128 KiB
+         * took at most 18 s at an RTT of about 300 ms, and it did not complete with a limit of 192 KiB. A real server
+         * on the loopback with this loss got the paste in about 3.5 s. The cost: with no loss, a paste of 128 KiB
+         * takes 16 round trips.
          */
-        const val MAX_DIFF_SIZE: Int = 192 * 1024
+        const val MAX_DIFF_SIZE: Int = 8 * 1024
 
-        /** The largest part of a key event. */
-        const val MAX_KEYS_PART_SIZE: Int = 16 * 1024
-
-        // The protobuf tags and lengths of one event take fewer bytes than this value.
-        private const val EVENT_OVERHEAD = 16
+        /** The protobuf tags and lengths of one event take fewer bytes than this value. */
+        const val EVENT_OVERHEAD: Int = 16
 
         // The echo ack can be older than the acknowledged state, so the marks stay after an acknowledgment.
         private const val MAX_ECHO_MARKS = 1024

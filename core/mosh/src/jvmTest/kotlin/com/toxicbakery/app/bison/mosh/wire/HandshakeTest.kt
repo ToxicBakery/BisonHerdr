@@ -193,8 +193,9 @@ class HandshakeTest {
                 rejectedCount++
                 return null
             }
-            // The server gives each instruction a higher ID (wire fact 18). FragmentAssembler depends on this
-            // order. The loopback path does not change the order of datagrams.
+            // The ID of a server instruction is never lower than the ID before it (wire fact 18). The server can
+            // send an instruction again with the same ID. FragmentAssembler depends on this order. The loopback path
+            // does not change the order of datagrams.
             val instructionId = datagram.fragment.instructionId
             assertTrue(instructionId >= lastInstructionId, "ID $instructionId came after ID $lastInstructionId.")
             lastInstructionId = instructionId

@@ -5,8 +5,8 @@ package com.toxicbakery.app.bison.mosh.wire
  *
  * The wire form is the 64-bit [instructionId], a 16-bit word, and the [content]. Bit 15 of the word is the final
  * flag, and bits 0 to 14 are the fragment [number]. The numbers are big-endian. The content of all fragments of one
- * ID, in the order of their numbers, is the zlib stream of one instruction. Each resend of an instruction has a new
- * ID.
+ * ID, in the order of their numbers, is the zlib stream of one instruction. A resend of an instruction usually has a
+ * new ID. The server can also send the same instruction again with the same ID.
  */
 class Fragment(
     val instructionId: ULong,

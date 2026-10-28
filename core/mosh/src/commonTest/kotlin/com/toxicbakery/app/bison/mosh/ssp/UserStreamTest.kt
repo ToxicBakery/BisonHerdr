@@ -5,6 +5,7 @@ import com.toxicbakery.app.bison.mosh.wire.UserEvent
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -78,13 +79,14 @@ class UserStreamTest {
 
     @Test
     fun aLargeKeyEventBecomesPartsAndTheDiffStaysInTheLimit() {
-        val stream = UserStream(maxDiffSize = 40_000)
+        val part = 16 * 1024
+        val stream = UserStream(maxDiffSize = 40_000, maxKeysPartSize = part)
         val paste = ByteArray(100_000) { index -> ('a' + index % 26).code.toByte() }
         assertEquals(7, stream.push(UserEvent.Keys(paste)))
         assertTrue(stream.numberPending())
         // Two parts of 16 KiB fit in 40,000 bytes. The third part waits for an acknowledgment.
         val first = assertNotNull(UserDiff.decode(stream.encodedDiff()))
-        assertEquals(2 * UserStream.MAX_KEYS_PART_SIZE, (first.events.single() as UserEvent.Keys).bytes.size)
+        assertEquals(2 * part, (first.events.single() as UserEvent.Keys).bytes.size)
         assertTrue(stream.hasPending)
         assertFalse(stream.canNumber)
         assertFalse(stream.numberPending())
@@ -101,6 +103,31 @@ class UserStreamTest {
         }
         assertContentEquals(paste, received.toByteArray())
         assertEquals(7, stream.acknowledgedCount)
+    }
+
+    @Test
+    fun byDefaultOnePartFillsOneStateAndEachDiffStaysInTheLimit() {
+        val stream = UserStream()
+        val paste = ByteArray(20_000) { index -> ('a' + index % 26).code.toByte() }
+        stream.push(UserEvent.Keys(paste))
+        stream.push(keys("z"))
+        val sizes = ArrayList<Int>()
+        while (stream.numberPending()) {
+            val diff = assertNotNull(UserDiff.decode(stream.encodedDiff()))
+            sizes += diff.events.filterIsInstance<UserEvent.Keys>().sumOf { event -> event.bytes.size }
+            assertTrue(stream.encodedDiff().size <= UserStream.MAX_DIFF_SIZE)
+            stream.acknowledge(stream.currentState)
+        }
+        val part = UserStream.MAX_DIFF_SIZE - UserStream.EVENT_OVERHEAD
+        assertEquals(listOf(part, part, 20_000 - 2 * part + 1), sizes)
+    }
+
+    @Test
+    fun aLimitThatCannotHoldAKeyPartIsAnError() {
+        // Such a stream could never send a part, and the input would stop for ever.
+        assertFailsWith<IllegalArgumentException> { UserStream(maxDiffSize = 1000, maxKeysPartSize = 1000) }
+        assertFailsWith<IllegalArgumentException> { UserStream(maxDiffSize = 1000, maxKeysPartSize = 0) }
+        UserStream(maxDiffSize = 1000, maxKeysPartSize = 1000 - UserStream.EVENT_OVERHEAD)
     }
 
     @Test

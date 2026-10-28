@@ -70,6 +70,48 @@ class SspTransportTest {
     }
 
     @Test
+    fun aCopyOfAHostStateAfterTheAckGetsOneAckAtOnce() {
+        connect(rttMs = 10)
+        transport.poll(110)
+        // The server did not get the ack, so it sends the same state again.
+        val copy = peer.seal(0uL, 1uL, ackState = 1uL, events = hostText("$"))
+        assertFalse(transport.receive(copy.single(), nowMs = 500).hasNewHostState)
+        assertEquals(500, transport.nextDeadlineMs(500))
+        val ack = assertNotNull(peer.open(transport.poll(500).single()).instruction)
+        assertEquals(1uL, ack.ackState)
+        assertEquals(1uL, ack.toState)
+        assertEquals(0, ack.diff.size)
+        assertEquals(listOf(3500L), (501L..4000L).filter { now -> transport.poll(now).isNotEmpty() })
+    }
+
+    @Test
+    fun aCopyWhileTheDelayedAckWaitsMakesTheAckGoOutAtOnce() {
+        connect(rttMs = 10)
+        transport.receive(peer.seal(0uL, 1uL, ackState = 1uL, events = hostText("$")).single(), nowMs = 40)
+        assertEquals(1, transport.poll(40).size)
+        assertTrue((41L..200L).none { now -> transport.poll(now).isNotEmpty() })
+    }
+
+    @Test
+    fun aDiffFromAStateThatTheClientDoesNotHaveGetsOneAckAtOnce() {
+        connect(rttMs = 10)
+        transport.poll(110)
+        assertFalse(transport.receive(peer.seal(5uL, 6uL, ackState = 1uL).single(), nowMs = 500).hasNewHostState)
+        val ack = assertNotNull(peer.open(transport.poll(500).single()).instruction)
+        assertEquals(1uL, ack.ackState)
+        assertTrue((501L..3000L).none { now -> transport.poll(now).isNotEmpty() })
+    }
+
+    @Test
+    fun aPureAckOfTheServerGetsNoAnswer() {
+        connect(rttMs = 10)
+        transport.poll(110)
+        assertFalse(transport.receive(peer.seal(1uL, 1uL, ackState = 1uL).single(), nowMs = 500).hasNewHostState)
+        assertEquals(3110, transport.nextDeadlineMs(500))
+        assertTrue((500L..3109L).none { now -> transport.poll(now).isNotEmpty() })
+    }
+
+    @Test
     fun anAckGoesOutWithTheNextUserStateAndNotAgainAfter100Ms() {
         connect(rttMs = 10)
         transport.poll(110)
@@ -233,9 +275,12 @@ class SspTransportTest {
         var acknowledged = 1uL
         var now = 100L
         while (transport.userStream.acknowledgedCount < transport.userStream.pushedCount && now < 100_000) {
-            for (instruction in peer.instructions(transport.poll(now))) {
+            val packets = transport.poll(now)
+            // A full diff of random bytes is at most 7 fragments.
+            assertTrue(packets.size <= 7, "${packets.size} datagrams")
+            for (instruction in peer.instructions(packets)) {
                 if (instruction.toState <= acknowledged) continue
-                assertTrue(instruction.diff.size <= UserStream.MAX_DIFF_SIZE + 64)
+                assertTrue(instruction.diff.size <= UserStream.MAX_DIFF_SIZE)
                 assertEquals(acknowledged, instruction.fromState)
                 val events = assertNotNull(UserDiff.decode(instruction.diff)).events
                 received += events.filterIsInstance<UserEvent.Keys>().map { event -> event.bytes }
