@@ -85,51 +85,34 @@ class BisonSessionService : Service(), DIAware {
     private var lastActiveAgentCount = 0
     private var disconnectAllLabel: String? = null
 
+    private val networkEvents = NetworkEventQueue()
+
     /**
-     * Tells [sshTransportManager] about changes of the default network. The manager checks each machine a maximum
-     * of one time each second, so the two calls after a change cause one check.
+     * Sends the changes of the default network to [networkEvents]. [collectNetworkEvents] gives them to
+     * [sshTransportManager] one at a time. The manager checks each machine a maximum of one time each second, so the
+     * two events after a change cause one check.
      */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             log.d { "Default network available ($network); check the sessions" }
-            serviceScope.launch {
-                runCatching {
-                    sshTransportManager.onNetworkAvailable()
-                }.onFailure { error ->
-                    rethrowIfCancelled(error)
-                    log.w(error) { "Could not check the sessions after onAvailable" }
-                }
-            }
+            networkEvents.send(NetworkEventQueue.Event.Available)
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
             log.d { "Network link properties changed (${linkProperties.interfaceName}); check the sessions" }
-            serviceScope.launch {
-                runCatching {
-                    sshTransportManager.onNetworkAvailable()
-                }.onFailure { error ->
-                    rethrowIfCancelled(error)
-                    log.w(error) { "Could not check the sessions after onLinkPropertiesChanged" }
-                }
-            }
+            networkEvents.send(NetworkEventQueue.Event.LinkPropertiesChanged)
         }
 
         override fun onLost(network: Network) {
             log.d { "Default network lost ($network); close the SSH sockets" }
-            serviceScope.launch {
-                runCatching {
-                    sshTransportManager.onNetworkLost()
-                }.onFailure { error ->
-                    rethrowIfCancelled(error)
-                    log.w(error) { "Could not close the sockets after onLost" }
-                }
-            }
+            networkEvents.send(NetworkEventQueue.Event.Lost)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannels()
+        collectNetworkEvents()
         registerNetworkCallback()
         collectSshRequests()
         observeSessionStatusForForegroundNotification()
@@ -186,6 +169,24 @@ class BisonSessionService : Service(), DIAware {
         // command calls startForeground again and starts a new idle timer.
         if (!stopSelfResult(lastStartId)) {
             log.d { "A newer start command exists; BisonSessionService continues" }
+        }
+    }
+
+    /** Gives the network events to [sshTransportManager], one at a time and in order. */
+    private fun collectNetworkEvents() {
+        serviceScope.launch {
+            networkEvents.run(
+                handle = { event ->
+                    when (event) {
+                        NetworkEventQueue.Event.Available,
+                        NetworkEventQueue.Event.LinkPropertiesChanged,
+                        -> sshTransportManager.onNetworkAvailable()
+
+                        NetworkEventQueue.Event.Lost -> sshTransportManager.onNetworkLost()
+                    }
+                },
+                onError = { event, error -> log.w(error) { "Could not handle the network event $event" } },
+            )
         }
     }
 
