@@ -5,4 +5,4 @@ package com.toxicbakery.app.bison.ssh
  * guard does not change a connection.
  */
 internal fun permittedLocalNetwork(): LocalNetworkGuard =
-    LocalNetworkGuard(hasPermission = { true }, localPrefixes = { emptyList() })
+    LocalNetworkGuard(hasPermission = { true }, localNetwork = { LocalNetworkView.EMPTY })

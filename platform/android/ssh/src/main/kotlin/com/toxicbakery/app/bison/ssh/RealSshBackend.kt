@@ -49,9 +49,9 @@ import kotlinx.coroutines.withContext
  * route ([LocalNetworkGuard.needsPermission]). When Android stops that connection, [authenticate] asks the user
  * through [LocalNetworkAccess.request]. With no UI or with no permission, it returns
  * [SshAuthResult.LocalNetworkBlocked] and opens no socket. When the connect to a private address times out with no
- * permission, [authenticate] also asks, and it tries one more time after a grant. A reconnect does not call
- * [authenticate], so it never asks. The socket of the client throws a [LocalNetworkPermissionException], and the
- * reconnect loop stops for the user.
+ * permission, [authenticate] also asks. After a grant, it does all steps one more time, also the key prompt. A
+ * reconnect does not call [authenticate], so it never asks. The socket of the client throws a
+ * [LocalNetworkPermissionException], and the reconnect loop stops for the user.
  *
  * The backbone is always [ActiveBackbone.SshEndpoint], because this version has no Mosh transport (issue #22). The
  * client measures the poll time, and the backend puts its average in the backbone with
@@ -99,7 +99,19 @@ class RealSshBackend internal constructor(
         client.roundTripListener = sshStateManager::setRoundTripTime
     }
 
-    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
+    override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult =
+        authenticate(machine, route, mayRetryAfterGrant = true)
+
+    /**
+     * Does the login steps of [authenticate]. When [mayRetryAfterGrant] is true and the connect to a private address
+     * times out, the function asks for the local network permission. After a grant, it does all steps one more time.
+     * This includes the key prompt, because a time-bound key signs only for a short time after its prompt.
+     */
+    private suspend fun authenticate(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        mayRetryAfterGrant: Boolean,
+    ): SshAuthResult {
         // A connection that Android stops cannot use the key, so check the network before the key prompt.
         localNetworkBlock(machine, route)?.let { return it }
         val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
@@ -130,10 +142,10 @@ class RealSshBackend internal constructor(
         }
         val result = connectAndVerify(machine, route, keyAuth, promptOutcome)
         // A connect to a private address can time out because Android stops it. Ask, and try one more time.
-        if (result is SshAuthResult.LocalNetworkBlocked && result.timedOut &&
-            askForLocalNetwork(machine, result.hostPort) == LocalNetworkOutcome.Granted
+        if (mayRetryAfterGrant && result is SshAuthResult.LocalNetworkBlocked && result.timedOut &&
+            askForLocalNetwork(machine, result.hostPort, timedOut = true) == LocalNetworkOutcome.Granted
         ) {
-            return connectAndVerify(machine, route, keyAuth, promptOutcome)
+            return authenticate(machine, route, mayRetryAfterGrant = false)
         }
         return result
     }
@@ -169,9 +181,16 @@ class RealSshBackend internal constructor(
         return if (outcome == LocalNetworkOutcome.Granted) null else SshAuthResult.LocalNetworkBlocked(hostPort)
     }
 
-    /** Asks the user for the local network permission for [hostPort] of [machine], and writes the answer to the log. */
-    private suspend fun askForLocalNetwork(machine: HostMachine, hostPort: String): LocalNetworkOutcome {
-        val outcome = localNetworkAccess.request(machine.id, hostPort, LOCAL_NETWORK_TIMEOUT)
+    /**
+     * Asks the user for the local network permission for [hostPort] of [machine], and writes the answer to the log.
+     * [timedOut] is true after a connect timeout to a private address. See [LocalNetworkRequest.timedOut].
+     */
+    private suspend fun askForLocalNetwork(
+        machine: HostMachine,
+        hostPort: String,
+        timedOut: Boolean = false,
+    ): LocalNetworkOutcome {
+        val outcome = localNetworkAccess.request(machine.id, hostPort, LOCAL_NETWORK_TIMEOUT, timedOut)
         client.recordTransport(machine.id, "The request for the local network permission for $hostPort: $outcome")
         return outcome
     }

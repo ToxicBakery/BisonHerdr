@@ -23,8 +23,8 @@ import kotlin.time.TimeSource
  *   [LocalNetworkPermissionException] with `timedOut`. Android can stop such a connection on a network that the app
  *   does not see.
  *
- * [localPrefixes] gives the prefixes of all interfaces of the device ([LocalNetworkAddresses.localPrefixOf]).
- * [resolve] gives the addresses of a host. [timeSource] measures the age of a resolution that [needsPermission] keeps
+ * [localNetwork] gives the lists of all networks of the device ([LocalNetworkView]). [resolve] gives the addresses of a
+ * host. [timeSource] measures the age of a resolution that [needsPermission] keeps
  * for the next socket. A test gives its own functions.
  *
  * The SSH sockets use [socketAddressFor] and [connectFailure]. A socket that gets an address and not a host can use
@@ -32,7 +32,7 @@ import kotlin.time.TimeSource
  */
 class LocalNetworkGuard(
     private val hasPermission: () -> Boolean,
-    private val localPrefixes: () -> List<AddressPrefix>,
+    private val localNetwork: () -> LocalNetworkView,
     private val resolve: (String) -> List<InetAddress> = { host -> InetAddress.getAllByName(host).toList() },
     private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
@@ -52,7 +52,9 @@ class LocalNetworkGuard(
      */
     fun socketAddressFor(host: String, port: Int): InetSocketAddress {
         if (hasPermission()) return InetSocketAddress(host, port)
-        val address = permittedAddressOf(host, addressesOf(host))
+        val view = localNetwork()
+        val addresses = if (isStoppedName(host, view)) emptyList() else addressesOf(host)
+        val address = permittedAddressOf(host, addresses, view)
             ?: throw LocalNetworkPermissionException(KnownHost.formatHostPort(host, port))
         return InetSocketAddress(address, port)
     }
@@ -63,6 +65,7 @@ class LocalNetworkGuard(
      *
      * The result is a [LocalNetworkPermissionException] with `timedOut` when all of these are true:
      * - The app does not have the permission.
+     * - At least one network has the protection ([LocalNetworkView.isProtected]).
      * - [address] is private ([LocalNetworkAddresses.isPrivate]).
      * - [error] is a timeout, or an `EPERM` error.
      *
@@ -71,6 +74,7 @@ class LocalNetworkGuard(
     fun connectFailure(address: InetSocketAddress, hostPort: String, error: IOException): Exception {
         val resolved = address.address ?: return error
         if (hasPermission() || !LocalNetworkAddresses.isPrivate(resolved.address) || !isDenial(error)) return error
+        if (!localNetwork().isProtected) return error
         return LocalNetworkPermissionException(hostPort, timedOut = true, cause = error)
     }
 
@@ -81,11 +85,12 @@ class LocalNetworkGuard(
      */
     fun needsPermission(host: String): Boolean {
         if (hasPermission()) return false
-        if (LocalNetworkAddresses.isLocalName(host)) return true
+        val view = localNetwork()
+        if (isStoppedName(host, view)) return true
         return try {
             val addresses = resolve(host)
             resolutions[host] = Resolution(addresses, timeSource.markNow())
-            permittedAddressOf(host, addresses) == null
+            permittedAddressOf(host, addresses, view) == null
         } catch (_: IOException) {
             false
         }
@@ -96,24 +101,29 @@ class LocalNetworkGuard(
      * app does not have the permission.
      */
     fun requireAccess(address: InetAddress, hostPort: String) {
-        if (!hasPermission() && LocalNetworkAddresses.isLocal(address.address, localPrefixes())) {
+        if (!hasPermission() && LocalNetworkAddresses.isLocal(address.address, localNetwork())) {
             throw LocalNetworkPermissionException(hostPort)
         }
     }
 
     /** Returns the recent resolution of [host] from [needsPermission] one time, or resolves [host] again. */
     private fun addressesOf(host: String): List<InetAddress> {
-        if (LocalNetworkAddresses.isLocalName(host)) return emptyList()
         val recent = resolutions.remove(host)?.takeIf { it.time.elapsedNow() < RESOLUTION_REUSE_LIMIT }
         return recent?.addresses ?: resolve(host)
     }
 
     /** Returns the first of [addresses] that Android does not stop, or null when [host] has no such address. */
-    private fun permittedAddressOf(host: String, addresses: List<InetAddress>): InetAddress? {
-        if (LocalNetworkAddresses.isLocalName(host)) return null
-        val prefixes = localPrefixes()
-        return addresses.firstOrNull { address -> !LocalNetworkAddresses.isLocal(address.address, prefixes) }
+    private fun permittedAddressOf(host: String, addresses: List<InetAddress>, view: LocalNetworkView): InetAddress? {
+        if (isStoppedName(host, view)) return null
+        return addresses.firstOrNull { address -> !LocalNetworkAddresses.isLocal(address.address, view) }
     }
+
+    /**
+     * Returns true when Android stops the mDNS query for [host]. The query is a multicast, so Android stops it only
+     * while a network has the protection.
+     */
+    private fun isStoppedName(host: String, view: LocalNetworkView): Boolean =
+        view.isProtected && LocalNetworkAddresses.isLocalName(host)
 
     /** Returns true when [error] is a connect timeout, or an `EPERM` error in its text or in the text of a cause. */
     private fun isDenial(error: IOException): Boolean =

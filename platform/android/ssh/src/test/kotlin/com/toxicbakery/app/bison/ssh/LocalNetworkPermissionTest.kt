@@ -77,6 +77,9 @@ class LocalNetworkPermissionTest {
     @Volatile
     private var onLinkPrefixes = listOf(AddressPrefix(InetAddress.getByName("127.0.0.0").address, 8))
 
+    /** Returns the lists of the device for the guard: [onLinkPrefixes], and no own address. */
+    private fun localNetworkView(): LocalNetworkView = LocalNetworkView(onLinkPrefixes, emptyList(), isProtected = true)
+
     /** The host names that the guard resolved, in order. */
     private val resolved: MutableList<String> = CopyOnWriteArrayList()
 
@@ -245,11 +248,63 @@ class LocalNetworkPermissionTest {
         assertEquals(listOf("timeout"), batches)
     }
 
+    @Test
+    fun theRetryAfterAGrantShowsTheKeyPromptAgainForATimeBoundKey() = runTest {
+        val timeBoundKeys = AndroidKeystoreKeyManager(
+            allowSoftwareKeys = true,
+            keyUserAuthReader = { KeyUserAuth.TimeBound },
+        )
+        timeBoundKeys.getOrCreatePublicKey(keyAlias = TIME_BOUND_KEY, requireBiometric = true)
+        val keyPrompts = CopyOnWriteArrayList<String>()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.hostUserAuthPrompts { prompt ->
+                keyPrompts += prompt.keyAlias
+                UserAuthOutcome.Confirmed
+            }
+        }
+        val batches = CopyOnWriteArrayList<String>()
+        val backend = timeoutBackend(batches, keyManager = timeBoundKeys)
+        startUi {
+            permitted = true
+            LocalNetworkOutcome.Granted
+        }
+        val machine = passwordMachine("routed-time-bound")
+            .copy(authMethod = SshAuthMethod.KeystoreKey(keyAlias = TIME_BOUND_KEY, requireBiometric = true))
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine)))
+
+        // The key signs only for 30 s after its prompt, and the answer to the dialog can take longer.
+        assertEquals(listOf(TIME_BOUND_KEY, TIME_BOUND_KEY), keyPrompts)
+        assertEquals(listOf("timeout", "ok"), batches)
+    }
+
+    @Test
+    fun aSecondTimeoutAfterTheGrantDoesNotAskAgain() = runTest {
+        val batches = CopyOnWriteArrayList<String>()
+        val backend = timeoutBackend(batches, timeoutsOnly = true)
+        startUi {
+            permitted = true
+            LocalNetworkOutcome.Granted
+        }
+        val machine = passwordMachine("routed-down")
+
+        val result = backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine))
+
+        assertEquals(SshAuthResult.LocalNetworkBlocked(ROUTED_HOST_PORT, timedOut = true), result)
+        assertEquals(listOf(ROUTED_HOST_PORT), shown)
+        assertEquals(listOf("timeout", "timeout"), batches)
+    }
+
     /**
      * Returns a backend whose client runs no real command. Its first batch fails as a connect timeout to a private
-     * address, and each later batch passes. [batches] gets the result of each batch.
+     * address, and each later batch passes. With [timeoutsOnly], each batch fails. [batches] gets the result of each
+     * batch. The client uses the keys of [keyManager].
      */
-    private fun timeoutBackend(batches: MutableList<String>): RealSshBackend {
+    private fun timeoutBackend(
+        batches: MutableList<String>,
+        keyManager: AndroidKeystoreKeyManager = this.keyManager,
+        timeoutsOnly: Boolean = false,
+    ): RealSshBackend {
         // The loopback address is not local here, so the check before the connect does not ask.
         onLinkPrefixes = emptyList()
         val client = RealHerdrSshClient(
@@ -261,14 +316,14 @@ class LocalNetworkPermissionTest {
             keystoreKeyManagerProvider = { keyManager },
             secretStore = secretStore,
             remoteBatchExecutor = { _, _, _, _ ->
-                if (batches.isEmpty()) {
+                if (batches.isEmpty() || timeoutsOnly) {
                     batches += "timeout"
                     throw LocalNetworkPermissionException(ROUTED_HOST_PORT, timedOut = true)
                 }
                 batches += "ok"
                 "herdr 0.1.0"
             },
-            localNetworkGuard = LocalNetworkGuard(hasPermission = { permitted }, localPrefixes = { onLinkPrefixes }),
+            localNetworkGuard = LocalNetworkGuard(hasPermission = { permitted }, localNetwork = ::localNetworkView),
         )
         return RealSshBackend(
             client = client,
@@ -287,7 +342,7 @@ class LocalNetworkPermissionTest {
     ): SshTransportManager {
         val guard = LocalNetworkGuard(
             hasPermission = { permitted },
-            localPrefixes = { onLinkPrefixes },
+            localNetwork = ::localNetworkView,
             resolve = { host ->
                 resolved += host
                 resolve(host)
@@ -389,6 +444,9 @@ class LocalNetworkPermissionTest {
         const val TARGET = "target"
         const val BASTION = "bastion"
         const val PASSWORD_REF = "password-local-network"
+
+        /** The alias of a key that needs a user authentication, and then signs only for a short time. */
+        const val TIME_BOUND_KEY = "local_network_time_bound"
 
         /** The host and port of a host on a private subnet behind a router. */
         const val ROUTED_HOST_PORT = "192.168.2.10:22"
