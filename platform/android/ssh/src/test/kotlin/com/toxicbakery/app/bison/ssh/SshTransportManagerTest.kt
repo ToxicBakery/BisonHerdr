@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
 import java.net.ConnectException
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -99,7 +100,8 @@ class SshTransportManagerTest {
 
     @Test
     fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLineOnEachLane() = runTest {
-        // Each command batch fails, as on a broken SSH channel.
+        // Each command batch fails, as on a broken SSH channel. The executor records the lane of each batch.
+        val lanes = CopyOnWriteArrayList<RealHerdrSshClient.WorkerLane>()
         val client = RealHerdrSshClient(
             localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
@@ -108,7 +110,10 @@ class SshTransportManagerTest {
             semanticNotificationBus = SemanticNotificationBus(),
             knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
             secretStore = InMemorySecretStore(),
-            remoteBatchExecutor = { _, _, _, _ -> throw IOException("Broken pipe") },
+            remoteBatchExecutor = { _, _, lane, _ ->
+                lanes += lane
+                throw IOException("Broken pipe")
+            },
         )
         val backend = RealSshBackend(client, stateManager, AndroidKeystoreKeyManager(allowSoftwareKeys = true))
         val manager = manager(backend)
@@ -120,6 +125,9 @@ class SshTransportManagerTest {
 
         assertTrue(layoutResponse.contains(SshTransportManager.NO_RESPONSE_CODE), layoutResponse)
         assertEquals(listOf("RPC pane.layout error: Broken pipe"), errorMessages(), debugLogDump())
+        // The RPC and the read of the surface after it use the poll lane.
+        assertEquals(setOf(RealHerdrSshClient.WorkerLane.Poll), lanes.toSet())
+        val pollBatches = lanes.size
 
         // pane.send_keys uses the input lane of the client, which has its own error path.
         val keysResponse = manager.sendEndpointCommand(
@@ -133,6 +141,7 @@ class SshTransportManagerTest {
             errorMessages(),
             debugLogDump(),
         )
+        assertEquals(listOf(RealHerdrSshClient.WorkerLane.Input), lanes.drop(pollBatches))
     }
 
     /** Returns the messages of the error entries of the debug log, in sequence. */
@@ -534,11 +543,12 @@ class SshTransportManagerTest {
         )
 
         events.onReconnecting(lanBox.id, null)
+        assertFalse(queuePrompt(manager), "The prompt was not queued")
         events.onReconnected(lanBox.id)
 
         assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
-        // The reconnect reads the surface one time, also while the lease is off.
-        assertEquals(listOf("refreshSurface lan-box"), backend.calls)
+        // While the lease is off, the reconnect reads the surface one time, and then sends the queued prompt.
+        assertEquals(listOf("refreshSurface lan-box", "sendEndpointCommand lan-box"), backend.calls)
     }
 
     @Test
