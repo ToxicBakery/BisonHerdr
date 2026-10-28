@@ -1743,8 +1743,6 @@ HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->applyFocusRpcMutation(Lj
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->authenticateSshSession(Lcom/toxicbakery/app/bison/model/HostMachine;Lcom/toxicbakery/app/bison/ssh/ResolvedSshRoute;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->buildMoshServerBootstrapCommand(Lcom/toxicbakery/app/bison/model/HostMachine;)Ljava/lang/String;
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->buildSshApiBridgeCommand()Ljava/lang/String;
-HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->buildSshEndpointBridgeCommand$default(Lcom/toxicbakery/app/bison/ssh/SshTransportManager;ZILjava/lang/Object;)Ljava/lang/String;
-HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->buildSshEndpointBridgeCommand(Z)Ljava/lang/String;
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->buildTwoPaneLayoutSnapshot(Ljava/lang/String;)Lcom/toxicbakery/app/bison/protocol/PaneLayoutSnapshot;
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->connect$default(Lcom/toxicbakery/app/bison/ssh/SshTransportManager;Ljava/lang/String;Lcom/toxicbakery/app/bison/model/HostMachine;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
 HSPLcom/toxicbakery/app/bison/ssh/SshTransportManager;->connect(Lcom/toxicbakery/app/bison/model/HostMachine;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;

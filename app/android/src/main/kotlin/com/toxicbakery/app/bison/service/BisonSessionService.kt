@@ -416,7 +416,7 @@ class BisonSessionService : Service(), DIAware {
     private fun resolveTransportSummary(backbones: Map<String, ActiveBackbone>): String {
         if (backbones.isEmpty()) return "Idle"
         val hasMosh = backbones.values.any { it is ActiveBackbone.MoshUdp }
-        return if (hasMosh) "Mosh UDP" else "SSH Endpoint"
+        return if (hasMosh) "Mosh UDP" else "SSH"
     }
 
     private fun promoteToForeground(

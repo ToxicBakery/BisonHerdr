@@ -338,8 +338,8 @@ class SshTransportManager(
     }
 
     /**
-     * Disconnects [machineId] and clears its cached control streams. It also stops the Mosh session of the machine,
-     * but this version starts no Mosh session (issue #22).
+     * Disconnects [machineId] and clears its session state in the manager. It also stops the Mosh session of the
+     * machine, but this version starts no Mosh session (issue #22).
      */
     suspend fun disconnect(machineId: String) {
         releaseConnection(machineId)
@@ -406,14 +406,14 @@ class SshTransportManager(
      * Sends a Herdr RPC to the backend of [machineId], and returns the response line of the backend. The real backend
      * sends each request as a `herdr remote-api-bridge` line.
      *
-     * When the machine has no profile, or when the backend gives no response, the manager writes an error to the
-     * debug log and returns an error response with the code [NO_RESPONSE_CODE]. Thus a caller cannot take a failed
-     * RPC for a success.
+     * When the machine has no profile, or when the backend gives no response, the manager returns an error response
+     * with the code [NO_RESPONSE_CODE]. Thus a caller cannot take a failed RPC for a success. A backend writes the
+     * cause of its error to the debug log, so the manager writes an error only for a machine with no profile.
      */
     suspend fun sendEndpointCommand(
         machineId: String,
         request: ClientShellEndpointRequest,
-    ): String? {
+    ): String {
         val isMoshActive = sshStateManager.activeTransportBackbone.value[machineId] is ActiveBackbone.MoshUdp
         sshDebugLog.record(
             machineId = machineId,
@@ -421,24 +421,24 @@ class SshTransportManager(
             message = HerdrRpcBuilder.toNdjsonLine(request).trim(),
         )
         val machine = activeMachines[machineId]
-        val response = machine?.let {
-            backend.sendEndpointCommand(it, proxyJumpTunnel.resolveRoute(it), request, isMoshActive)
+        if (machine == null) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "RPC",
+                message = "No machine profile for $machineId; did not send ${request.method}",
+                isError = true,
+            )
+            return noResponseError(request, "The machine has no profile, so the app did not send ${request.method}")
         }
-        if (response != null) return response
-        sshDebugLog.record(
-            machineId = machineId,
-            tag = "RPC",
-            message = "No response for ${request.method}",
-            isError = true,
-        )
-        return noResponseError(request)
+        return backend.sendEndpointCommand(machine, proxyJumpTunnel.resolveRoute(machine), request, isMoshActive)
+            ?: noResponseError(request, "The backend gave no response for ${request.method}")
     }
 
     suspend fun sendEndpointCommand(
         machineId: String,
         method: String,
         paramsJson: String = "{}",
-    ): String? = sendEndpointCommand(
+    ): String = sendEndpointCommand(
         machineId = machineId,
         request = ClientShellEndpointRequest(
             id = "rpc_${presentationEpochCounter.getAndIncrement()}",
@@ -820,7 +820,10 @@ class SshTransportManager(
 
     companion object {
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
-        /** The error code of the response of [sendEndpointCommand] when the backend gives no response. */
+        /**
+         * The error code of the response of [sendEndpointCommand] when the machine has no profile, or when the backend
+         * gives no response.
+         */
         const val NO_RESPONSE_CODE: String = "no_response"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
@@ -862,26 +865,15 @@ class SshTransportManager(
                 "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
         }
 
-        /** Returns the error response line of [request] for a backend that gave no response. */
-        internal fun noResponseError(request: ClientShellEndpointRequest): String =
+        /** Returns the error response line of [request] with the code [NO_RESPONSE_CODE] and [message]. */
+        internal fun noResponseError(request: ClientShellEndpointRequest, message: String): String =
             buildJsonObject {
                 put("id", request.id)
                 putJsonObject("error") {
                     put("code", NO_RESPONSE_CODE)
-                    put("message", "The backend gave no response for ${request.method}")
+                    put("message", message)
                 }
             }.toString()
-
-        /**
-         * Builds the command of the Herdr Endpoint Generation 1 bridge of the target design. No code runs this
-         * command in this version: the real backend uses `herdr api snapshot` and [buildSshApiBridgeCommand].
-         */
-        fun buildSshEndpointBridgeCommand(idleTimeoutV1: Boolean = true): String =
-            if (idleTimeoutV1) {
-                "herdr remote-client-bridge --idle-timeout-v1"
-            } else {
-                "herdr remote-client-bridge"
-            }
 
         fun buildSshApiBridgeCommand(): String = "herdr remote-api-bridge"
     }

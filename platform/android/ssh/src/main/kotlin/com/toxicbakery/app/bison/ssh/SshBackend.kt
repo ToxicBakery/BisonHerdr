@@ -44,7 +44,8 @@ interface SshBackend {
 
     /**
      * Sends the Herdr RPC [request] to [machine]. [isMoshActive] is true when the backbone is Mosh UDP.
-     * Returns the response from the machine, or null when the backend has no response.
+     * Returns the response from the machine, or null when the backend has no response. A backend that returns null
+     * after an error writes the cause to the debug log.
      */
     suspend fun sendEndpointCommand(
         machine: HostMachine,

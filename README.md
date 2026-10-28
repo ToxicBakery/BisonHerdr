@@ -23,11 +23,11 @@ Traditional SSH clients on Android drop connections when you switch apps to insp
 ### 2. Primary Input: Touch-First Terminal Experience
 On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. BisonHerdr replaces tiny text-mode chrome with native, ergonomic touch controls:
 
-- **Zen Canvas (96%+ Terminal Viewport)**: Suppresses Herdr's inner ASCII sidebar and top tab bar so your panes occupy the entire screen. A compact top HUD shows workspace and tab pills, agent attention badges, and a connection pill with the measured poll time.
+- **Zen Canvas (Edge-to-Edge Pane Area)**: The app reads each visible pane with `pane.read` and draws only the pane cells. No Herdr sidebar or tab bar shows. The panes use all of the area between the top HUD and the thumb bar. A compact top HUD shows workspace and tab pills, agent attention badges, and a connection pill with the measured poll time.
 - **Split-Thumb Ergonomic Floating Clusters**: Docked at the bottom-left (`Esc`, `Tab`, `Ctrl`, `Alt`, `^C`, `^B`, `/`, `|` by default) and bottom-right (`←`, `↓`, `↑`, `→`, `Enter`, and a drag trackpad for the arrows) corners, with the `Prompt` pill between them. The clusters are right under your thumbs when you hold a tablet in landscape, and the center viewport stays clear.
-- **Native Prompt & Command Composer**: An expandable card above the thumb keys with a multi-line text field, so the Android IME gives voice dictation, swipe typing, and autocorrect. You select the target: the focused pane, the first available agent, or a broadcast. The app sends the prompt with Herdr's `agent.prompt` / `pane.send_input` RPCs.
+- **Native Prompt & Command Composer**: An expandable card above the thumb keys with a multi-line text field, so the Android IME gives voice dictation, swipe typing, and autocorrect. You select the target: the focused pane, the first agent of the snapshot, or a broadcast. The app sends the prompt with Herdr's `agent.prompt` / `pane.send_input` RPCs.
 - **Direct BSP Touch Manipulation**: Drag pane dividers with snap points (25% / 33% / 50% / 67% / 75%), and double-tap a divider to set its split to 50%. Double-tap a pane to zoom or unzoom it (`pane.zoom`), and pinch with two fingers to change the font size.
-- **120Hz Native Compose Canvas**: `TerminalSurfaceCanvas` draws the cells of each Herdr `PaneSurfaceFrame` in Compose, with box-drawing geometry, 24-bit TrueColor, and 19 curated themes. **Gruvbox Dark** is the default theme, and **OLED Pitch Black** is a battery-saver theme. A `libghostty-vt` VT parser over JNI is planned for the Mosh path.
+- **Native Compose Canvas**: `TerminalSurfaceCanvas` draws the cells of each Herdr `PaneSurfaceFrame` in Compose, with box-drawing geometry, 24-bit TrueColor, and 19 curated themes. The app sets no frame rate: Compose draws a new frame when the cells change. **Gruvbox Dark** is the default theme, and **OLED Pitch Black** is a battery-saver theme. A `libghostty-vt` VT parser over JNI is planned for the Mosh path.
 
 ---
 
@@ -35,7 +35,7 @@ On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-clas
 
 | Layer | Technology | Responsibility |
 | :--- | :--- | :--- |
-| **UI & Ergonomics** | Compose Multiplatform + Material 3 | 120Hz `TerminalSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, agent command drawer, multi-machine fleet screen |
+| **UI & Ergonomics** | Compose Multiplatform + Material 3 | `TerminalSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, agent command drawer, multi-machine fleet screen |
 | **Shared Client Logic** | Kotlin Multiplatform (`commonMain`) + Kodein DI | Unidirectional MVI state stores, session lifecycle orchestration, SSH host management, theme & keymap persistence |
 | **Terminal & Transport Core** | Kotlin (`:core:protocol`, `:platform:android:ssh`) + [JSch](https://github.com/mwiede/jsch) | SSH transport over JSch: `herdr api snapshot` and `herdr remote-api-bridge` requests on persistent `sh` channels. `:core:protocol` has the Herdr Endpoint Generation 1 models and `SurfaceDeltaAssembler`. A Mosh UDP SSP client and a `libghostty-vt` VT parser are planned. |
 | **Remote Host Daemon** | [Herdr](https://github.com/herdrdev/herdr) (`herdr api snapshot` / `remote-api-bridge`) | Unmodified remote daemon providing persistent workspaces, BSP panes, PTY multiplexer, coding-agent status detection (`claude`, `codex`, `gemini`, `aider`, `opencode`), and JSON-RPC control plane |

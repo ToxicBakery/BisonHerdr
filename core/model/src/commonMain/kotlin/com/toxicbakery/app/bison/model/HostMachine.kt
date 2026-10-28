@@ -72,7 +72,7 @@ enum class TransportMode {
 }
 
 /**
- * Authentication strategy for SSH2 bootstrap and Herdr control sideband channels.
+ * The login method of the SSH session of a machine. A ProxyJump bastion uses the same method.
  */
 @Serializable
 sealed interface SshAuthMethod {
