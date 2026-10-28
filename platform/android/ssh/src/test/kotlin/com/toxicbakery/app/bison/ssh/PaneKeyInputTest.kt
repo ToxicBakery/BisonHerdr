@@ -7,7 +7,6 @@ import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.File
-import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -231,55 +230,43 @@ class PaneKeyInputTest {
 
     @Test
     fun theRealShellPathKeepsTheTypedOrderAndStopsTheBatchAfterAnUnknownKey() = runBlocking {
-        val home = createTempDirectory("bison-key-input-home").toFile()
-        try {
-            val fakeHerdr = File(File(home, ".local/bin").apply { mkdirs() }, "herdr").apply {
-                writeText(assertNotNull(PaneKeyInputTest::class.java.getResource("/fake-herdr.sh")).readText())
-                setExecutable(true)
-            }
+        TestSshServer().start().use { server ->
+            val fakeHerdr = server.installHerdr(TestHerdr.FAKE_HERDR_SCRIPT)
+            val home = server.home
             File(home, "unknown-keys").writeText("Down\n")
-            TestSshServer().start().use { server ->
-                server.homeDirectory = home
-                val backend = realBackend(server)
-                val machine = server.machine(
-                    id = "key-input",
-                    username = TestSshServer.KEY_USER,
-                    authMethod = server.keyAuthMethod,
-                )
-                val route = ProxyJumpTunnel().resolveRoute(machine)
-                try {
-                    assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
-                    // A real herdr of the test machine must not get the keys. Stop before the input when the remote
-                    // shell does not run the fake.
-                    assertEquals(
-                        fakeHerdr.absolutePath,
-                        backend.client.runCommand(machine, route, "command -v herdr").trim(),
-                    )
+            val backend = realBackend(server)
+            val machine = server.machine(
+                id = "key-input",
+                username = TestSshServer.KEY_USER,
+                authMethod = server.keyAuthMethod,
+            )
+            val route = ProxyJumpTunnel().resolveRoute(machine)
+            try {
+                assertEquals(SshAuthResult.Success, backend.authenticate(machine, route))
+                val herdrPath = backend.client.runCommand(machine, route, "command -v herdr").trim()
+                assertEquals(fakeHerdr.absolutePath, herdrPath)
 
-                    assertTrue(backend.client.sendPaneInput(machine, route, PANE, text("a").event))
-                    // The fake holds the first request, so the next four events go in one batch.
-                    awaitRealTime { File(home, "held").exists() }
-                    assertTrue(File(home, "held").exists(), "The fake did not get the first request")
-                    for (item in AFTER_HELD_INPUT) {
-                        assertTrue(backend.client.sendPaneInput(machine, route, PANE, item.event))
-                    }
-                    File(home, "release").createNewFile()
-
-                    awaitRealTime { writtenInput(File(home, "input.log")) == "a<Up>$ESC[Hb" }
-                    assertEquals("a<Up>$ESC[Hb", writtenInput(File(home, "input.log")))
-                    assertEquals(
-                        listOf(
-                            InputRequest("pane.send_keys", keys = listOf("Down", "Up")),
-                            InputRequest("pane.send_keys", keys = listOf("Down")),
-                        ),
-                        File(home, "not-accepted.log").readLines().map(::inputRequest),
-                    )
-                } finally {
-                    backend.disconnect(machine.id)
+                assertTrue(backend.client.sendPaneInput(machine, route, PANE, text("a").event))
+                // The fake holds the first request, so the next four events go in one batch.
+                awaitRealTime { File(home, "held").exists() }
+                assertTrue(File(home, "held").exists(), "The fake did not get the first request")
+                for (item in AFTER_HELD_INPUT) {
+                    assertTrue(backend.client.sendPaneInput(machine, route, PANE, item.event))
                 }
+                File(home, "release").createNewFile()
+
+                awaitRealTime { writtenInput(File(home, "input.log")) == "a<Up>$ESC[Hb" }
+                assertEquals("a<Up>$ESC[Hb", writtenInput(File(home, "input.log")))
+                assertEquals(
+                    listOf(
+                        InputRequest("pane.send_keys", keys = listOf("Down", "Up")),
+                        InputRequest("pane.send_keys", keys = listOf("Down")),
+                    ),
+                    File(home, "not-accepted.log").readLines().map(::inputRequest),
+                )
+            } finally {
+                backend.disconnect(machine.id)
             }
-        } finally {
-            home.deleteRecursively()
         }
     }
 

@@ -13,6 +13,7 @@ import java.security.PublicKey
 import java.security.spec.ECGenParameterSpec
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.io.path.createTempDirectory
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
 import org.apache.sshd.common.config.keys.PublicKeyEntry
@@ -48,7 +49,8 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
  * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
- * in [binDirectory] before the programs of the test machine. When [allowTcpForwarding] is
+ * in [binDirectory] before the programs of the test machine. Each command has its own [home] and a new environment,
+ * so it never gets to a real `herdr` of the test machine (see [TestHerdr]). When [allowTcpForwarding] is
  * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion. [directTcpipTargets]
  * records the `host:port` of each channel that a client asked for.
  *
@@ -87,13 +89,30 @@ internal class TestSshServer(
     @Volatile
     var binDirectory: File? = null
 
-    /**
-     * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The client puts
-     * `$HOME/.local/bin` first on the `PATH`, so a test that sets a home can put a fake `herdr` there. Then no
-     * command gets to a real `herdr` of the test machine.
-     */
+    /** The `HOME` of each `exec` command, or null for a temporary home of this server. See [home]. */
     @Volatile
     var homeDirectory: File? = null
+
+    private val temporaryHome: File = createTempDirectory("bison-test-ssh-home").toFile()
+
+    /**
+     * The `HOME` of each `exec` command: [homeDirectory], or a temporary directory of this server.
+     *
+     * The client workers put `$HOME/.local/bin` first on the `PATH`. Before each command, the server puts
+     * [TestHerdr.NO_HERDR_SCRIPT] in that directory when it has no `herdr`. Thus no command gets to a real `herdr` of
+     * the test machine. A test that needs a Herdr installs a fake with [installHerdr].
+     */
+    val home: File
+        get() = homeDirectory ?: temporaryHome
+
+    /** Writes [script] to the `herdr` of [home] ([TestHerdr.HERDR_PATH]), and returns that file. */
+    fun installHerdr(script: String): File = synchronized(this) {
+        File(home, TestHerdr.HERDR_PATH).apply {
+            parentFile?.mkdirs()
+            writeText(script)
+            setExecutable(true)
+        }
+    }
 
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
@@ -208,7 +227,11 @@ internal class TestSshServer(
         sshd?.activeSessions?.forEach { it.close(true) }
     }
 
-    override fun close() = stop()
+    /** Stops the server and deletes its temporary home. */
+    override fun close() {
+        stop()
+        temporaryHome.deleteRecursively()
+    }
 
     /** Returns a [HostMachine] that connects to this server as [username] with [authMethod]. */
     fun machine(
@@ -227,15 +250,30 @@ internal class TestSshServer(
     )
 
     /**
-     * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [homeDirectory] as `HOME`, and
-     * [binDirectory] on the `PATH`.
+     * Returns the process that runs [command]: `sh -c` in a new environment. The environment has [NAME_VARIABLE],
+     * [home] as `HOME`, the Herdr configuration directories in [home], and a `PATH` with the `herdr` of [home] first,
+     * then [binDirectory], and then the `PATH` of the test machine. It has no other variable of the test machine, for
+     * example no `HERDR_SOCKET_PATH`.
      */
-    private fun shellCommand(command: String): List<String> = buildList {
-        add("env")
-        add("$NAME_VARIABLE=$name")
-        homeDirectory?.let { add("HOME=${it.absolutePath}") }
-        binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
-        addAll(listOf("sh", "-c", command))
+    private fun shellCommand(command: String): List<String> {
+        val home = home
+        val herdr = File(home, TestHerdr.HERDR_PATH)
+        if (!herdr.exists()) installHerdr(TestHerdr.NO_HERDR_SCRIPT)
+        check(herdr.canExecute()) { "The test server has no herdr at $herdr, so a real herdr can run" }
+        val path = listOfNotNull(herdr.parentFile, binDirectory).map { it.absolutePath } +
+            System.getenv("PATH").orEmpty()
+        return listOf(
+            "env",
+            "-i",
+            "$NAME_VARIABLE=$name",
+            "HOME=${home.absolutePath}",
+            "XDG_CONFIG_HOME=${File(home, ".config").absolutePath}",
+            "XDG_STATE_HOME=${File(home, ".local/state").absolutePath}",
+            "PATH=${path.joinToString(File.pathSeparator)}",
+            "sh",
+            "-c",
+            command,
+        )
     }
 
     /** Accepts each forwarding request, and records each `direct-tcpip` request in [directTcpipTargets]. */
