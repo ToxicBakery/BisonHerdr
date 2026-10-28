@@ -35,9 +35,13 @@ internal suspend fun SshStateManager.runControlRequest(
  * Ends the user authentication wait and the keyboard-interactive wait of the machine of [request] at once when
  * [request] is a disconnect. Call it when the request arrives, before the control queue. A connect that waits for the
  * user can hold that queue for up to 90 s, so a disconnect in the queue cannot end that wait.
+ *
+ * For a connect, it keeps the cancel mark of the machine ([SshStateManager.markConnectRequest]). Thus a disconnect
+ * while the connect waits in the queue also stops the security key login of that connect.
  */
 internal fun SshStateManager.cancelUserAuthBeforeQueue(request: SshRequest) {
     if (request is SshRequest.Disconnect) cancelUserAuth(request.machineId)
+    if (request is SshRequest.Connect) markConnectRequest(request.machineId)
 }
 
 /**
