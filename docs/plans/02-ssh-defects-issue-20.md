@@ -37,6 +37,17 @@ No item is dismissed. Two items have a correction:
   service type passes manifest validation. The type is still wrong, because the
   service does not talk to an external device. The fix keeps only `specialUse`.
 
+## Resolved decisions
+
+Three items needed a decision. Each one got a research pass against the code, the
+Android documentation, and the libraries. The results are in the items below.
+
+| Decision | Result | Reason |
+|----------|--------|--------|
+| Backups (item 2) | Keep backups on. Add `dataExtractionRules` that include only the non-secret files. Write secrets to `noBackupFilesDir`. | `allowBackup="false"` does not stop device-to-device transfer on some devices. A keystore key never leaves the device, so a restored secret can never decrypt. The machine list and the known hosts are useful after a restore. |
+| Hardware keys (item 5) | Hide the option now. Open one issue for FIDO2 `sk-*` keys with yubikit-android. | Real support is five to seven engineer-days, needs a physical YubiKey, and blocks no other fix. Only yubikit can sign for the `ssh:` relying party. Platform passkey APIs cannot. |
+| Rust core (item 13) | Do not build it. Delete the prototype crates and the vendored `libghostty-vt`. Keep `rust/herdr-protocol` as a tested reference crate. Correct the documents. | The Mosh code is a codec, not a transport, and a real `mosh-server` rejects its packets. A working Mosh path is about 29 engineer-days. The SSH path with items 10 and 11 meets both mission goals. |
+
 ## Security
 
 ### 1. Host-key check
@@ -69,28 +80,90 @@ then saves, second connection does not prompt, a changed key stops the connectio
 `encryptedPasswordRef` (`ConfigureMachineViewModel.kt:208-209`). `MachineStore`
 writes the model to `machines.json`. `getOrOpenSession` sends the value to
 `session.setPassword` with no decryption (`RealHerdrSshClient.kt:1410-1411`).
-`AndroidManifest.xml:18` sets `allowBackup="true"`.
+`AndroidManifest.xml:18` sets `allowBackup="true"` with no `dataExtractionRules`.
+`StoreIOProviderAndroid` writes every store file into `filesDir`
+(`StoreIOProviderAndroid.kt:19-24`), and Auto Backup includes that directory. A
+quarantine copy `machines.json.corrupt.<epoch>` can also hold a plain-text password.
+
+**Decision on backups.** Keep backups on, and let the rules decide what goes out.
+
+- `allowBackup="false"` stops the cloud backup, but on some devices it does not
+  stop the device-to-device transfer
+  ([Android 12 behavior changes](https://developer.android.com/about/versions/12/behavior-changes-12)).
+  The flag alone does not protect a secret.
+- An AndroidKeyStore key never leaves the device
+  ([Keystore](https://developer.android.com/privacy-and-security/keystore)). A
+  restored ciphertext can never decrypt, so a backup of the ciphertext has no use.
+- The machine list, the known hosts, and the settings hold no secret, and they are
+  useful after a restore. Keep them in the backup.
+- `androidx.security:security-crypto` is deprecated since 1.1.0-alpha07 in favor of
+  the platform keystore APIs
+  ([release notes](https://developer.android.com/jetpack/androidx/releases/security)).
+  The plan uses `KeyGenParameterSpec` and `Cipher` directly.
 
 **Fix.**
 
 1. Add a `SecretStore` interface in `:core:ssh` with `put(ref, secret)`,
-   `get(ref)`, and `remove(ref)`.
-2. Implement `AndroidKeystoreSecretStore` in `:platform:android:ssh`. It makes one
-   AES-256-GCM key in AndroidKeyStore. It writes the IV and the ciphertext to a
-   private file, keyed by a random reference.
-3. Implement `InMemorySecretStore` for JVM tests and for the fake server.
-4. `ConfigureMachineViewModel` stores the password through `SecretStore` and
-   writes only the reference into `encryptedPasswordRef`. On edit, the field shows
-   a placeholder, not the password.
-5. `RealHerdrSshClient` resolves the reference through `SecretStore` before
+   `get(ref)`, and `remove(ref)`. `get` returns `null` for a missing file and for
+   an `AEADBadTagException`.
+2. Implement `AndroidKeystoreSecretStore` in `:platform:android:ssh`. The key:
+   alias `bison_secret_store_v1`, `PURPOSE_ENCRYPT or PURPOSE_DECRYPT`,
+   `BLOCK_MODE_GCM`, `ENCRYPTION_PADDING_NONE`, key size 256,
+   `setRandomizedEncryptionRequired(true)`. Do not set
+   `setUserAuthenticationRequired`, `setUnlockedDeviceRequired`, or StrongBox: the
+   service reconnects while the screen is locked, and `setUnlockedDeviceRequired`
+   has known bugs on Android 12 to 14.
+3. Encrypt with `Cipher.getInstance("AES/GCM/NoPadding")`. Let the keystore make
+   the 12-byte IV. Pass the reference string as additional authenticated data.
+   Write `iv || ciphertext` to one file per reference in
+   `context.noBackupFilesDir/secrets/`. Add a second `StoreIOProvider` binding for
+   that directory.
+4. Implement `InMemorySecretStore` for JVM tests and for the fake server, with a
+   `javax.crypto` AES key and the same file format.
+5. `ConfigureMachineViewModel` stores the password through `SecretStore` and
+   writes `secret:<ref>` into `encryptedPasswordRef`. On edit, the field shows a
+   placeholder, not the password.
+6. `RealHerdrSshClient` resolves the reference through `SecretStore` before
    `setPassword`. Clear the byte array after `connect`.
-6. Add a one-time migration: on load, if `encryptedPasswordRef` has no
-   `secret:` prefix, move the value into the store and rewrite the reference.
-7. Set `android:allowBackup="false"`. The app has no export flow yet, so a backup
-   has no use that is worth the risk.
+7. Add a one-time migration: on load, if `encryptedPasswordRef` has no `secret:`
+   prefix, move the value into the store and rewrite the reference. Delete the
+   `*.corrupt.*` files in the same step.
+8. Set `android:dataExtractionRules="@xml/data_extraction_rules"` in the manifest.
+   Keep `allowBackup="true"`. Add `res/xml/data_extraction_rules.xml`:
 
-**Tests.** Round trip through the store, migration of an old `machines.json`, and
-a password login against the in-process server.
+   ```xml
+   <?xml version="1.0" encoding="utf-8"?>
+   <data-extraction-rules>
+       <cloud-backup disableIfNoEncryptionCapabilities="true">
+           <include domain="file" path="machines.json"/>
+           <include domain="file" path="settings.json"/>
+           <include domain="file" path="known_hosts.json"/>
+       </cloud-backup>
+       <device-transfer>
+           <include domain="file" path="machines.json"/>
+           <include domain="file" path="settings.json"/>
+           <include domain="file" path="known_hosts.json"/>
+       </device-transfer>
+   </data-extraction-rules>
+   ```
+
+   An include list keeps `*.tmp` and `*.corrupt.*` out. The `secrets/` directory is
+   under `noBackupFilesDir`, which Auto Backup never reads.
+9. Handle a restore. Write a marker file `device.id` into `noBackupFilesDir` on
+   first start. On load, when `machines.json` exists and the marker is absent, set
+   a `restoredFromBackup` flag and write the marker.
+10. Add a transient `credentialState` to the machine list state: `Ready`,
+    `PasswordMissing`, or `KeyMissing`. A `CredentialValidator` in
+    `:platform:android:ssh` computes it after load from `SecretStore.get` and
+    `keyManager.hasKey(alias)`. The machine card shows "Needs sign-in". For a
+    missing password, the connect path opens the password prompt from item 8 and
+    stores the new secret. For a missing key, show the item 7 message and a
+    "Make a new key" action.
+
+**Tests.** Round trip through the store, `get` of an unknown reference returns
+`null`, migration of an old `machines.json`, the restore marker sets the flag,
+the validator marks a machine with no secret, and a password login against the
+in-process server.
 
 ### 3. Software key fallback on a device
 
@@ -149,21 +222,68 @@ branches each carry a full simulated implementation.
 **Evidence.** `getOrOpenSession` adds no identity for `HardwareSecurityKey`
 (`RealHerdrSshClient.kt:1402`). `YubiKeyFido2Manager` signs with keys from
 `KeyPairGenerator` (`YubiKeyFido2Manager.kt:27-36`), and
-`isHardwareKeyAvailable()` returns `true`.
+`isHardwareKeyAvailable()` returns `true`. `SshTransportManager.kt:565-578` signs
+a local string, not SSH data.
 
-**Fix.** Hide the option, and keep the model.
+**Decision.** Hide the option now. Real support is a separate issue.
 
-1. Remove `HardwareSecurityKey` from `ConfigureMachineViewModel.AuthType` choices
-   in the screen. Keep the `SshAuthMethod.HardwareSecurityKey` model so that old
-   `machines.json` files still load.
-2. When a loaded machine has this method, show it as "not supported in this
-   version" and block the connect action.
-3. Move `YubiKeyFido2Manager` to the test source set, or delete it. Delete the
-   `NFC` permission when no code uses it (see item 15).
-4. Open a new issue for real FIDO2 support with the Yubico Android SDK
-   (Apache-2.0). This is new work, not a fix.
+- Real FIDO2 support is five to seven engineer-days. PIV support is three to four
+  days, and few users make PIV SSH keys. Both need a physical YubiKey, which CI
+  cannot drive. Neither blocks another fix in this plan.
+- Only [yubikit-android](https://github.com/Yubico/yubikit-android) (Apache-2.0,
+  version 3.2.1, `minSdk` 21, USB and NFC) can sign for the `ssh:` relying party.
+  Its `Ctap2Session.getAssertions` takes any `rpId` string. The Google FIDO2 API
+  and Credential Manager need a domain `rpId` with an `assetlinks.json` check, so
+  they cannot make an OpenSSH `sk` assertion
+  ([Google FIDO2 for native apps](https://developers.google.com/identity/fido/android/native-apps)).
+- JSch 2.28.x has no `sk-*` support, but a custom `Identity` works. The signature
+  blob from `getSignature(data, alg)` goes into the packet as is. The app must add
+  the `sk-*` names to `PubkeyAcceptedAlgorithms` and register a placeholder
+  `Signature` class, because `Session.checkSignatures` marks a name with no class
+  as unavailable.
+- About 80 percent of the current code stays for the real implementation: the
+  model, the `HardwareKeySigner` contract, `PromptHardwareKeyTouch`, the prompt
+  sheet, and the `AndroidKeystoreJschIdentity` pattern. Only the signer is new.
+  `buildOpenSshSkSignatureBlob` (`YubiKeyFido2Manager.kt:86-130`) has the correct
+  wire format and moves into the new identity later.
+
+**Fix.**
+
+1. Remove `AuthType.HardwareSecurityKey` from the choices in
+   `ConfigureMachineScreen.kt:291`. Keep the enum value and the
+   `SshAuthMethod.HardwareSecurityKey` model, so that old `machines.json` files
+   still load.
+2. When a loaded machine has this method, show "Not supported in this version" and
+   block the connect action.
+3. Delete `YubiKeyFido2Manager.kt`, its binding in `SshModule.kt:28-36`, and the
+   `HardwareSecurityKey` branch in `SshTransportManager.kt:565-578`. Keep
+   `HardwareKeySigner`, `PromptHardwareKeyTouch`, and
+   `HardwareSecurityKeyPromptSheet`.
+4. Remove the `NFC` permission and the `nfc` and `usb.host` features from the
+   manifest (`AndroidManifest.xml:10-14`). The real implementation adds them back.
+5. Update `SshPlatformTest.kt:122-129,275` and
+   `ConnectionPathsE2ETest.kt:274-350` to remove the YubiKey cases.
 
 **Tests.** A view-model test that the choice list has two entries.
+
+**New issue "FIDO2 security keys".** The issue must specify:
+
+- Library: `com.yubico.yubikit:android`, `core`, and `fido` 3.2.1. No `piv`.
+- Key types: `sk-ssh-ed25519@openssh.com` first, `sk-ecdsa-sha2-nistp256@openssh.com`
+  second. Ed25519 gives a raw 64-byte signature. P-256 needs DER to `mpint r, s`.
+- Model: add `credentialId`, `publicKey`, and `residentKey` to
+  `HardwareSecurityKey`. These are public data and go into `machines.json`.
+- UI: an "Enroll key" action on the configure screen. It runs `makeCredential`
+  with `rp = {id: "ssh:"}` under the touch sheet, then shows the `.pub` line with
+  the copy action from PR #16. On connect, a `HardwareKeyJschIdentity` calls
+  `getAssertions("ssh:", SHA256(data), allowList=[credentialId])` and returns
+  `string sig, byte flags, uint32 counter` from the authenticator data.
+- JSch: the `PubkeyAcceptedAlgorithms` entries and the placeholder `Signature`
+  class.
+- Transport: `YubiKitManager.startUsbDiscovery` and `startNfcDiscovery` from
+  `MainActivity`, with the permission and the two features restored.
+- Tests: a unit test with a fake `FidoConnection` for the wire format, and a
+  manual test card with a YubiKey 5 over USB-C and NFC against the item 16 server.
 
 ### 6. Biometric keys
 
@@ -318,34 +438,87 @@ which item 13 does not build. The real path cannot run Mosh today.
    keep an exponential moving average, and update the backbone `rttMs` once per
    second when it changes.
 3. Remove the fixed values 9 and 12.
-4. When item 13 ships the library, add the Mosh bootstrap to `RealSshBackend` and
-   call `moshUdpEngine.startSession`.
+4. Mosh stays out of this version. The new issue from item 13 holds the
+   acceptance list for a real Mosh path.
 
 **Tests.** A test that the RTT on the backbone changes after measured round trips.
 
 ### 13. Rust core
 
-**Evidence.** `jni_bridge.rs` exports `HerdrNativeBridge` functions, and no Kotlin
-class has that name. Gradle has no Cargo or NDK step. CI has no `cargo` step.
-`isNativeLibraryLoaded` is always `false` (`MoshUdpEngine.kt:434-439`). The
-Kotlin code in `:core:protocol` already implements the config, parse, and layout
-functions that the JNI bridge exports. The Mosh SSP client in `mosh_ssp.rs` is the
-only part with no Kotlin equivalent.
+**Evidence.** `jni_bridge.rs` exports nine `HerdrNativeBridge` functions
+(`jni_bridge.rs:131-292`), and no Kotlin class has that name. Gradle has no Cargo
+or NDK step. CI has no `cargo` or `zig` step. `isNativeLibraryLoaded` is always
+`false` (`MoshUdpEngine.kt:434-439`). The `rust/` tree has three commits, all on
+2026-10-20.
 
-**Decision for the owner.** Two options:
+The research pass found more than the issue reports:
 
-- **A. Build and load it.** Add `cargo-ndk` to the `:platform:android:ssh` build,
-  add a `cargo test` and a `cargo ndk build` job to `validation.yml`, add
-  `HerdrNativeBridge` in `:core:protocol` `androidMain`, and wire `MoshUdpEngine`
-  to the Mosh SSP functions. This is a multi-week item and it is the prerequisite
-  for item 12.
-- **B. Document the state.** Change the README and
-  `docs/plans/01-core-app-design.md` so that they say: the Rust workspace is a
-  standalone prototype, the shipped app uses JSch and the Kotlin protocol code, and
-  Mosh is not available yet. Delete the dead `russh` dependency from the workspace.
+- `mosh_ssp.rs` (704 lines) is a codec, not a transport. Nothing in the crate
+  opens a UDP socket. It has no fragment header, no `UserMessage` or `HostMessage`
+  protobuf, no sent-state list, and no retransmit timer. A real `mosh-server`
+  rejects its packets. The AES-128-OCB3 code is correct against the RFC 7253
+  test vectors.
+- The workspace does not build. `rust/ghostty-vt/build.rs` runs `zig build` on
+  `vendor/libghostty-vt` (468 MB), which needs Zig 0.16.0. The machine has Zig
+  0.17.0. `herdr-mobile-core` depends on `ghostty-vt`, so it cannot build or test.
+  `cargo test -p herdr-protocol` passes 50 tests with zero clippy warnings.
+- Seven of the nine JNI exports duplicate Kotlin code in `:core:protocol`
+  (`MoshBootstrapConfig.kt:80,97`, `PaneLayoutDerivation.kt:62,118,124`,
+  `EndpointAndInputModels.kt:16`). Only `nativeSynthesizeMoshFrameJson` and the
+  SSP codec have no Kotlin equivalent.
+- `russh`, `ssh-key`, `tokio`, and `async-trait` serve only a dead handler in
+  `ssh_client.rs`. Nothing ships `vendor/libghostty-vt`.
+- `MoshUdpEngine.transmitSspDatagram` (`MoshUdpEngine.kt:303-317`) sends plain
+  `seq || 0x01` frames with no encryption and never reads a reply. `startSession`
+  returns `true` after one send, so the handshake in
+  `SshTransportManager.kt:626-640` verifies nothing.
+- The NDK is installed, `cargo-ndk` and the Android rustup targets are not.
 
-**Recommendation.** Do B now in a `docs` pull request, and open a separate issue
-for A. The claims in the documents are the defect that this issue reports.
+**Effort for a working Mosh path.** About 29 engineer-days: toolchain and CI (3),
+`HerdrNativeBridge` (1), a wire-compatible SSP with fragments, protobuf messages,
+state list, and timers (10), the UDP socket, event loop, and roaming (5), the
+VT frame path through ghostty-vt (5), and integration with tests (5). A pure-Kotlin
+SSP client saves the toolchain step but still needs a VT emulator, which the app
+does not have. The Herdr endpoint sends rendered cells, so the SSH path needs none.
+
+**Decision.** Do not build it. The SSH path meets both mission goals in
+`CLAUDE.md` section 2: the design document itself names the surface lease and
+`NetworkCallback` fast-roam as the answer to roaming
+(`01-core-app-design.md:14`), and items 10 and 11 complete that path. Mosh adds
+only zero-delay roaming and predictive echo. Delete the prototype crates and the
+vendored library: the git history keeps them, they do not build with the installed
+Zig, and the checkout drops 468 MB. Keep `rust/herdr-protocol` as a tested
+reference for the Herdr wire types.
+
+**Fix.** Branch `chore/rust-core-status`.
+
+1. Delete `rust/herdr-mobile-core`, `rust/ghostty-vt`, and
+   `vendor/libghostty-vt`. Remove them from `rust/Cargo.toml`. Remove `russh`,
+   `ssh-key`, `tokio`, and `async-trait` from the workspace. Run `cargo update`
+   so that `Cargo.lock` drops them.
+2. Add a `rust/README.md` note: the crate is a reference for the Herdr wire types,
+   and Gradle does not build it.
+3. Add a CI job to `validation.yml` that runs `cargo test -p herdr-protocol` and
+   `cargo clippy -p herdr-protocol -- -D warnings`.
+4. In `MoshUdpEngine.kt`, delete the `DatagramChannel` send path
+   (lines 92-96 and 303-317) and `isNativeLibraryLoaded`. `startSession` returns
+   `false` with the log line "Mosh is not available in this version". Update the
+   KDoc at lines 21-33.
+5. Correct `README.md`: line 18 (Mosh backbone) becomes "planned"; line 29
+   (`libghostty-vt` over JNI) describes the Compose canvas that renders Herdr
+   `PaneSurfaceFrame` cells; lines 39 and 49 name JSch and `:core:protocol`, and
+   call `rust/herdr-protocol` a reference crate.
+6. Correct `docs/plans/01-core-app-design.md`: lines 394, 476, and 477 (replace
+   `rust/herdr-mobile-core` with the Kotlin protocol module or mark as planned);
+   lines 597, 599, 622, and 630 (module tree); lines 962 to 970 (`russh` JNI
+   claims); line 985 (Phase 2 status: not started); line 998 (limit the `cargo`
+   definition of done to `herdr-protocol`). Keep line 14, it is true.
+7. Correct `CLAUDE.md` section 2: mark "Mosh UDP SSP zero-traffic idle suspend"
+   and "120Hz `libghostty-vt` JNI rendering" as planned.
+8. Open the issue "Mosh UDP backbone" with the six effort steps above and the
+   wire-compatibility gaps: fragment header, `UserMessage` and `HostMessage`,
+   sent-state list, timers, socket, and VT emulator. Link the last commit that has
+   the deleted crates.
 
 ## Foreground service
 
@@ -390,7 +563,7 @@ at runtime. The notification has only agent actions
 3. Set `android:foregroundServiceType="specialUse"` only. Remove
    `FOREGROUND_SERVICE_CONNECTED_DEVICE`. Keep the subtype text, and shorten it to
    one clause: "Keeps SSH terminal sessions open in the background".
-4. Remove the `NFC` permission with item 5.
+4. Remove the `NFC` permission and the `nfc` and `usb.host` features with item 5.
 
 **Tests.** A manifest assertion in the existing `app` unit tests, if present, or a
 review step in the pull request.
@@ -419,7 +592,7 @@ simulated path. `validation.yml` runs no device test and no `cargo` step.
    `shouldUseRealSsh` rule, which item 4 removes.
 5. Keep `AgyCursorPlacementE2ETest` as a manual device test. Add a note in
    `scripts/e2e/agy-cursor-e2e.sh` that CI does not run it.
-6. Add a `cargo` CI job only with option A of item 13.
+6. The `cargo` CI job for `herdr-protocol` comes with item 13.
 
 ## Order of pull requests
 
@@ -440,7 +613,7 @@ every later fix has a test against a real server.
 | 9 | `feat/keyboard-interactive` | 8 |
 | 10 | `fix/hide-hardware-key` | 5, and the `NFC` part of 15 |
 | 11 | `fix/session-service-lifecycle` | 14, 15 |
-| 12 | `docs/rust-core-status` | 13, option B |
+| 12 | `chore/rust-core-status` | 13 |
 
-Open issues for the two items that are new work: real FIDO2 support (item 5) and
-the Rust core build (item 13, option A).
+Open two issues for the work that this plan defers: "FIDO2 security keys"
+(item 5) and "Mosh UDP backbone" (item 13). Both items above give the content.
