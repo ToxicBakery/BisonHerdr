@@ -53,6 +53,11 @@ import kotlinx.coroutines.withContext
  * [authenticate], so it never asks. The socket of the client throws a [LocalNetworkPermissionException], and the
  * reconnect loop stops for the user.
  *
+ * A machine with a FIDO2 security key logs in through [HardwareKeySigner]. The signer asks the user to touch the key
+ * for each new session, also for a reconnect. In the background, the signer cannot ask, so the login fails with a
+ * [HardwareKeyException] and the reconnect loop stops for the user. Without a signer, [authenticate] refuses such a
+ * machine before the network connection.
+ *
  * The backbone is always [ActiveBackbone.SshEndpoint], because this version has no Mosh transport (issue #22). The
  * client measures the poll time, and the backend puts its average in the backbone with
  * [SshStateManager.setRoundTripTime]. See [RealHerdrSshClient.refreshSnapshotAndSurface].
@@ -77,6 +82,7 @@ class RealSshBackend internal constructor(
         keyboardInteractiveTimeout: Duration = KEYBOARD_INTERACTIVE_TIMEOUT,
         localNetworkGuard: LocalNetworkGuard,
         localNetworkAccess: LocalNetworkAccess = LocalNetworkAccess(),
+        hardwareKeySigner: HardwareKeySigner? = null,
     ) : this(
         client = RealHerdrSshClient(
             sshDebugLog = sshDebugLog,
@@ -89,6 +95,7 @@ class RealSshBackend internal constructor(
             userPrompter = { prompt -> sshStateManager.requestKeyboardInteractive(prompt, keyboardInteractiveTimeout) },
             machineStore = machineStore,
             localNetworkGuard = localNetworkGuard,
+            hardwareKeySigner = hardwareKeySigner,
         ),
         sshStateManager = sshStateManager,
         keystoreKeyManager = keystoreKeyManager,
@@ -280,7 +287,8 @@ class RealSshBackend internal constructor(
          * [SshAuthResult.KeyMissing]. A [UserAuthRequiredException] or a [UserNotAuthenticatedException] at any
          * level of the cause chain is [SshAuthResult.UserAuthRequired]. A [UserInputException] at any level of the
          * cause chain gives its [UserInputException.result]. A [LocalNetworkPermissionException] at any level of the
-         * cause chain is [SshAuthResult.LocalNetworkBlocked]. A refused login is [SshAuthResult.AuthFailed]. An
+         * cause chain is [SshAuthResult.LocalNetworkBlocked]. A [HardwareKeyException] at any level of the cause
+         * chain is [SshAuthResult.Failed] with that exception. A refused login is [SshAuthResult.AuthFailed]. An
          * [IOException] at any level of the cause chain is [SshAuthResult.NetworkError]. A [JSchException] with a
          * message that starts with a text of [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only
          * the message of [error] counts, because a cause with that text can be in an error that tells a different
@@ -294,6 +302,7 @@ class RealSshBackend internal constructor(
             val userAuth = causes.firstOrNull { it is UserAuthRequiredException || it is UserNotAuthenticatedException }
             val userInput = causes.filterIsInstance<UserInputException>().firstOrNull()
             val localNetwork = causes.filterIsInstance<LocalNetworkPermissionException>().firstOrNull()
+            val hardwareKey = causes.filterIsInstance<HardwareKeyException>().firstOrNull()
             return when {
                 error is HostKeyRejectedException -> error.rejection
 
@@ -304,6 +313,9 @@ class RealSshBackend internal constructor(
                 userInput != null -> userInput.result
 
                 localNetwork != null -> SshAuthResult.LocalNetworkBlocked(localNetwork.hostPort, localNetwork.timedOut)
+
+                // Only the user can fix a security key error, so it is not a NetworkError, also with an IOException.
+                hardwareKey != null -> SshAuthResult.Failed(hardwareKey)
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)

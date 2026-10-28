@@ -10,7 +10,9 @@ import com.toxicbakery.app.bison.common.screen.machine.KnownHostsViewModel
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalViewModel
 import com.toxicbakery.app.bison.common.version.ReleaseFetcher
 import com.toxicbakery.app.bison.common.version.VersionWatcher
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
+import com.toxicbakery.app.bison.ssh.HardwareKeySigner
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import org.kodein.di.DI
 import org.kodein.di.bindFactory
@@ -31,6 +33,9 @@ val viewModelModule = DI.Module("viewModelModule") {
         )
     }
     bindFactory<String, ConfigureMachineViewModel> { machineId: String ->
+        // The app binds the flags of the build, and the platform binds the signer. Without the flag, the app does
+        // not make the signer, and the screen does not offer security keys.
+        val featureFlags = instanceOrNull<FeatureFlags>() ?: FeatureFlags()
         ConfigureMachineViewModel(
             machineId = machineId,
             machineStore = instance(),
@@ -39,6 +44,8 @@ val viewModelModule = DI.Module("viewModelModule") {
             // The platform layer binds the real key support. Other hosts use all key types.
             keystoreKeySupport = instanceOrNull<KeystoreKeySupport>() ?: KeystoreKeySupport.AllAlgorithms,
             sshPublicKeyProvider = instanceOrNull<SshPublicKeyProvider>(),
+            featureFlags = featureFlags,
+            hardwareKeySigner = if (featureFlags.hardwareSecurityKeys) instanceOrNull<HardwareKeySigner>() else null,
         )
     }
     bindFactory<String, ConnectingMachineViewModel> { machineId: String ->
