@@ -1,7 +1,6 @@
 package com.toxicbakery.app.bison.debug
 
-import com.toxicbakery.app.bison.di.coreDiModule
-import com.toxicbakery.app.bison.di.platformModule
+import com.toxicbakery.app.bison.appModule
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialValidator
 import com.toxicbakery.app.bison.ssh.RealSshBackend
@@ -17,16 +16,15 @@ import org.kodein.di.direct
 import org.kodein.di.instance
 
 /**
- * Tests the bindings of the release [debugModule] with the same modules as the app. The release build type has
- * unit tests only for this check, so CI runs `testReleaseUnitTest` next to `testDebugUnitTest`.
+ * Tests the bindings of the release [debugModule] in [appModule], the module that the `Application` imports. Thus an
+ * override in another module of the app also fails the test. The `Application` also binds the store directories
+ * with its `Context`. The test binds only the secret store directory, because the instances of the test need no
+ * other directory. CI runs `testReleaseUnitTest` next to `testDebugUnitTest`.
  */
 class ReleaseDebugModuleTest {
 
     private val di = DI {
-        import(coreDiModule)
-        import(platformModule)
-        import(debugModule)
-        // The Application binds this directory with its Context.
+        import(appModule)
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) { InMemoryStoreIOProvider() }
     }
 
