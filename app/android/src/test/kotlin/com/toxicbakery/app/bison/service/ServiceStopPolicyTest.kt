@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.service
 
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.CONNECT_STEP_LIMIT
 import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.IDLE_TIMEOUT
 import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.isConnectStep
 import kotlin.test.Test
@@ -30,11 +31,15 @@ class ServiceStopPolicyTest {
     private val connectedMachines = MutableStateFlow<Set<String>>(emptySet())
     private val connectionProgress = MutableStateFlow<Map<String, ConnectionProgress>>(emptyMap())
     private val anyActivityStarted = MutableStateFlow(false)
-    private val policy = ServiceStopPolicy()
 
     @Test
     fun idleTimeoutIsThirtySeconds() {
         assertEquals(30.seconds, IDLE_TIMEOUT)
+    }
+
+    @Test
+    fun connectStepLimitIsTwoMinutes() {
+        assertEquals(2.minutes, CONNECT_STEP_LIMIT)
     }
 
     @Test
@@ -123,7 +128,7 @@ class ServiceStopPolicyTest {
         val stop = startPolicy()
 
         // The user leaves the app during a slow connect. A stop now cancels the connect.
-        advanceAndRun(10.minutes)
+        advanceAndRun(90.seconds)
         assertFalse(stop.isCompleted)
 
         connectionProgress.value = mapOf("workbox" to ConnectionProgress.Failed)
@@ -165,13 +170,63 @@ class ServiceStopPolicyTest {
         ConnectionProgress.entries.filter { step -> step.isConnectStep() }.forEach { step ->
             connectionProgress.value = mapOf("workbox" to step, "gpu-rig" to ConnectionProgress.Failed)
             val stop = startPolicy()
-            advanceAndRun(10.minutes)
+            advanceAndRun(CONNECT_STEP_LIMIT + IDLE_TIMEOUT - 1.milliseconds)
             assertFalse(stop.isCompleted, "$step did not keep the service busy")
             stop.cancel()
         }
     }
 
+    @Test
+    fun aConnectStepThatNeverEndsStopsTheServiceAfterTheLimit() = runTest {
+        // A connect that throws can leave its machine at a middle step with no Failed progress.
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.SyncingHerdrSnapshot)
+        val stop = startPolicy()
+
+        advanceAndRun(CONNECT_STEP_LIMIT - 1.milliseconds)
+        assertFalse(stop.isCompleted)
+        advanceAndRun(1.milliseconds)
+
+        // After the limit the step is idle, and the 30 s timeout starts.
+        assertStopsAfter(stop, IDLE_TIMEOUT)
+        assertEquals((CONNECT_STEP_LIMIT + IDLE_TIMEOUT).inWholeMilliseconds, currentTime)
+    }
+
+    @Test
+    fun aNewConnectStepStartsANewLimit() = runTest {
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.AuthenticatingSsh)
+        val stop = startPolicy()
+
+        advanceAndRun(100.seconds)
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.BootstrappingMoshOrBridge)
+        runCurrent()
+
+        // The new step started at 100 s, so it keeps the service busy until 220 s.
+        advanceAndRun(CONNECT_STEP_LIMIT)
+        assertStopsAfter(stop, IDLE_TIMEOUT)
+        assertEquals(250.seconds.inWholeMilliseconds, currentTime)
+    }
+
+    @Test
+    fun eachMachineHasItsOwnLimit() = runTest {
+        connectionProgress.value = mapOf("workbox" to ConnectionProgress.AuthenticatingSsh)
+        val stop = startPolicy()
+
+        advanceAndRun(60.seconds)
+        connectionProgress.value = mapOf(
+            "workbox" to ConnectionProgress.AuthenticatingSsh,
+            "gpu-rig" to ConnectionProgress.AuthenticatingSsh,
+        )
+        runCurrent()
+
+        // The step of workbox ends at 120 s. The step of gpu-rig started at 60 s and ends at 180 s.
+        advanceAndRun(CONNECT_STEP_LIMIT)
+        assertStopsAfter(stop, IDLE_TIMEOUT)
+        assertEquals(210.seconds.inWholeMilliseconds, currentTime)
+    }
+
     private fun TestScope.startPolicy(): Job {
+        // The virtual time source of the test scheduler agrees with the virtual delays.
+        val policy = ServiceStopPolicy(timeSource = testScheduler.timeSource)
         val job = launch {
             policy.awaitIdleTimeout(
                 connectedMachines = connectedMachines,
