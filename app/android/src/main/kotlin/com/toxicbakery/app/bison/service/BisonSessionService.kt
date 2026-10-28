@@ -191,10 +191,8 @@ class BisonSessionService : Service(), DIAware {
 
         serviceScope.launch {
             for (request in controlQueue) {
-                runCatching {
-                    dispatchSshRequest(request)
-                }.onFailure { error ->
-                    if (error is CancellationException) throw error
+                // A failed or cancelled Connect must not stay at a connect step.
+                sshStateManager.runControlRequest(request) { dispatchSshRequest(it) }?.let { error ->
                     log.e(error) { "Failed to handle control SshRequest: $request" }
                 }
             }
