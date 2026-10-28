@@ -17,7 +17,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 
 /**
- * Optimistically queued prompt waiting to be flushed once a roaming Mosh/SSH stream acknowledges.
+ * Optimistically queued prompt waiting to be flushed once a roaming SSH stream acknowledges.
  */
 @Serializable
 data class QueuedPrompt(
@@ -122,6 +122,24 @@ class SshStateManager {
 
     fun updateBackbone(machineId: String, backbone: ActiveBackbone) {
         setBackbone(machineId, backbone)
+    }
+
+    /**
+     * Sets the round trip time of the backbone of [machineId] to [rttMs]. Returns true when the value changed.
+     * Returns false when the machine has no backbone, or when its backbone has [rttMs] already. A machine that
+     * disconnects at the same time does not get its backbone again.
+     */
+    fun setRoundTripTime(machineId: String, rttMs: Int): Boolean {
+        while (true) {
+            val current = _activeTransportBackbone.value
+            val backbone = current[machineId] ?: return false
+            if (backbone.rttMs == rttMs) return false
+            val updated = when (backbone) {
+                is ActiveBackbone.MoshUdp -> backbone.copy(rttMs = rttMs)
+                is ActiveBackbone.SshEndpoint -> backbone.copy(rttMs = rttMs)
+            }
+            if (_activeTransportBackbone.compareAndSet(current, current + (machineId to updated))) return true
+        }
     }
 
     fun setConnectionProgress(machineId: String, progress: ConnectionProgress) {

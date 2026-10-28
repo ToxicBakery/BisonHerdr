@@ -5,6 +5,7 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import java.io.File
 import java.net.InetSocketAddress
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -42,7 +43,8 @@ import org.apache.sshd.server.shell.ProcessShell
  * - [INTERACTIVE_USER] with the answers of [interactivePrompts] (`keyboard-interactive` method).
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
- * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. When [allowTcpForwarding] is
+ * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
+ * in [binDirectory] before the programs of the test machine. When [allowTcpForwarding] is
  * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
@@ -72,6 +74,13 @@ internal class TestSshServer(
      */
     @Volatile
     var extraHostKeys: List<KeyPair> = emptyList()
+
+    /**
+     * A directory at the start of the `PATH` of each `exec` command, or null. A test puts a script in it, so that a
+     * command finds a program that the test machine does not have, for example `mosh-server`.
+     */
+    @Volatile
+    var binDirectory: File? = null
 
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
@@ -153,9 +162,7 @@ internal class TestSshServer(
                 username == KEY_USER && authorizedKeys.any { KeyUtils.compareKeys(it, key) }
             }
             keyboardInteractiveAuthenticator = InteractiveAuthenticator()
-            commandFactory = CommandFactory { _, command ->
-                InvertedShellWrapper(ProcessShell("env", "$NAME_VARIABLE=$name", "sh", "-c", command))
-            }
+            commandFactory = CommandFactory { _, command -> InvertedShellWrapper(ProcessShell(shellCommand(command))) }
             forwardingFilter = if (allowTcpForwarding) {
                 AcceptAllForwardingFilter.INSTANCE
             } else {
@@ -196,6 +203,14 @@ internal class TestSshServer(
         authMethod = authMethod,
         transportMode = transportMode,
     )
+
+    /** Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], and [binDirectory] on the `PATH`. */
+    private fun shellCommand(command: String): List<String> = buildList {
+        add("env")
+        add("$NAME_VARIABLE=$name")
+        binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
+        addAll(listOf("sh", "-c", command))
+    }
 
     private inner class InteractiveAuthenticator : KeyboardInteractiveAuthenticator {
         override fun generateChallenge(

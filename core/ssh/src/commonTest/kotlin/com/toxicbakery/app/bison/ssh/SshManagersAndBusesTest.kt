@@ -236,4 +236,28 @@ class SshManagersAndBusesTest {
         stateManager.markMachineConnected("workbox", ActiveBackbone.SshEndpoint(rttMs = 10))
         assertTrue(stateManager.needsUser.value.isEmpty())
     }
+
+    @Test
+    fun setRoundTripTimeChangesOnlyTheBackboneOfAConnectedMachine() {
+        val stateManager = SshStateManager()
+        val reason = "The host has mosh-server"
+
+        // A machine with no backbone does not get one.
+        assertFalse(stateManager.setRoundTripTime("workbox", 42))
+        assertNull(stateManager.activeTransportBackbone.value["workbox"])
+
+        stateManager.markMachineConnected("workbox", ActiveBackbone.SshEndpoint(rttMs = 0, fallbackReason = reason))
+        assertTrue(stateManager.setRoundTripTime("workbox", 42))
+        assertEquals(
+            ActiveBackbone.SshEndpoint(rttMs = 42, fallbackReason = reason),
+            stateManager.activeTransportBackbone.value["workbox"],
+        )
+
+        // The same value is no change.
+        assertFalse(stateManager.setRoundTripTime("workbox", 42))
+
+        stateManager.markMachineDisconnected("workbox")
+        assertFalse(stateManager.setRoundTripTime("workbox", 50))
+        assertNull(stateManager.activeTransportBackbone.value["workbox"])
+    }
 }

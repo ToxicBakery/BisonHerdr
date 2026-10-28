@@ -43,6 +43,10 @@ import kotlinx.coroutines.withContext
  * of the machine, because machines can share a key alias. [authenticate] waits for the answer for
  * [USER_AUTH_TIMEOUT_MS] at most. The bastion of a ProxyJump machine logs in with the same key, so the one
  * prompt also unlocks the bastion login.
+ *
+ * The backbone is always [ActiveBackbone.SshEndpoint], because this version has no Mosh transport (issue #22). The
+ * client measures the round trips of the poll, and the backend puts their average in the backbone with
+ * [SshStateManager.setRoundTripTime].
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -76,6 +80,10 @@ class RealSshBackend internal constructor(
         sshStateManager = sshStateManager,
         keystoreKeyManager = keystoreKeyManager,
     )
+
+    init {
+        client.roundTripListener = sshStateManager::setRoundTripTime
+    }
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
         val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
@@ -116,26 +124,21 @@ class RealSshBackend internal constructor(
         )
     }
 
-    override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone {
+    /**
+     * Returns the SSH endpoint bridge for each [TransportMode], because this version has no Mosh transport
+     * (issue #22). When the mode permits Mosh, the backend checks for `mosh-server` on the host, and puts
+     * [MoshSessionEngine.MOSH_SERVER_FOUND] in [ActiveBackbone.SshEndpoint.fallbackReason] when the host has it.
+     *
+     * The round trip time is [UNMEASURED_RTT_MS] until the poll measures the first round trip.
+     */
+    override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone.SshEndpoint {
         sshStateManager.setConnectionProgress(machine.id, ConnectionProgress.VerifyingUdpOrHello)
-        val hasMosh = if (machine.transportMode != TransportMode.SshEndpointOnly) {
+        val hasMoshServer = machine.transportMode != TransportMode.SshEndpointOnly &&
             client.checkMoshServerAvailable(machine, route)
-        } else {
-            false
-        }
-        return if (hasMosh) {
-            ActiveBackbone.MoshUdp(
-                udpPort = machine.parsedMoshPortRange().first,
-                rttMs = 9,
-                localEchoEnabled = true,
-                roamedCount = 0,
-            )
-        } else {
-            ActiveBackbone.SshEndpoint(
-                rttMs = 12,
-                fallbackReason = null,
-            )
-        }
+        return ActiveBackbone.SshEndpoint(
+            rttMs = UNMEASURED_RTT_MS,
+            fallbackReason = if (hasMoshServer) MoshSessionEngine.MOSH_SERVER_FOUND else null,
+        )
     }
 
     override suspend fun openSurface(
@@ -198,6 +201,9 @@ class RealSshBackend internal constructor(
          * of common SSH servers (120 seconds for OpenSSH), so that the server has not closed the connection yet.
          */
         val KEYBOARD_INTERACTIVE_TIMEOUT: Duration = 90.seconds
+
+        /** The round trip time of a new backbone. It tells that the client did not measure a round trip yet. */
+        const val UNMEASURED_RTT_MS: Int = 0
 
         /** JSch starts the message of a refused login with one of these texts. */
         private val AUTH_FAILURE_PREFIXES = listOf("Auth fail", "Auth cancel")
