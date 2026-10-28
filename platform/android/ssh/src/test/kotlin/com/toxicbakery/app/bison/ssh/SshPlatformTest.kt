@@ -110,7 +110,7 @@ class SshPlatformTest {
     }
 
     @Test
-    fun proxyJumpTunnelDetectsTailscaleAndBuildsDirectTcpIpPayload() {
+    fun proxyJumpTunnelDetectsTailscaleAndRoutesThroughTheBastion() {
         val tunnel = ProxyJumpTunnel()
         assertTrue(tunnel.isTailscaleAddress("100.64.0.12"))
         assertTrue(tunnel.isTailscaleAddress("workbox.tailnet.ts.net"))
@@ -133,8 +133,17 @@ class SshPlatformTest {
         assertTrue(route.viaBastion)
         assertTrue(route.isTailscaleMesh)
         assertEquals("bastion.tailnet.ts.net", route.entryHost)
+        assertEquals(22, route.entryPort)
+        assertEquals("jump", route.entryUsername)
         assertEquals("10.0.0.42", route.targetHost)
-        assertNotNull(route.directTcpIpPayload)
+        assertEquals(2222, route.targetPort)
+        assertEquals("ian", route.targetUsername)
+        assertEquals("jump@bastion.tailnet.ts.net:22", route.bastionAddress)
+        assertEquals("10.0.0.42:2222", route.targetAddress)
+
+        // A blank bastion user gives the user of the machine.
+        val blankUser = machine.copy(proxyJump = machine.proxyJump?.copy(bastionUser = "  "))
+        assertEquals("ian", tunnel.resolveRoute(blankUser).entryUsername)
     }
 
     @Test

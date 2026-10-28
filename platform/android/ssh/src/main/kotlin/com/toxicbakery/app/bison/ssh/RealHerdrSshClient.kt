@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
+import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SocketFactory
 import com.toxicbakery.app.bison.model.HostMachine
@@ -88,6 +89,11 @@ import kotlinx.serialization.json.put
  * A password machine keeps a [SecretRef] value. The client reads the password from [secretStore] before each
  * connection, and clears its copy after the connection. A missing password stops the session with a
  * [MissingSecretException] before the client opens a connection.
+ *
+ * A machine with a ProxyJump bastion gets two sessions. The client logs in to the bastion first, with the bastion
+ * user and the credentials of the machine. It then logs in to the target over a `direct-tcpip` channel of the
+ * bastion session ([BastionChannelProxy]), and runs all commands on the target. Each session checks the host key of
+ * its own `host:port`.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -198,7 +204,16 @@ internal class RealHerdrSshClient(
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val knownHostsRepository = KnownHostsRepository(knownHostsStore)
+
+    /** The session to the target of each machine. All commands use this session. */
     private val sessions = ConcurrentHashMap<String, Session>()
+
+    /**
+     * The bastion session of each machine with a ProxyJump bastion. The session of the machine in [sessions] sends
+     * all of its data over a channel of this session. Thus [liveSession] gives a session only while its bastion
+     * session is open, and [closeSessions] closes the target session first.
+     */
+    private val bastionSessions = ConcurrentHashMap<String, Session>()
     private val sessionOpenLocks = ConcurrentHashMap<String, Mutex>()
     private val inputLaneLocks = ConcurrentHashMap<String, Mutex>()
     private val pollLaneLocks = ConcurrentHashMap<String, Mutex>()
@@ -273,7 +288,7 @@ internal class RealHerdrSshClient(
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "RealSSH",
-                message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
+                message = "Connected to ${describeRoute(route)} (${out.trim().ifBlank { "SSH ok" }})",
             )
         }.onFailure { err ->
             val errDetail = err.message?.takeIf { it.isNotBlank() }
@@ -282,7 +297,7 @@ internal class RealHerdrSshClient(
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "RealSSH",
-                message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
+                message = "SSH connection failed to ${describeFailedEndpoint(route, err)}: $errDetail",
                 isError = true,
             )
         }
@@ -363,8 +378,34 @@ internal class RealHerdrSshClient(
         viewportSizes.remove(machineId)
         inputWorkers.remove(machineId)?.close()
         pollWorkers.remove(machineId)?.close()
-        sessions.remove(machineId)?.let { session ->
-            runCatching { session.disconnect() }
+        closeSessions(machineId)
+    }
+
+    /**
+     * Returns true when [machineId] has an open session. A session through a bastion is open only while its bastion
+     * session is open too.
+     */
+    internal fun hasLiveSession(machineId: String): Boolean = liveSession(machineId) != null
+
+    /** Returns the `host:port` text of the target of [route], and the bastion when the route has one. */
+    private fun describeRoute(route: ResolvedSshRoute): String =
+        if (route.viaBastion) {
+            "${route.targetAddress} via bastion ${route.bastionAddress}"
+        } else {
+            route.targetAddress
+        }
+
+    /**
+     * Returns the text that names the endpoint of [route] where [error] occurred: the bastion, or the target.
+     * A bastion error is a [BastionConnectException], or a host key rejection for the `host:port` of the bastion.
+     */
+    private fun describeFailedEndpoint(route: ResolvedSshRoute, error: Throwable): String {
+        val rejected = (error as? HostKeyRejectedException)?.rejection?.presented
+        val onBastion = error is BastionConnectException || rejected?.isFor(route.entryHost, route.entryPort) == true
+        return if (route.viaBastion && onBastion) {
+            "bastion ${route.bastionAddress} of ${route.targetAddress}"
+        } else {
+            describeRoute(route)
         }
     }
 
@@ -1413,17 +1454,13 @@ internal class RealHerdrSshClient(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Session {
-        val fastExisting = sessions[machine.id]
-        if (fastExisting != null && fastExisting.isConnected) {
-            return fastExisting
-        }
+        liveSession(machine.id)?.let { return it }
         return sessionMutexFor(machine.id).withLock {
-            val existing = sessions[machine.id]
-            if (existing != null && existing.isConnected) {
-                return@withLock existing
-            }
+            liveSession(machine.id)?.let { return@withLock it }
             inputWorkers.remove(machine.id)?.close()
             pollWorkers.remove(machine.id)?.close()
+            // Close the old sessions. When the bastion session is dead, the target session is dead too.
+            closeSessions(machine.id)
             // The host key check reads only the loaded entries.
             knownHostsStore.awaitLoaded()
             JschAndroidCrypto.installGlobalDefaults()
@@ -1445,33 +1482,126 @@ internal class RealHerdrSshClient(
                 is SshAuthMethod.HardwareSecurityKey ->
                     throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
             }
-            val session = jsch.getSession(
-                route.entryUsername.ifBlank { machine.username },
-                route.entryHost,
-                route.entryPort,
-            )
             val password = (machine.authMethod as? SshAuthMethod.Password)?.let { resolvePassword(machine, it) }
-            password?.let(session::setPassword)
-            val props = Properties().apply {
-                put("PreferredAuthentications", preferredAuths)
-                put("Compression", "none")
-            }
-            session.setConfig(props)
-            session.setSocketFactory(LowLatencySocketFactory)
-            runCatching {
-                session.setServerAliveInterval(10_000)
-                session.setServerAliveCountMax(3)
-            }
-            JschAndroidCrypto.configureSession(session)
             try {
-                knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
+                // The bastion uses the same password or key as the machine.
+                val bastion = if (route.viaBastion) connectBastion(jsch, route, password, preferredAuths) else null
+                val session = try {
+                    connectTarget(jsch, route, bastion, password, preferredAuths)
+                } catch (error: Throwable) {
+                    bastion?.let { runCatching { it.disconnect() } }
+                    throw error
+                }
+                bastion?.let { bastionSessions[machine.id] = it }
+                sessions[machine.id] = session
+                session
             } finally {
                 // JSch keeps its own copy, and clears it after the login.
                 password?.fill(0)
             }
-            sessions[machine.id] = session
-            session
         }
+    }
+
+    /**
+     * Returns the open session of [machineId], or null. A session through a bastion is open only while its bastion
+     * session is open too, because the bastion session carries all of its data.
+     */
+    private fun liveSession(machineId: String): Session? {
+        val session = sessions[machineId]?.takeIf { it.isConnected } ?: return null
+        val bastion = bastionSessions[machineId]
+        return session.takeIf { bastion == null || bastion.isConnected }
+    }
+
+    /** Closes the session of [machineId] first, and then its bastion session. */
+    private fun closeSessions(machineId: String) {
+        sessions.remove(machineId)?.let { runCatching { it.disconnect() } }
+        bastionSessions.remove(machineId)?.let { runCatching { it.disconnect() } }
+    }
+
+    /** Returns a new session with the settings that the bastion session and the target session use. */
+    private fun newSession(
+        jsch: JSch,
+        username: String,
+        host: String,
+        port: Int,
+        password: ByteArray?,
+        preferredAuths: String,
+    ): Session {
+        val session = jsch.getSession(username, host, port)
+        password?.let(session::setPassword)
+        val props = Properties().apply {
+            put("PreferredAuthentications", preferredAuths)
+            put("Compression", "none")
+        }
+        session.setConfig(props)
+        runCatching {
+            session.setServerAliveInterval(SERVER_ALIVE_INTERVAL_MS)
+            session.setServerAliveCountMax(SERVER_ALIVE_COUNT_MAX)
+        }
+        JschAndroidCrypto.configureSession(session)
+        return session
+    }
+
+    /**
+     * Logs in to the bastion of [route] as [ResolvedSshRoute.entryUsername]. The host key check uses the `host:port`
+     * of the bastion, so an unknown bastion key gives a [HostKeyRejectedException] for the bastion.
+     *
+     * Each other JSch error becomes a [BastionConnectException] that names the bastion.
+     */
+    private fun connectBastion(
+        jsch: JSch,
+        route: ResolvedSshRoute,
+        password: ByteArray?,
+        preferredAuths: String,
+    ): Session {
+        val bastion = newSession(
+            jsch = jsch,
+            username = route.entryUsername,
+            host = route.entryHost,
+            port = route.entryPort,
+            password = password,
+            preferredAuths = preferredAuths,
+        )
+        bastion.setSocketFactory(LowLatencySocketFactory)
+        try {
+            knownHostsRepository.connect(bastion, SOCKET_CONNECT_TIMEOUT_MS)
+        } catch (error: JSchException) {
+            throw BastionConnectException(route.bastionAddress, error)
+        }
+        return bastion
+    }
+
+    /**
+     * Logs in to the target of [route] as [ResolvedSshRoute.targetUsername]. With a [bastion], the session sends its
+     * data over a `direct-tcpip` channel of [bastion] ([BastionChannelProxy]). In the two cases the session has the
+     * `host:port` of the target, so the host key check uses the target.
+     */
+    private fun connectTarget(
+        jsch: JSch,
+        route: ResolvedSshRoute,
+        bastion: Session?,
+        password: ByteArray?,
+        preferredAuths: String,
+    ): Session {
+        val session = newSession(
+            jsch = jsch,
+            username = route.targetUsername,
+            host = route.targetHost,
+            port = route.targetPort,
+            password = password,
+            preferredAuths = preferredAuths,
+        )
+        if (bastion == null) {
+            session.setSocketFactory(LowLatencySocketFactory)
+            knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
+        } else {
+            val proxy = BastionChannelProxy(bastion, route.bastionAddress)
+            session.setProxy(proxy)
+            knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
+            // A socket gets the session timeout after the login. Give the same read timeout to the channel.
+            proxy.readTimeoutMs = session.timeout
+        }
+        return session
     }
 
     /**
@@ -2322,6 +2452,8 @@ internal class RealHerdrSshClient(
 
     companion object {
         private const val SOCKET_CONNECT_TIMEOUT_MS = 6_000
+        private const val SERVER_ALIVE_INTERVAL_MS = 10_000
+        private const val SERVER_ALIVE_COUNT_MAX = 3
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
         private const val IPTOS_LOWDELAY = 0x10
         private const val LIVE_POLL_INTERVAL_MS = 400L

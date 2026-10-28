@@ -40,8 +40,9 @@ import org.apache.sshd.server.shell.ProcessShell
  *   software keys.
  * - [INTERACTIVE_USER] with the answers of [interactivePrompts] (`keyboard-interactive` method).
  *
- * An `exec` request runs `sh -c <command>` on the test machine. When [allowTcpForwarding] is true, the
- * server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion.
+ * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
+ * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. When [allowTcpForwarding] is
+ * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
  * client sent no credentials, for example after a host key check stopped the connection.
@@ -50,6 +51,7 @@ internal class TestSshServer(
     val keyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
     val keyAlgorithm: KeyAlgorithm = KeyAlgorithm.Ed25519,
     private val allowTcpForwarding: Boolean = false,
+    val name: String = "test-ssh-server",
 ) : AutoCloseable {
 
     /** One `keyboard-interactive` prompt and the answer that the server accepts. */
@@ -82,6 +84,10 @@ internal class TestSshServer(
     /** The number of login requests that got to an authenticator of the server, for all users and methods. */
     val credentialChecks: Int
         get() = credentialCheckCount.get()
+
+    /** The number of open sessions on the server. It is 0 when the server is stopped. */
+    val activeSessionCount: Int
+        get() = sshd?.activeSessions?.size ?: 0
 
     /** The port of the server. It is 0 until the first [start]. */
     var port: Int = 0
@@ -135,7 +141,9 @@ internal class TestSshServer(
                 username == KEY_USER && authorizedKeys.any { KeyUtils.compareKeys(it, key) }
             }
             keyboardInteractiveAuthenticator = InteractiveAuthenticator()
-            commandFactory = CommandFactory { _, command -> InvertedShellWrapper(ProcessShell("sh", "-c", command)) }
+            commandFactory = CommandFactory { _, command ->
+                InvertedShellWrapper(ProcessShell("env", "$NAME_VARIABLE=$name", "sh", "-c", command))
+            }
             forwardingFilter = if (allowTcpForwarding) {
                 AcceptAllForwardingFilter.INSTANCE
             } else {
@@ -206,6 +214,9 @@ internal class TestSshServer(
         const val KEY_USER: String = "bison-key"
         const val KEY_ALIAS: String = "test_ssh_server_key"
         const val INTERACTIVE_USER: String = "bison-interactive"
+
+        /** The environment variable that has the [name] of the server for each `exec` command. */
+        const val NAME_VARIABLE: String = "BISON_TEST_SSH_SERVER"
 
         /** Makes a new in-memory `ecdsa-sha2-nistp256` host key. */
         fun newHostKey(): KeyPair =
