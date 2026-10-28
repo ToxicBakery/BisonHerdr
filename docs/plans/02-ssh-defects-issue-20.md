@@ -48,6 +48,19 @@ Android documentation, and the libraries. The results are in the items below.
 | Hardware keys (item 5) | Hide the option now. Open one issue for FIDO2 `sk-*` keys with yubikit-android. | Real support is five to seven engineer-days, needs a physical YubiKey, and blocks no other fix. Only yubikit can sign for the `ssh:` relying party. Platform passkey APIs cannot. |
 | Rust core (item 13) | Do not build it. Delete the prototype crates and the vendored `libghostty-vt`. Keep `rust/herdr-protocol` as a tested reference crate. Correct the documents. | The Mosh code is a codec, not a transport, and a real `mosh-server` rejects its packets. A working Mosh path is about 29 engineer-days. The SSH path with items 10 and 11 meets both mission goals. |
 
+## Review corrections
+
+A review of this plan found six defects. The items below include the corrections.
+
+| Item | Defect | Correction |
+|------|--------|------------|
+| 2 | The plan does not remove a secret when the user deletes a machine. It does not keep the secret when an edit leaves the password field empty. | Add both rules. |
+| 4 | `SimulatedSshBackend` in `:core:fake-server` must call `MoshUdpEngine`, which is in `:platform:android:ssh`. A `:core:*` module must not import from `:platform:*`. | Put `SimulatedSshBackend` in the `src/debug` source set of `:platform:android:ssh`. |
+| 9 | A local port forward opens a listener on `127.0.0.1`. Any app on the device can use it to get to the target network through the bastion. | Use a `direct-tcpip` channel on the bastion session as a JSch `Proxy`. |
+| 10 | The reconnect loop retries all failures. A changed host key or a failed login retries forever. | Retry only network failures. Stop the loop on all other failures. |
+| 14 | `replay = 1` on the shared request flow replays the last request of any type, for example a `Disconnect`. | Use a buffered `Channel` for the requests. |
+| 15 | `BisonSessionService.kt:326` passes `FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE` to `startForeground`. The call throws when the manifest drops that type. | Change the call to `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` only. |
+
 ## Security
 
 ### 1. Host-key check
@@ -122,7 +135,9 @@ quarantine copy `machines.json.corrupt.<epoch>` can also hold a plain-text passw
    `javax.crypto` AES key and the same file format.
 5. `ConfigureMachineViewModel` stores the password through `SecretStore` and
    writes `secret:<ref>` into `encryptedPasswordRef`. On edit, the field shows a
-   placeholder, not the password.
+   placeholder, not the password. When the user saves an edit with an empty
+   password field, keep the stored secret. When the user deletes a machine, call
+   `SecretStore.remove` for its reference.
 6. `RealHerdrSshClient` resolves the reference through `SecretStore` before
    `setPassword`. Clear the byte array after `connect`.
 7. Add a one-time migration: on load, if `encryptedPasswordRef` has no `secret:`
@@ -162,8 +177,9 @@ quarantine copy `machines.json.corrupt.<epoch>` can also hold a plain-text passw
 
 **Tests.** Round trip through the store, `get` of an unknown reference returns
 `null`, migration of an old `machines.json`, the restore marker sets the flag,
-the validator marks a machine with no secret, and a password login against the
-in-process server.
+the validator marks a machine with no secret, an edit with an empty password field
+keeps the secret, a machine delete removes its secret, and a password login
+against the in-process server.
 
 ### 3. Software key fallback on a device
 
@@ -199,11 +215,15 @@ branches each carry a full simulated implementation.
 
 1. Extract an `SshBackend` interface from `SshTransportManager`: `authenticate`,
    `negotiateBackbone`, `openSurface`, `sendInput`, `disconnect`, and the other
-   calls that today branch on `shouldUseRealSsh`.
+   calls that today branch on `shouldUseRealSsh`. Put the interface in `src/main`
+   of `:platform:android:ssh`.
 2. Move the real branches into `RealSshBackend`, which wraps `RealHerdrSshClient`.
-3. Move the simulated branches into `SimulatedSshBackend` in `:core:fake-server`.
-   Keep the test hooks (`moshBootstrapBannerProvider` and the others) on that class
-   only.
+3. Move the simulated branches into `SimulatedSshBackend` in the `src/debug` source
+   set of `:platform:android:ssh`. Do not put it in `:core:fake-server`: the
+   simulated branches call `MoshUdpEngine`, and a `:core:*` module must not import
+   from `:platform:*`. The release variant of the library does not compile the
+   `src/debug` source set, so release builds do not contain the class. Keep the test
+   hooks (`moshBootstrapBannerProvider` and the others) on that class only.
 4. `SshTransportManager` takes the backend by constructor. The debug `DebugModule`
    binds a selector that uses `SimulatedSshBackend` only for machines that the
    fake server made. The release `DebugModule` binds `RealSshBackend` only.
@@ -212,7 +232,8 @@ branches each carry a full simulated implementation.
    example confuses users. A `.ts.net` host is now a real host.
 
 **Tests.** Update `ConnectionPathsE2ETest` and `SshPlatformTest` to construct
-`SimulatedSshBackend` directly. Add a test that a `.ts.net` host resolves to
+`SimulatedSshBackend` directly. Move them to `src/testDebug`, because
+`testReleaseUnitTest` cannot see the `src/debug` source set. Add a test that a `.ts.net` host resolves to
 `RealSshBackend` in the release bindings.
 
 ## Authentication
@@ -355,21 +376,28 @@ authenticator with two prompts, and assert that the UI receives both.
 `route.entryHost` (`RealHerdrSshClient.kt:1404-1408`). No code uses
 `directTcpIpPayload`.
 
-**Fix.** Use JSch local port forwarding. It is the simplest path with JSch and it
-needs no custom `Proxy`.
+**Fix.** Use a `direct-tcpip` channel on the bastion session as a JSch `Proxy`. Do
+not use local port forwarding: `setPortForwardingL` opens a listener on
+`127.0.0.1`, and any app on the device can connect to it and get to the target
+network through the bastion.
 
 1. In `getOrOpenSession`, when `route.viaBastion` is `true`, open a bastion
    session first with the bastion user and the same identity. Apply the host-key
    check from item 1.
-2. Call `bastion.setPortForwardingL("127.0.0.1", 0, route.targetHost, route.targetPort)`.
-   The call returns the bound local port.
-3. Open the target session to `127.0.0.1:<port>` with the target user. Register
-   the host key under `route.targetHost:route.targetPort`, not under the local
-   address.
+2. Add a `BastionChannelProxy` that implements `com.jcraft.jsch.Proxy`. Its
+   `connect` opens a `ChannelDirectTCPIP` on the bastion session with
+   `setHost(route.targetHost)` and `setPort(route.targetPort)`. Its
+   `getInputStream` and `getOutputStream` return the channel streams. Its
+   `getSocket` returns `null`. Its `close` disconnects the channel.
+3. Open the target session with
+   `jsch.getSession(targetUser, route.targetHost, route.targetPort)`, and call
+   `session.setProxy(BastionChannelProxy(...))`. The session has the real target
+   host name, so the host-key check from item 1 uses
+   `route.targetHost:route.targetPort` with no extra code.
 4. Keep the bastion session in a second map. `disconnect` closes the target and
    then the bastion. When the bastion dies, mark the target dead too.
-5. Delete `directTcpIpPayload` and `buildDirectTcpIpChannelPayload`. Update the
-   tests that assert on them.
+5. Delete `directTcpIpPayload` and `buildDirectTcpIpChannelPayload`. JSch makes
+   the channel request. Update the tests that assert on them.
 
 **Tests.** With two in-process servers: a login via the bastion runs `hostname`
 on the target. A failed bastion login gives an error that names the bastion.
@@ -387,17 +415,24 @@ backoff and no status (`RealHerdrSshClient.kt:296-311`, `1371-1383`).
    session and runs a reconnect loop: delays of 1, 2, 4, 8, 16, and 30 s, each with
    random jitter of up to 25 percent, with no upper count while the machine stays in
    the connected set.
-2. `getOrOpenSession` no longer opens a session on demand. When the session is
+2. Put each connect failure into one of two classes. Retry only a network failure:
+   a timeout, a refused connection, an unknown host name, or a closed socket. Stop
+   the loop on all other failures: a changed or unknown host key (item 1), a failed
+   login, a missing key (item 7), an expired biometric unlock (item 6), and a
+   keyboard-interactive prompt with no UI (item 8). For these, set a "needs user"
+   state on the machine and show the cause. A user connect starts the loop again.
+3. `getOrOpenSession` no longer opens a session on demand. When the session is
    dead, it suspends until the supervisor has a new one, or fails after one loop
    step when the caller is a user input.
-3. The supervisor sets `RoamingStatus.RoamingReconnect` on the first failure and
+4. The supervisor sets `RoamingStatus.RoamingReconnect` on the first failure and
    `Healthy` after a successful reconnect. The poll loop pauses while the status is
    `RoamingReconnect`.
-4. After a reconnect, send `client_shell.surface.set { active: true }` again and
+5. After a reconnect, send `client_shell.surface.set { active: true }` again and
    resync the surface. Replay the queued prompts through `flushOfflinePrompts`.
 
 **Tests.** With the in-process server: stop the server, assert the status
-changes, start the server, assert the session comes back and a command runs.
+changes, start the server, assert the session comes back and a command runs. A
+wrong password stops the loop after one attempt and sets the "needs user" state.
 
 ### 11. Network changes
 
@@ -540,8 +575,12 @@ reference for the Herdr wire types.
 3. Return `START_NOT_STICKY`. A restart with no session has no work.
 4. The `SharedFlow` in `SshRequestManager` has a buffer of 64 and no replay. When
    the service is not running, a request is lost. Change the activity so that it
-   starts the service and then emits, and give the flow `replay = 1` for
-   `Connect` requests.
+   starts the service and then emits. Make sure that the service is the only
+   collector. Then replace the `SharedFlow` with a `Channel(capacity = 64)` and
+   expose it with `receiveAsFlow()`, so that a request waits in the channel until
+   the service collects it. Do not use `replay = 1`: the flow carries all request
+   types, and a replay sends the last request again, for example a `Disconnect`,
+   to each new collector.
 
 **Tests.** A Robolectric test is not in the project. Add a unit test for the
 30 s timer logic in a small `ServiceStopPolicy` class.
@@ -563,6 +602,9 @@ at runtime. The notification has only agent actions
 3. Set `android:foregroundServiceType="specialUse"` only. Remove
    `FOREGROUND_SERVICE_CONNECTED_DEVICE`. Keep the subtype text, and shorten it to
    one clause: "Keeps SSH terminal sessions open in the background".
+   Change the `startForeground` call in `BisonSessionService.kt:323-327` to pass
+   only `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`. The call throws when it passes a
+   type that the manifest does not declare.
 4. Remove the `NFC` permission and the `nfc` and `usb.host` features with item 5.
 
 **Tests.** A manifest assertion in the existing `app` unit tests, if present, or a
@@ -614,6 +656,17 @@ every later fix has a test against a real server.
 | 10 | `fix/hide-hardware-key` | 5, and the `NFC` part of 15 |
 | 11 | `fix/session-service-lifecycle` | 14, 15 |
 | 12 | `chore/rust-core-status` | 13 |
+
+Pull request 1 goes first and alone. After it merges, four lanes run in parallel.
+Each pull request in a lane starts from the latest `main`, and merges only after a
+separate verification and a green CI run.
+
+| Lane | Pull requests in order |
+|------|------------------------|
+| Session | 2, 3, 5, 6, 7, 9 |
+| Keys | 4, 8 |
+| App | 10, 11 |
+| Rust | 12 |
 
 Open two issues for the work that this plan defers: "FIDO2 security keys"
 (item 5) and "Mosh UDP backbone" (item 13). Both items above give the content.
