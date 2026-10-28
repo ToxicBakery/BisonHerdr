@@ -50,4 +50,41 @@ sealed interface SshAuthResult {
         val message: String
             get() = MissingKeyException.messageFor(keyAlias)
     }
+
+    /**
+     * The key [keyAlias] needs a user authentication with a strong biometric or the device screen lock, and the
+     * key is locked. Only the user can unlock it, so a reconnect loop must stop and wait for the user. It is not a
+     * [NetworkError]. A user connect from the app shows the prompt again.
+     *
+     * [promptOutcome] is the result of the prompt of this login, or null when the login showed no prompt.
+     * [keyAlias] is null when the error did not name the key.
+     */
+    data class UserAuthRequired(
+        val keyAlias: String?,
+        val promptOutcome: UserAuthOutcome? = null,
+    ) : SshAuthResult {
+        /** The text that tells the user what occurred and what to do. */
+        val message: String
+            get() {
+                val key = keyAlias?.let { "The key $it" } ?: "The SSH key"
+                return when (promptOutcome) {
+                    null -> "$key needs a user authentication. Connect again from the app."
+                    UserAuthOutcome.NoUi ->
+                        "$key needs a user authentication, but the app is in the background. " +
+                            "Open the app and connect again."
+                    UserAuthOutcome.Cancelled -> "The user authentication for ${key.lowercaseKey()} was cancelled."
+                    is UserAuthOutcome.Failed ->
+                        "The user authentication for ${key.lowercaseKey()} failed: ${promptOutcome.reason}"
+                    UserAuthOutcome.TimedOut ->
+                        "The user authentication for ${key.lowercaseKey()} did not complete in the time limit."
+                    // The key is still locked after the prompt. A key from an earlier version needs a
+                    // user authentication for each sign, and this version cannot give that.
+                    UserAuthOutcome.Confirmed ->
+                        "$key is still locked after the user authentication. Make a new key in the machine " +
+                            "settings, and add the new public key to the host."
+                }
+            }
+
+        private fun String.lowercaseKey(): String = replaceFirstChar { it.lowercaseChar() }
+    }
 }
