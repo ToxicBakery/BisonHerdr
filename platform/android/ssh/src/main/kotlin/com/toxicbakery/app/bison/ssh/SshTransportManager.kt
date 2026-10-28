@@ -876,15 +876,15 @@ class SshTransportManager(
         /**
          * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet
          * `HERDR_CONFIG_PATH` config, and launches `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`.
-         * No code runs this command in this version. Issue #22 adds the Mosh path.
+         * No code runs this command in this version. Issue #22 adds the Mosh path. The `herdr` command selects the
+         * Herdr session of the machine. See [HerdrCommand].
          */
         fun buildMoshServerBootstrapCommand(machine: HostMachine): String {
             val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
             val portRange = machine.moshUdpPortRange.ifBlank { HostMachine.DEFAULT_MOSH_UDP_PORT_RANGE }
-            val sessionArg = machine.herdrSessionName?.takeIf { it.isNotBlank() }?.let { " --session $it" }.orEmpty()
             return "command -v $moshBin >/dev/null 2>&1 && " +
                 "$moshBin new -s -c 256 -l LANG=en_US.UTF-8 -p $portRange -- " +
-                "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
+                "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH ${HerdrCommand.of(machine)}"
         }
 
         /** Returns the error response line of [request] with the code [NO_RESPONSE_CODE] and [message]. */

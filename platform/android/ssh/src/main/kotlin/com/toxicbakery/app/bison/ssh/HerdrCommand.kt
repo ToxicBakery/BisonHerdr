@@ -6,9 +6,9 @@ import com.toxicbakery.app.bison.model.HostMachine
  * Makes the start of each `herdr` command that the app runs on a host.
  *
  * Each Herdr session has its own API socket. A named session keeps its socket in `sessions/<name>/herdr.sock` in the
- * Herdr configuration directory. A `herdr` command without `--session` uses the socket of the default session. Thus
- * each `herdr` command for a machine with [HostMachine.herdrSessionName] must have the flag. This rule also applies to
- * each `herdr remote-api-bridge` call.
+ * Herdr configuration directory. Without `--session`, Herdr uses `HERDR_SOCKET_PATH`, then `HERDR_SESSION`, then the
+ * default session. Thus each `herdr` command for a machine with [HostMachine.herdrSessionName] must have the flag.
+ * This rule also applies to each `herdr remote-api-bridge` call.
  *
  * Herdr removes `--session <name>` from the arguments before it reads the subcommand (`configure_from_args` in
  * `src/session.rs` of Herdr 0.9.5). With the flag, Herdr ignores `HERDR_SOCKET_PATH` and `HERDR_SESSION` in the

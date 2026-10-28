@@ -92,6 +92,7 @@
     <string name="machine_field_mosh_path_label">Custom mosh-server Path (Optional)</string>
     <string name="machine_transport_mosh_planned_hint">This version connects each machine over SSH. Mosh UDP is planned for a later version. The app only checks if the host has mosh-server.</string>
     <string name="machine_field_mosh_ports_label">Mosh UDP Port Range (planned)</string>
+    <string name="machine_field_herdr_session_invalid">Use only the letters A to Z and a to z, the digits 0 to 9, dots, underscores, and hyphens. Use a maximum of 64 characters. Herdr does not accept the names . and .. alone.</string>
     <string name="machine_field_auth_method_label">Authentication Method</string>
     <string name="machine_auth_keystore">Android Keystore Key</string>
     <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock. Set a PIN, a pattern, or a password in the device settings. Then show the public key again.</string>
