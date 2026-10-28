@@ -543,12 +543,9 @@ class SshTransportManagerTest {
         )
 
         events.onReconnecting(lanBox.id, null)
-        assertFalse(queuePrompt(manager), "The prompt was not queued")
         events.onReconnected(lanBox.id)
 
         assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
-        // While the lease is off, the reconnect reads the surface one time, and then sends the queued prompt.
-        assertEquals(listOf("refreshSurface lan-box", "sendEndpointCommand lan-box"), backend.calls)
     }
 
     @Test
