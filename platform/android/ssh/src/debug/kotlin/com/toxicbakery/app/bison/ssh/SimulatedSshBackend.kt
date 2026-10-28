@@ -14,12 +14,11 @@ import com.toxicbakery.app.bison.protocol.ClientShellPane
 import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.protocol.ClientShellTab
 import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
-import com.toxicbakery.app.bison.protocol.ClientSurfaceSize
 import com.toxicbakery.app.bison.protocol.CursorShape
 import com.toxicbakery.app.bison.protocol.CursorState
-import com.toxicbakery.app.bison.protocol.EndpointClientHello
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
 import com.toxicbakery.app.bison.protocol.SemanticNotification
@@ -28,12 +27,14 @@ import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_COLS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_ROWS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.HARDWARE_KEY_NOT_SUPPORTED
-import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildSshEndpointBridgeCommand
 import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
  * Debug [SshBackend] that simulates a Herdr host. It does not open a network connection.
@@ -41,7 +42,7 @@ import kotlinx.serialization.json.jsonPrimitive
  * The debug bindings use this backend only for the machines that the fake server made. This class is in
  * the `src/debug` source set, so the release variant does not compile it and release builds do not contain it.
  *
- * The backend gives the same backbone as [RealSshBackend]: the SSH endpoint bridge, because this version has no Mosh
+ * The backend gives the same backbone as [RealSshBackend]: the SSH session backbone, because this version has no Mosh
  * transport (issue #22). The round trip time is [SIMULATED_RTT_MS].
  *
  * The test hooks [moshServerProbe], [sshRouteProbe], and [passwordAuthenticator] change the simulated results.
@@ -135,7 +136,7 @@ class SimulatedSshBackend(
     }
 
     /**
-     * Returns the SSH endpoint bridge with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
+     * Returns the SSH session backbone with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
      * transport (issue #22). [moshServerProbe] tells if the simulated host has `mosh-server`. The fallback reason
      * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
      */
@@ -150,15 +151,10 @@ class SimulatedSshBackend(
         val reason = MoshSessionEngine.fallbackReasonFor(machine.transportMode, hasMoshServer)
         reason?.let { sshDebugLog.record(machineId = machineId, tag = "Transport", message = it) }
 
-        // SSH Endpoint Generation 1 (`herdr remote-client-bridge --idle-timeout-v1`)
-        val hello = EndpointClientHello(
-            surfaceSize = ClientSurfaceSize(cols = DEFAULT_COLS, rows = DEFAULT_ROWS),
-            surfaceActive = true,
-        )
         sshDebugLog.record(
             machineId = machineId,
-            tag = "EndpointGen1",
-            message = "Negotiated ${buildSshEndpointBridgeCommand()} (hello.generation=${hello.generation}, surfaceActive=${hello.surfaceActive})",
+            tag = SIMULATED_HOST_LOG_TAG,
+            message = "Simulated the SSH session of ${machine.displayAddress}. The simulated host runs no Herdr command.",
         )
         return ActiveBackbone.SshEndpoint(
             rttMs = SIMULATED_RTT_MS,
@@ -290,7 +286,7 @@ class SimulatedSshBackend(
                         paneId = "w1:p1",
                         rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
                         focused = true,
-                        title = "${machine.name} · SSH Endpoint Gen 1",
+                        title = "${machine.name} · Simulated SSH Session",
                         agentStatus = AgentStatus.Working,
                     ),
                     PaneSurfacePane(
@@ -309,7 +305,7 @@ class SimulatedSshBackend(
         semanticNotificationBus.updateAgentSnippet(
             machineId = machineId,
             paneId = "w1:p1",
-            snippet = "Connected to ${machine.displayAddress} via SSH Endpoint Gen 1",
+            snippet = "Connected to ${machine.displayAddress} over a simulated SSH session",
         )
         semanticNotificationBus.tryPublishNotification(
             machineId = machineId,
@@ -317,7 +313,7 @@ class SimulatedSshBackend(
                 bootId = "boot-$machineId",
                 sequence = 1u,
                 title = "Connected to ${machine.name}",
-                body = "SSH Endpoint Gen 1 active",
+                body = "Simulated SSH session",
                 paneId = "w1:p1",
                 agentName = "claude",
                 agentStatus = AgentStatus.Working,
@@ -328,14 +324,24 @@ class SimulatedSshBackend(
     /**
      * Applies a focus RPC to the simulated snapshot and surface. Returns null, because no host answers.
      */
+    /**
+     * Applies a focus RPC to the simulated snapshot, and returns a simulated success. The response names the lane
+     * that the target design gives the request ([designLaneOf]), so that a test can check the lane rules.
+     */
     override suspend fun sendEndpointCommand(
         machine: HostMachine,
         route: ResolvedSshRoute,
         request: ClientShellEndpointRequest,
         isMoshActive: Boolean,
-    ): String? {
+    ): String {
         applyFocusRpcMutation(machine.id, request)
-        return null
+        return buildJsonObject {
+            put("id", request.id)
+            putJsonObject("result") {
+                put("type", "ok")
+                put("lane", designLaneOf(request, isMoshActive))
+            }
+        }.toString()
     }
 
     /** The simulated host has no terminal, so the input has no effect. */
@@ -352,15 +358,12 @@ class SimulatedSshBackend(
     /** The simulated host has no session. */
     override fun disconnect(machineId: String) = Unit
 
-    /**
-     * Writes the debug log entry that [SshTransportManager.sendEndpointCommand] writes for an RPC on the
-     * `herdr remote-api-bridge` lane.
-     */
+    /** Writes the debug log entry that [SshTransportManager.sendEndpointCommand] writes for an RPC. */
     private fun recordApiBridgeRpc(machineId: String, request: ClientShellEndpointRequest) {
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
-            message = "[${SshTransportManager.API_BRIDGE_LANE}] ${HerdrRpcBuilder.toNdjsonLine(request).trim()}",
+            message = HerdrRpcBuilder.toNdjsonLine(request).trim(),
         )
     }
 
@@ -440,9 +443,30 @@ class SimulatedSshBackend(
         }
     }
 
-    internal companion object {
+    companion object {
         /** The round trip time of the backbone of a simulated host. */
-        const val SIMULATED_RTT_MS: Int = 24
+        internal const val SIMULATED_RTT_MS: Int = 24
+
+        /** The debug log tag of the entry that [negotiateBackbone] writes. Only this backend writes it. */
+        const val SIMULATED_HOST_LOG_TAG: String = "SimulatedHost"
+
+        /** The `herdr remote-api-bridge` lane (`herdr.sock`) of the target design. */
+        internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
+
+        /** The `herdr remote-client-bridge` lane (`herdr-client.sock`) of the target design. */
+        internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
+
+        /**
+         * Returns the lane that the target design gives [request]. In Mosh mode (issue #22), a focus RPC goes over
+         * `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]). A method that is not a
+         * `client_shell` method also goes over `herdr.sock`. Each other request goes over `herdr-client.sock`. The
+         * real backend of this version sends each request over `herdr remote-api-bridge`.
+         */
+        internal fun designLaneOf(request: ClientShellEndpointRequest, isMoshActive: Boolean): String {
+            val useApiBridge = (isMoshActive && MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode(request.method)) ||
+                !MoshBootstrapConfig.isClientShellSupportedMethod(request.method)
+            return if (useApiBridge) API_BRIDGE_LANE else CLIENT_BRIDGE_LANE
+        }
 
         private val BLANK_CELL = CellData()
     }

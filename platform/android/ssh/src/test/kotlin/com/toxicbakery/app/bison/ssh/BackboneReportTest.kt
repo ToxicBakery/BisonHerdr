@@ -28,7 +28,7 @@ import kotlinx.coroutines.withTimeout
 
 /**
  * Tests the backbone that [RealSshBackend] reports. This version has no Mosh transport (issue #22), so the backbone
- * is always the SSH endpoint bridge. Its round trip time comes from the poll of [RealHerdrSshClient].
+ * is always the SSH session backbone. Its round trip time comes from the poll of [RealHerdrSshClient].
  */
 class BackboneReportTest {
 

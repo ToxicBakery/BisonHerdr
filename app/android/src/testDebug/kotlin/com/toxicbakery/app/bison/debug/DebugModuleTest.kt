@@ -104,9 +104,9 @@ class DebugModuleTest {
     }
 
     /**
-     * Returns true when the debug log has the `EndpointGen1` entry that only [SimulatedSshBackend] writes.
+     * Returns true when the debug log has the `SimulatedHost` entry that only [SimulatedSshBackend] writes.
      * For an endpoint-only machine, [RealSshBackend] selects the backbone with no network call and no log entry.
      */
     private fun hasSimulatedEndpointLog(machineId: String): Boolean =
-        debugLog.entries.value.any { it.machineId == machineId && it.tag == "EndpointGen1" }
+        debugLog.entries.value.any { it.machineId == machineId && it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG }
 }

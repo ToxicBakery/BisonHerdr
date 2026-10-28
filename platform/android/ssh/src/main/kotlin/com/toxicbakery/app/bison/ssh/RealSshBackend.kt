@@ -125,7 +125,7 @@ class RealSshBackend internal constructor(
     }
 
     /**
-     * Returns the SSH endpoint bridge for each [TransportMode], because this version has no Mosh transport
+     * Returns the SSH session backbone for each [TransportMode], because this version has no Mosh transport
      * (issue #22). When the mode permits Mosh, the backend checks for `mosh-server` on the host. The fallback reason
      * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
      *

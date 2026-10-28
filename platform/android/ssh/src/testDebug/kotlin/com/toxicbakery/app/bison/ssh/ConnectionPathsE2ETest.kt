@@ -37,7 +37,7 @@ import kotlinx.coroutines.test.runTest
  * [AndroidKeystoreKeyManager], [SshStateManager], [EndpointSnapshotBus],
  * [PaneSurfaceBus], and [SemanticNotificationBus].
  *
- * This version has no Mosh transport (issue #22). Each path thus connects over the SSH endpoint bridge, and the
+ * This version has no Mosh transport (issue #22). Each path thus connects over the SSH session backbone, and the
  * Mosh engine starts no session.
  *
  * [SimulatedSshBackend] is in the `src/debug` source set, so these tests are in `src/testDebug`.
@@ -76,15 +76,15 @@ class ConnectionPathsE2ETest {
         )
     }
 
-    /** Returns the lane of [request] on the SSH endpoint bridge while the surface lease is on. */
+    /** Returns the lane that the target design gives [request] while the surface lease is on. */
     private fun expectedLane(request: ClientShellEndpointRequest): String =
         if (MoshBootstrapConfig.isClientShellSupportedMethod(request.method)) {
-            SshTransportManager.CLIENT_BRIDGE_LANE
+            SimulatedSshBackend.CLIENT_BRIDGE_LANE
         } else {
-            SshTransportManager.API_BRIDGE_LANE
+            SimulatedSshBackend.API_BRIDGE_LANE
         }
 
-    /** Sends [request] to [machineId] and asserts that it went on the lane of the SSH endpoint bridge. */
+    /** Sends [request] to [machineId] and asserts that the response names the lane of the target design. */
     private suspend fun Harness.assertSentOnSshEndpointLane(machineId: String, request: ClientShellEndpointRequest) {
         val response = transport.sendEndpointCommand(machineId, request)
         assertTrue(response?.contains(expectedLane(request)) == true, "Wrong lane for ${request.method}: $response")
@@ -140,7 +140,7 @@ class ConnectionPathsE2ETest {
         val initialSurface = assertNotNull(h.surfaceBus.surfaceFor("workbox-1a"))
         assertEquals(2, initialSurface.panes.size)
 
-        // 3. Focus RPCs go on the lanes of the SSH endpoint bridge and update the snapshot and the surface.
+        // 3. Focus RPCs get the lanes of the target design and update the snapshot and the surface.
         h.assertSentOnSshEndpointLane("workbox-1a", HerdrRpcBuilder.workspaceFocus("w2"))
         assertEquals("w2", h.snapshotBus.snapshotFor("workbox-1a")?.focusedWorkspaceId)
 
@@ -179,13 +179,7 @@ class ConnectionPathsE2ETest {
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "host-1b" }
         assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
-        assertTrue(
-            logs.any {
-                it.tag == "EndpointGen1" &&
-                    it.message.contains("herdr remote-client-bridge --idle-timeout-v1") &&
-                    it.message.contains("surfaceActive=true")
-            },
-        )
+        assertTrue(logs.any { it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG })
         assertNotNull(h.snapshotBus.snapshotFor("host-1b"))
         assertNotNull(h.surfaceBus.surfaceFor("host-1b"))
     }
@@ -255,13 +249,7 @@ class ConnectionPathsE2ETest {
 
         val logs = h.debugLog.entries.value.filter { it.machineId == "ssh-only-3" }
         assertTrue(logs.none { it.message == MoshSessionEngine.MOSH_SERVER_FOUND })
-        assertTrue(
-            logs.any {
-                it.tag == "EndpointGen1" &&
-                    it.message.contains("herdr remote-client-bridge --idle-timeout-v1") &&
-                    it.message.contains("surfaceActive=true")
-            },
-        )
+        assertTrue(logs.any { it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG })
     }
 
     @Test
@@ -375,7 +363,6 @@ class ConnectionPathsE2ETest {
                 bastionHost = "bastion.example.com",
                 bastionPort = 2222,
                 bastionUser = "jump",
-                tailscaleMagicDns = false,
             ),
         )
         val bastionRoute = hBastion.transport.proxyJumpTunnel.resolveRoute(bastionHost)
@@ -389,7 +376,7 @@ class ConnectionPathsE2ETest {
         assertTrue(hBastion.transport.connect(bastionHost))
         assertEquals(ConnectionProgress.Connected, hBastion.stateManager.connectionProgress.value["route-bastion"])
 
-        // Path 5C (part 1): Tailscale MagicDNS + CGNAT bastion
+        // Path 5C (part 1): A MagicDNS short name behind a CGNAT bastion. The bastion resolves the name.
         val hTailscale = Harness()
         val tailscaleHost = HostMachine(
             id = "route-tailscale",
@@ -401,18 +388,17 @@ class ConnectionPathsE2ETest {
                 bastionHost = "100.64.0.1",
                 bastionPort = 22,
                 bastionUser = "ts",
-                tailscaleMagicDns = true,
             ),
         )
         val tsRoute = hTailscale.transport.proxyJumpTunnel.resolveRoute(tailscaleHost)
         assertTrue(tsRoute.viaBastion)
         assertTrue(tsRoute.isTailscaleMesh)
         assertEquals("100.64.0.1", tsRoute.entryHost)
-        assertEquals("workbox.ts.net", tsRoute.targetHost)
+        assertEquals("workbox", tsRoute.targetHost)
         assertTrue(hTailscale.transport.connect(tailscaleHost))
         assertEquals(ConnectionProgress.Connected, hTailscale.stateManager.connectionProgress.value["route-tailscale"])
 
-        // Path 5C (part 2): Invalid bastion host (blank or unreachable) fails cleanly to ConnectionProgress.Failed
+        // Path 5C (part 2): A blank or unreachable bastion host gives ConnectionProgress.Failed
         val hBlankBastion = Harness()
         val blankBastionHost = bastionHost.copy(
             id = "route-invalid-blank",
@@ -428,7 +414,14 @@ class ConnectionPathsE2ETest {
             hBlankBastion.stateManager.connectionProgress.value["route-invalid-blank"],
         )
 
+        // The transport has no host name rule, so a `.invalid` bastion gets to the backend. The simulated backend
+        // gives the network error of the bastion. With the old rule, the cause was NeedsUserCause.Other.
         val hUnreachableBastion = Harness()
+        val probedRoutes = mutableListOf<ResolvedSshRoute>()
+        hUnreachableBastion.backend.sshRouteProbe = { _, route ->
+            probedRoutes += route
+            route.entryHost != "dead-bastion.invalid"
+        }
         val unreachableBastionHost = bastionHost.copy(
             id = "route-invalid-unreachable",
             proxyJump = ProxyJumpConfig(
@@ -441,6 +434,10 @@ class ConnectionPathsE2ETest {
         assertEquals(
             ConnectionProgress.Failed,
             hUnreachableBastion.stateManager.connectionProgress.value["route-invalid-unreachable"],
+        )
+        assertEquals(setOf("dead-bastion.invalid"), probedRoutes.map { it.entryHost }.toSet())
+        assertIs<NeedsUserCause.Unreachable>(
+            hUnreachableBastion.stateManager.needsUser.value["route-invalid-unreachable"],
         )
     }
 
@@ -466,14 +463,15 @@ class ConnectionPathsE2ETest {
         assertEquals(surfaceBeforePark.bootId, surfaceWhileParked.bootId)
         assertEquals(surfaceBeforePark.panes.size, surfaceWhileParked.panes.size)
 
-        // Path 6B: setSurfaceLease(active = true) commits presentation fence and restores Healthy
+        // Path 6B: setSurfaceLease(active = true) publishes the frame with a new presentation epoch and restores
+        // Healthy.
         h.transport.setSurfaceLease(machineId, active = true)
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(
             h.debugLog.entries.value.any {
                 it.machineId == machineId &&
                     it.tag == "PresentationFence" &&
-                    it.message.contains("endpoint.presentation.ready.v1")
+                    it.message.startsWith("Resumed: published the last frame again")
             },
         )
 
@@ -537,7 +535,7 @@ class ConnectionPathsE2ETest {
         )
         assertEquals(MoshSessionEngine.MOSH_SERVER_FOUND, workboxBackbone.fallbackReason)
 
-        // A focus RPC goes on the lane of the SSH endpoint bridge.
+        // A focus RPC gets the lane of the target design.
         h.assertSentOnSshEndpointLane("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
 
         // Verify background surface parking and wakeup presentation fence

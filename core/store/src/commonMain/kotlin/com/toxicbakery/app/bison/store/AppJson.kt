@@ -4,7 +4,7 @@ import kotlinx.serialization.json.Json
 
 /**
  * Canonical app-wide [Json] instance used for persisted JSON stores (`machines.json`, `settings.json`)
- * and Herdr Endpoint Generation 1 forward-compatible control payloads.
+ * and forward-compatible Herdr JSON payloads.
  */
 val appJson: Json = Json {
     ignoreUnknownKeys = true
