@@ -120,7 +120,7 @@ class MainActivity : FragmentActivity(), DIAware {
         // The service is the only collector of the request queue, so start it before the requests.
         // The service can stop itself while this activity is stopped.
         startSessionService()
-        // Turn the surface leases on again, so that the poll reads the panes again.
+        // Turn the surface leases on again, so that the poll reads the snapshot and the panes again.
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(
@@ -136,7 +136,7 @@ class MainActivity : FragmentActivity(), DIAware {
     override fun onStop() {
         super.onStop()
         startedActivityCounter.onActivityStopped()
-        // Turn the surface leases off, so that the poll reads no panes. The SSH sessions stay open.
+        // Turn the surface leases off, so that the poll reads no snapshot and no panes. The SSH sessions stay open.
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(
