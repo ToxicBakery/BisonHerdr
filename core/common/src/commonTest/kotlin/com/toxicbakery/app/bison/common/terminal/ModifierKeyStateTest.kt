@@ -40,9 +40,11 @@ class ModifierKeyStateTest {
     }
 
     @Test
-    fun theSpaceKeyGetsTheHerdrNameSpaceInAChord() {
+    fun theSpaceTabAndPlusKeysGetTheirHerdrNamesInAChord() {
         val ctrl = ModifierKeyState().onSingleTap(TerminalModifierKey.Ctrl)
         assertEquals("ctrl+space", ctrl.formatKeyChord(" "))
+        assertEquals("ctrl+tab", ctrl.formatKeyChord("\t"))
+        assertEquals("ctrl+plus", ctrl.formatKeyChord("+"))
         val ctrlAlt = ctrl.onSingleTap(TerminalModifierKey.Alt)
         assertEquals("ctrl+alt+space", ctrlAlt.formatKeyChord(" "))
     }

@@ -1069,7 +1069,7 @@ internal class RealHerdrSshClient(
         // Herdr drops a request line over its limit with no answer, so the client does not send it. For example, a very
         // long prompt of the composer can be over the limit.
         val requestBytes = HerdrRpcBuilder.toNdjsonLine(request).trim().encodeToByteArray().size
-        if (requestBytes >= MAX_HERDR_REQUEST_BYTES) {
+        if (requestBytes > MAX_HERDR_REQUEST_BYTES) {
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "RealSSH",
@@ -1078,6 +1078,25 @@ internal class RealHerdrSshClient(
                 isError = true,
             )
             return@withContext null
+        }
+
+        // For one unknown key name, Herdr does not accept the full key request and writes nothing. For example,
+        // "ctrl+ " has no key after the plus. The client does not send such a request.
+        if (request.method == "pane.send_keys" || request.method == "agent.send_keys") {
+            val keys = (parseParamsObject(request.paramsJson)["keys"] as? JsonArray)
+                ?.map { it.jsonPrimitive.content }
+                .orEmpty()
+            val unknownKeys = keys.filterNot(HerdrKeys::isSupportedName)
+            if (unknownKeys.isNotEmpty()) {
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "Herdr has no key named ${unknownKeys.joinToString { "\"$it\"" }}, so the client did " +
+                        "not send the ${request.method} request.",
+                    isError = true,
+                )
+                return@withContext null
+            }
         }
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
@@ -1356,14 +1375,26 @@ internal class RealHerdrSshClient(
 
             val maxSeqInBatch = batch.maxOf { it.seq }
             val targetPaneId = batch.last().paneId
-            val coalescedRpcCommands = buildCoalescedInputCommands(batch) { key ->
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "RealSSH",
-                    message = "Herdr has no key for $key. The client did not send it.",
-                    isError = true,
-                )
-            }
+            val coalescedRpcCommands = buildCoalescedInputCommands(
+                batch = batch,
+                onUnsupportedKey = { key ->
+                    sshDebugLog.record(
+                        machineId = machine.id,
+                        tag = "RealSSH",
+                        message = "Herdr has no key for $key. The client did not send it.",
+                        isError = true,
+                    )
+                },
+                onRefusedPaste = { requestBytes ->
+                    sshDebugLog.record(
+                        machineId = machine.id,
+                        tag = "RealSSH",
+                        message = "The paste request has $requestBytes bytes. The app does not send a paste over " +
+                            "$MAX_PASTE_REQUEST_BYTES bytes, so the client did not send it.",
+                        isError = true,
+                    )
+                },
+            )
             if (coalescedRpcCommands.isEmpty()) continue
 
             val prevAnsi = cachedInputs[machine.id]?.ansiByPane?.get(targetPaneId)
@@ -1444,23 +1475,28 @@ internal class RealHerdrSshClient(
      *   terminal writes the keys that the user types. The bytes of a key that Herdr cannot name (see [HerdrKeys]) go
      *   in the same text.
      * - A key with a Herdr name goes to `pane.send_keys`. Herdr encodes it for the modes of the pane.
-     * - A `Paste` goes to `pane.send_input` with no keys. Herdr puts this text in a bracketed paste when the pane has
-     *   bracketed paste on, as a terminal does for a paste.
+     * - A `Paste` goes to `pane.send_input` with no keys, in a line of its own. Herdr puts this text in a bracketed
+     *   paste when the pane has bracketed paste on, as a terminal does for a paste.
      *
-     * Consecutive input of one kind goes in one line. The JSON text of a line stays below [MAX_INPUT_JSON_BYTES],
-     * because Herdr drops a longer request with no answer. A longer text goes in more lines of the same kind. The
-     * client never splits the bytes of one key. [onUnsupportedKey] gets each key that Herdr does not accept. The
-     * client does not send such a key.
+     * Consecutive typed text and keys go in one line. Herdr drops a request line over its limit with no answer, so the
+     * JSON text of a typed line stays below [MAX_INPUT_JSON_BYTES]. A longer typed text goes in more `pane.send_text`
+     * lines, in order. The client never splits the bytes of one key. [onUnsupportedKey] gets each key that Herdr does
+     * not accept. The client does not send such a key.
+     *
+     * A paste never splits, so that it stays one paste. When the request line of a paste is over
+     * [MAX_PASTE_REQUEST_BYTES], the client does not send the paste, and [onRefusedPaste] gets the size of the line.
+     * No UI of the app makes a `Paste` event yet.
      */
     internal fun buildCoalescedInputCommands(
         batch: List<PendingPaneInput>,
         onUnsupportedKey: (ClientKeyEvent) -> Unit = {},
+        onRefusedPaste: (requestBytes: Int) -> Unit = {},
     ): List<RemoteShellCommand.ApiBridgeLine> {
         val builder = PaneInputLineBuilder()
         for (item in batch) {
             when (val ev = item.event) {
-                is ClientPaneInputEvent.TextCommit -> builder.addText(item.paneId, PaneInputKind.Typed, ev.text)
-                is ClientPaneInputEvent.Paste -> builder.addText(item.paneId, PaneInputKind.Paste, ev.text)
+                is ClientPaneInputEvent.TextCommit -> builder.addText(item.paneId, ev.text)
+                is ClientPaneInputEvent.Paste -> builder.addPaste(item.paneId, ev.text, onRefusedPaste)
                 is ClientPaneInputEvent.Key -> when (val key = HerdrKeys.encode(ev.event)) {
                     is HerdrKeyInput.Named -> builder.addKey(item.paneId, key.spec)
                     is HerdrKeyInput.Raw -> builder.addKeyBytes(item.paneId, key.bytes)
@@ -1489,9 +1525,9 @@ internal class RealHerdrSshClient(
         private val keys = ArrayList<String>(4)
         private var jsonBytes = 0
 
-        /** Adds [value] as text of [kind]. A long text goes in more lines, with a split only between code points. */
-        fun addText(paneId: String, kind: PaneInputKind, value: String) {
-            start(paneId, kind)
+        /** Adds the typed text [value]. A long text goes in more lines, with a split only between code points. */
+        fun addText(paneId: String, value: String) {
+            start(paneId, PaneInputKind.Typed)
             var index = 0
             while (index < value.length) {
                 val codePoint = value.codePointAt(index)
@@ -1506,6 +1542,20 @@ internal class RealHerdrSshClient(
             start(paneId, PaneInputKind.Typed)
             reserve(bytes.codePoints().map(::jsonBytesOf).sum())
             text.append(bytes)
+        }
+
+        /**
+         * Adds [value] as one paste line. When the request line is over [MAX_PASTE_REQUEST_BYTES], [onRefused] gets its
+         * size, and the paste does not go in a line.
+         */
+        fun addPaste(paneId: String, value: String, onRefused: (requestBytes: Int) -> Unit) {
+            flush()
+            this.paneId = null
+            this.kind = null
+            if (value.isEmpty()) return
+            val line = paneInputLine(paneId, PaneInputKind.Paste, text = value)
+            val requestBytes = line.ndjsonLine.encodeToByteArray().size
+            if (requestBytes > MAX_PASTE_REQUEST_BYTES) onRefused(requestBytes) else lines += line
         }
 
         /** Adds the Herdr key name [spec]. */
@@ -1583,7 +1633,8 @@ internal class RealHerdrSshClient(
      * When Herdr answers `invalid_key` for a line, Herdr writes nothing of that line, and the batch script does not
      * run the next input lines (see [appendBatchCommands]). This function then sends each key of that line in a
      * separate request, and then the lines that did not run. Then only the unknown key does not get to the pane, and
-     * the pane gets the other input in the typed order.
+     * the pane gets the other input in the typed order. All batches run in one lock of the lane, so no other request
+     * of the lane, for example a key chord, gets to the pane between them.
      *
      * A line that ran with no answer is a failure. For example, Herdr drops a request over its size limit with no
      * answer. This function writes an error to the debug log for such a line, and does not send it again.
@@ -1595,42 +1646,53 @@ internal class RealHerdrSshClient(
         readCommand: RemoteShellCommand.ApiBridgeLine,
     ): String {
         var pending = lines
-        while (true) {
-            val output = executeBatchOnLane(
-                machine = machine,
-                route = route,
-                lane = WorkerLane.Input,
-                commands = pending + readCommand,
-            )
-            val answers = answerLinesById(output)
-            val rejectedIndex = pending.indexOfFirst { line ->
-                answers[requestId(line)]?.contains(INVALID_KEY_ANSWER) == true
-            }
-            val ranLines = if (rejectedIndex < 0) pending else pending.subList(0, rejectedIndex)
-            ranLines.filter { answers[requestId(it)] == null }.forEach { line ->
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "RealSSH",
-                    message = "Herdr gave no answer to the pane input ${requestId(line)}. The pane can be without it.",
-                    isError = true,
-                )
-            }
-            if (rejectedIndex < 0) return output
-            val rejected = pending[rejectedIndex]
-            val message = runCatching {
-                json.parseToJsonElement(answers.getValue(requestId(rejected))).jsonObject["error"]
-                    ?.jsonObject?.get("message")?.jsonPrimitive?.content
-            }.getOrNull()
+        return executeBatchOnLane(
+            machine = machine,
+            route = route,
+            lane = WorkerLane.Input,
+            commands = pending + readCommand,
+            nextBatch = { output ->
+                pending = linesToSendAgain(machine, pending, output)
+                if (pending.isEmpty()) null else pending + readCommand
+            },
+        )
+    }
+
+    /**
+     * Reads the answers in [output] to the pane input [lines], and returns the lines to send again. See
+     * [executePaneInputLines].
+     */
+    private fun linesToSendAgain(
+        machine: HostMachine,
+        lines: List<RemoteShellCommand.ApiBridgeLine>,
+        output: String,
+    ): List<RemoteShellCommand.ApiBridgeLine> {
+        val answers = answerLinesById(output)
+        val rejectedIndex = lines.indexOfFirst { line ->
+            answers[requestId(line)]?.contains(INVALID_KEY_ANSWER) == true
+        }
+        val ranLines = if (rejectedIndex < 0) lines else lines.subList(0, rejectedIndex)
+        ranLines.filter { answers[requestId(it)] == null }.forEach { line ->
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "RealSSH",
-                message = "Herdr did not accept a key ($message). The client sends the other input again.",
+                message = "Herdr gave no answer to the pane input ${requestId(line)}. The pane can be without it.",
                 isError = true,
             )
-            pending = splitRejectedLine(rejected) +
-                pending.drop(rejectedIndex + 1).filter { answers[requestId(it)] == null }
-            if (pending.isEmpty()) return output
         }
+        if (rejectedIndex < 0) return emptyList()
+        val rejected = lines[rejectedIndex]
+        val message = runCatching {
+            json.parseToJsonElement(answers.getValue(requestId(rejected))).jsonObject["error"]
+                ?.jsonObject?.get("message")?.jsonPrimitive?.content
+        }.getOrNull()
+        sshDebugLog.record(
+            machineId = machine.id,
+            tag = "RealSSH",
+            message = "Herdr did not accept a key ($message). The client sends the other input again.",
+            isError = true,
+        )
+        return splitRejectedLine(rejected) + lines.drop(rejectedIndex + 1).filter { answers[requestId(it)] == null }
     }
 
     /**
@@ -2569,6 +2631,9 @@ internal class RealHerdrSshClient(
      * [onLaneLocked] runs when the batch has the lane lock, before the batch goes to the worker. The lane runs one batch
      * at a time, so the order of these calls is the order of the batches on the lane. [remoteBatchExecutor] has no lane
      * lock, so with it [onLaneLocked] runs just before the call.
+     *
+     * [nextBatch] gets the output of each batch, and returns the next batch or null. The next batch runs in the same
+     * lane lock. This function then returns the output of the last batch.
      */
     private suspend fun executeBatchOnLane(
         machine: HostMachine,
@@ -2577,37 +2642,62 @@ internal class RealHerdrSshClient(
         commands: List<RemoteShellCommand>,
         onRoundTrip: ((Duration) -> Unit)? = null,
         onLaneLocked: (() -> Unit)? = null,
+        nextBatch: ((output: String) -> List<RemoteShellCommand>?)? = null,
     ): String {
         if (commands.isEmpty()) return ""
         val customExecutor = remoteBatchExecutor
         if (customExecutor != null) {
             onLaneLocked?.invoke()
-            return timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            var output = timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            var batch = nextBatch?.invoke(output)
+            while (!batch.isNullOrEmpty()) {
+                val next = batch
+                output = timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, next) }
+                batch = nextBatch?.invoke(output)
+            }
+            return output
         }
         // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
         // the lane.
         awaitSession(machine)
         return laneMutexFor(machine.id, lane).withLock {
             onLaneLocked?.invoke()
-            val session = getOrOpenSession(machine, route)
-            runCatching {
-                val worker = getOrOpenWorkerLocked(machine.id, lane, session)
-                val timing = onRoundTrip.takeIf { worker.ranBatch }
-                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, machine.herdrSessionName) }
-                    .also { worker.ranBatch = true }
-            }.recoverCatching {
-                // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
-                workerMapFor(lane).remove(machine.id)?.close()
-                val freshSession = getOrOpenSession(machine, route)
-                runCatching {
-                    val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
-                    runCommandsOnWorker(freshWorker, commands, machine.herdrSessionName)
-                        .also { freshWorker.ranBatch = true }
-                }.getOrElse {
-                    execBatchOneShot(freshSession, commands, machine.herdrSessionName)
-                }
-            }.getOrThrow()
+            var output = runBatchLocked(machine, route, lane, commands, onRoundTrip)
+            var batch = nextBatch?.invoke(output)
+            while (!batch.isNullOrEmpty()) {
+                output = runBatchLocked(machine, route, lane, batch, onRoundTrip)
+                batch = nextBatch?.invoke(output)
+            }
+            output
         }
+    }
+
+    /** Runs [commands] on the worker of [lane]. The caller holds the lock of [lane]. See [executeBatchOnLane]. */
+    private suspend fun runBatchLocked(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        lane: WorkerLane,
+        commands: List<RemoteShellCommand>,
+        onRoundTrip: ((Duration) -> Unit)?,
+    ): String {
+        val session = getOrOpenSession(machine, route)
+        return runCatching {
+            val worker = getOrOpenWorkerLocked(machine.id, lane, session)
+            val timing = onRoundTrip.takeIf { worker.ranBatch }
+            timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, machine.herdrSessionName) }
+                .also { worker.ranBatch = true }
+        }.recoverCatching {
+            // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
+            workerMapFor(lane).remove(machine.id)?.close()
+            val freshSession = getOrOpenSession(machine, route)
+            runCatching {
+                val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
+                runCommandsOnWorker(freshWorker, commands, machine.herdrSessionName)
+                    .also { freshWorker.ranBatch = true }
+            }.getOrElse {
+                execBatchOneShot(freshSession, commands, machine.herdrSessionName)
+            }
+        }.getOrThrow()
     }
 
     /**
@@ -3454,10 +3544,16 @@ internal class RealHerdrSshClient(
         private const val INVALID_KEY_ANSWER = "\"code\":\"invalid_key\""
 
         /**
-         * The maximum bytes of one request line that Herdr reads (`MAX_INITIAL_REQUEST_BYTES` in `src/api/server.rs`
-         * of Herdr 0.9.5). Herdr drops a longer line with no answer.
+         * The maximum bytes of one request line, with no line end, that Herdr reads (`MAX_INITIAL_REQUEST_BYTES` in
+         * `src/api/server.rs` of Herdr 0.9.5). Herdr drops a longer line with no answer.
          */
         internal const val MAX_HERDR_REQUEST_BYTES = 1024 * 1024
+
+        /**
+         * The maximum bytes of the request line of one paste. The app does not send a longer paste, on the Mosh path
+         * and on the SSH path (rule R7 of the Mosh plan), because a paste must arrive whole.
+         */
+        internal const val MAX_PASTE_REQUEST_BYTES = 1_000_000
 
         /**
          * The maximum JSON bytes of the text or the keys of one pane input line. The other parts of the line are

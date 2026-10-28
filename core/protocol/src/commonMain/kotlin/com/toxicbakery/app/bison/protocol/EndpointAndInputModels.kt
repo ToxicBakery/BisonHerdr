@@ -69,8 +69,9 @@ sealed interface ClientPaneInputEvent {
     data class Mouse(val event: ClientMouseEvent) : ClientPaneInputEvent
 
     /**
-     * Text that the user pastes. The SSH client sends it with `pane.send_input` and no keys. Herdr then puts the text in
-     * a bracketed paste when the pane has bracketed paste on, as a terminal does.
+     * Text that the user pastes. The SSH client sends it whole with `pane.send_input` and no keys. Herdr then puts the
+     * text in a bracketed paste when the pane has bracketed paste on, as a terminal does. The client does not send a
+     * paste whose request is over 1,000,000 bytes. No UI makes this event yet.
      */
     @Serializable
     @SerialName("paste")

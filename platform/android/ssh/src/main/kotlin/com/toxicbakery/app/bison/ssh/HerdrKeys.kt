@@ -56,7 +56,8 @@ internal object HerdrKeys {
      * Returns true when Herdr accepts [spec] as a key of `pane.send_keys`.
      *
      * This function follows `normalize_api_key_alias` in `src/app/api_helpers.rs` and `parse_key_combo` in
-     * `src/config/keybinds.rs` of Herdr 0.9.5.
+     * `src/config/keybinds.rs` of Herdr 0.9.5. Herdr 0.9.0 has no rule for a modifier and then `++`, so it does not
+     * accept `ctrl++`. Both versions accept `ctrl+plus`.
      */
     fun isSupportedName(spec: String): Boolean {
         val key = spec.trim()
@@ -74,7 +75,17 @@ internal object HerdrKeys {
         val lower = name.lowercase()
         return lower in KEY_NAMES ||
             name.codePointCount(0, name.length) == 1 ||
-            (lower.startsWith('f') && lower.substring(1).toUByteOrNull() != null)
+            isFunctionKey(lower)
+    }
+
+    /**
+     * Returns true when [name] is `f` and a number from 0 to 255, as `s[1..].parse::<u8>()` requires. Rust reads only
+     * the ASCII digits, so `f٥` is not a key.
+     */
+    private fun isFunctionKey(name: String): Boolean {
+        val digits = name.removePrefix("f")
+        if (digits.length == name.length || digits.isEmpty() || digits.any { it !in '0'..'9' }) return false
+        return digits.trimStart('0').let { it.length <= 3 && (it.toIntOrNull() ?: 0) <= 255 }
     }
 
     /** Returns true when each `+` part of [combo] is a modifier token, as `parse_modifier_combo` requires. */
