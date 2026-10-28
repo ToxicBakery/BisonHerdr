@@ -258,6 +258,8 @@ class SshPlatformTest {
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
         val initialSurface = assertNotNull(surfaceBus.surfaceFor("lan-box"))
         assertEquals("$", initialSurface.frame.cellAt(0, 0)?.symbol)
+        // The cursor is after the space of the prompt "$ ".
+        assertEquals(2, initialSurface.frame.cursor?.x?.toInt())
 
         synchronized(recordedBatches) { recordedBatches.clear() }
 
@@ -281,7 +283,7 @@ class SshPlatformTest {
         // 3. Send "l" and "s" and verify instant optimistic local echo on PaneSurfaceBus
         assertTrue(client.sendPaneInput(machine, route, "%1", ClientPaneInputEvent.TextCommit("l")))
         val optimisticAfterL = assertNotNull(surfaceBus.surfaceFor("lan-box"))
-        val predictedCell = assertNotNull(optimisticAfterL.frame.cellAt(1, 0))
+        val predictedCell = assertNotNull(optimisticAfterL.frame.cellAt(2, 0))
         assertEquals("l", predictedCell.symbol)
         assertTrue(predictedCell.isPredictedEcho)
         inputLaneGate.complete(Unit)
