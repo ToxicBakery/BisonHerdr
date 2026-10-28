@@ -285,8 +285,9 @@ fun ConfigureMachineScreen(
                         state.authChoices.forEach { type ->
                             val label = when (type) {
                                 ConfigureMachineViewModel.AuthType.KeystoreKey -> "Android Keystore Key"
-                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> "YubiKey / FIDO2 / PIV"
                                 ConfigureMachineViewModel.AuthType.Password -> "Password / Passphrase"
+                                // The choices do not contain this method (issue #23), so it has no chip.
+                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> return@forEach
                             }
                             FilterChip(
                                 selected = state.authType == type,
