@@ -320,6 +320,7 @@ class LocalNetworkPermissionTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
         )
     }
 

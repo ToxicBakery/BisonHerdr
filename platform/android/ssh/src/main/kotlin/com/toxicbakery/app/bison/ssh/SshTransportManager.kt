@@ -60,12 +60,17 @@ import kotlinx.serialization.json.putJsonObject
  *
  * After a connect, the backend reconnects on its own when the session closes, and sends the events of its loop to
  * the manager ([SessionEvents]). The manager shows [RoamingStatus.RoamingReconnect] during the loop. After a
- * reconnect, it sets the surface lease again, reads the surface again, and sends the queued prompts. When the loop
- * stops for the user, the manager puts the cause in [SshStateManager.needsUser] and marks the machine disconnected.
+ * reconnect, it sets the surface lease again. While the lease is on, it also reads the surface again. Then it sends
+ * the queued prompts. When the loop stops for the user, the manager puts the cause in [SshStateManager.needsUser]
+ * and marks the machine disconnected.
  *
  * [timeSource] measures the interval between two network checks of a machine. A test gives a source with virtual
  * time. [promptScope] sends the queued prompts after a network check, so that a slow prompt does not stop the next
  * network event. A test gives a scope with virtual time.
+ *
+ * [foregroundState] tells if the app is in the foreground. The surface lease of a machine is on only while the app
+ * is in the foreground. [setSurfaceLease] gives the order rule. A test gives [ForegroundState.ALWAYS] or a state that
+ * it can change.
  */
 class SshTransportManager(
     private val backend: SshBackend,
@@ -73,6 +78,8 @@ class SshTransportManager(
     private val sshStateManager: SshStateManager,
     private val sshDebugLog: SshDebugLog,
     private val paneSurfaceBus: PaneSurfaceBus,
+    /** Has no default, so that a missing binding cannot turn the foreground rule off. A test gives one. */
+    private val foregroundState: ForegroundState,
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
     private val timeSource: TimeSource = TimeSource.Monotonic,
     private val promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
@@ -236,7 +243,8 @@ class SshTransportManager(
             return false
         }
         activeMachines[machineId] = machine
-        surfaceLeaseActive[machineId] = true
+        // The lease follows the foreground state. runConnectSteps sets it again when the connect completes.
+        surfaceLeaseActive[machineId] = foregroundState.isInForeground()
 
         // Phase 1: AuthenticatingSsh (optionally via ProxyJump / Tailscale)
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.AuthenticatingSsh)
@@ -310,6 +318,7 @@ class SshTransportManager(
         startControlSideband(machine, route, backbone)
 
         sshStateManager.markMachineConnected(machineId, backbone)
+        applyLeaseAfterConnect(machineId)
         flushOfflinePrompts(machineId)
         return true
     }
@@ -366,7 +375,33 @@ class SshTransportManager(
     }
 
     /**
-     * Turns the surface lease of [machineId] on or off (`onStart()` -> `active = true`, `onStop()` -> `active = false`).
+     * Turns the surface lease of [machineId] on or off. The lease is on only while the app is in the foreground. Thus
+     * a request for `active = true` turns the lease off when [foregroundState] tells that no activity is started.
+     *
+     * The order rule:
+     * 1. `MainActivity` changes the foreground state first. Then it sends a [SshRequest.SetSurfaceLease] for each
+     *    connected machine: `onStart()` -> `active = true`, `onStop()` -> `active = false`.
+     * 2. A connect marks the machine connected first. Then it reads the foreground state and sets the lease
+     *    ([applyLeaseAfterConnect]).
+     * 3. Thus an `onStart()` or an `onStop()` during a connect finds the machine connected and sends a request for
+     *    it, or it changes the state before the connect reads it. The control queue keeps the order of the
+     *    requests. Thus the last `onStart()` or `onStop()` sets the lease, also when it comes after the connect.
+     * 4. A reconnect and a network check keep the lease that is set ([isLeaseOn]).
+     */
+    suspend fun setSurfaceLease(machineId: String, active: Boolean) {
+        val inForeground = foregroundState.isInForeground()
+        if (active && !inForeground) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "SurfaceLease",
+                message = "The app is in the background, so the surface lease stays off.",
+            )
+        }
+        applySurfaceLease(machineId, active = active && inForeground)
+    }
+
+    /**
+     * Sets the surface lease of [machineId] to [active]. [setSurfaceLease] applies the foreground rule before it.
      *
      * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
      * - While the lease is off, the poll of the backend reads no snapshot and no panes. Thus the SSH session stays
@@ -375,7 +410,7 @@ class SshTransportManager(
      *   new presentation epoch, and the next poll reads the new state. The app does not send
      *   `endpoint.presentation.ready.v1` in this version.
      */
-    suspend fun setSurfaceLease(machineId: String, active: Boolean) {
+    private suspend fun applySurfaceLease(machineId: String, active: Boolean) {
         surfaceLeaseActive[machineId] = active
         moshUdpEngine.setParked(machineId, parked = !active)
         val leaseRequest = HerdrRpcBuilder.clientShellSurfaceSet(active = active)
@@ -669,34 +704,57 @@ class SshTransportManager(
 
     /** Returns the status of a session that works: [RoamingStatus.SurfaceParked] while the lease is off. */
     private fun statusAfterRoam(machineId: String): RoamingStatus =
-        if (surfaceLeaseActive[machineId] == false) RoamingStatus.SurfaceParked else RoamingStatus.Healthy
+        if (isLeaseOn(machineId)) RoamingStatus.Healthy else RoamingStatus.SurfaceParked
+
+    /**
+     * Returns true when the surface lease of [machineId] is on and the app is in the foreground. The poll reads the
+     * snapshot and the panes only then. A machine with no lease value counts as on.
+     */
+    private fun isLeaseOn(machineId: String): Boolean =
+        surfaceLeaseActive[machineId] != false && foregroundState.isInForeground()
+
+    /**
+     * Sets the surface lease of [machineId] at the end of a connect, after [SshStateManager.markMachineConnected].
+     * `MainActivity` sends a lease request only for a connected machine. Thus an `onStart()` or an `onStop()` that
+     * occurred during the connect did not set the lease of this machine. When the lease does not agree with the
+     * foreground state, this function sets it. In the background, it also sets [RoamingStatus.SurfaceParked].
+     */
+    private suspend fun applyLeaseAfterConnect(machineId: String) {
+        if (!isLeaseOn(machineId)) setSurfaceLease(machineId, active = true)
+    }
 
     /**
      * Restores [machineId] after the reconnect loop opened a new session. When the surface lease is on, it publishes
-     * the last frame again and sets [RoamingStatus.Healthy]. When the lease is off, it keeps
-     * [RoamingStatus.SurfaceParked]. Then it reads the surface again and sends the queued prompts.
+     * the last frame again, sets [RoamingStatus.Healthy], and reads the surface again. When the lease is off, it
+     * keeps [RoamingStatus.SurfaceParked] and reads no surface: the poll reads the new state when the lease comes on.
+     * Then it sends the queued prompts.
      */
     private suspend fun restoreAfterReconnect(machineId: String) {
         val machine = activeMachines[machineId] ?: return
-        if (surfaceLeaseActive[machineId] == false) {
+        if (!isLeaseOn(machineId)) {
             sshStateManager.setRoamingStatus(machineId, RoamingStatus.SurfaceParked)
         } else {
             // This also sets RoamingStatus.Healthy, so that the queued prompts do not go back into the queue.
             setSurfaceLease(machineId, active = true)
+            refreshSurfaceAfterReconnect(machine)
         }
+        flushOfflinePrompts(machineId)
+    }
+
+    /** Reads the surface of [machine] again after a reconnect. A failure goes to the debug log. */
+    private suspend fun refreshSurfaceAfterReconnect(machine: HostMachine) {
         try {
             backend.refreshSurface(machine, proxyJumpTunnel.resolveRoute(machine))
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             sshDebugLog.record(
-                machineId = machineId,
+                machineId = machine.id,
                 tag = RECONNECT_LOG_TAG,
                 message = "Could not read the surface after the reconnect: ${detailOf(error)}",
                 isError = true,
             )
         }
-        flushOfflinePrompts(machineId)
     }
 
     private suspend fun startControlSideband(
@@ -712,7 +770,7 @@ class SshTransportManager(
                 "surface lease is on. The real backend runs herdr api snapshot and ${buildSshApiBridgeCommand()}.",
         )
         backend.openSurface(machine, route, backbone) {
-            surfaceLeaseActive[machineId] != false
+            isLeaseOn(machineId)
         }
     }
 

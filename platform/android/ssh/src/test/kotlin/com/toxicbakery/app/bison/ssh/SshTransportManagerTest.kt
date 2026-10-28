@@ -41,6 +41,11 @@ class SshTransportManagerTest {
     private val stateManager = SshStateManager()
 
     private val lanBox = HostMachine(id = "lan-box", name = "lan-box", hostname = "192.168.1.42", username = "ian")
+
+    /** The foreground state of the app. A test changes it as `MainActivity.onStart` and `onStop` do. */
+    @Volatile
+    private var inForeground = true
+    private val foreground = ForegroundState { inForeground }
     private val gpuRig = HostMachine(id = "gpu-rig", name = "gpu-rig", hostname = "192.168.1.44", username = "ian")
 
     /** Returns a manager that sends the queued prompts of a network check in the background scope of the test. */
@@ -48,6 +53,7 @@ class SshTransportManagerTest {
         backend: SshBackend,
         timeSource: TimeSource = TimeSource.Monotonic,
         surfaceBus: PaneSurfaceBus = PaneSurfaceBus(),
+        foregroundState: ForegroundState = ForegroundState.ALWAYS,
     ): SshTransportManager {
         return SshTransportManager(
             backend = backend,
@@ -57,6 +63,7 @@ class SshTransportManagerTest {
             paneSurfaceBus = surfaceBus,
             timeSource = timeSource,
             promptScope = backgroundScope,
+            foregroundState = foregroundState,
         )
     }
 
@@ -546,6 +553,101 @@ class SshTransportManagerTest {
         events.onReconnected(lanBox.id)
 
         assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        assertFalse("refreshSurface lan-box" in backend.calls, "A parked surface must not read the surface")
+    }
+
+    @Test
+    fun aConnectThatCompletesAfterOnStopKeepsTheLeaseOffAndThePollReadsNothing() = runTest {
+        // onStop occurs during the connect. MainActivity sends no lease request, because the machine is not
+        // connected yet.
+        val backend = RecordingSshBackend(onOpenSurface = { inForeground = false })
+        val manager = manager(backend, foregroundState = foreground)
+
+        assertTrue(manager.connect(lanBox), debugLogDump())
+
+        assertTrue(stateManager.isMachineConnected(lanBox.id))
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        val pollGate = assertNotNull(backend.surfaceGates[lanBox.id])
+        assertFalse(pollGate(), "The poll must read no snapshot and no panes in the background")
+        // The connect turned the lease off. Only a lease request turns it on again.
+        inForeground = true
+        assertFalse(pollGate(), "The lease must stay off until onStart sends a lease request")
+    }
+
+    @Test
+    fun aLeaseRequestThatComesAfterOnStopKeepsTheLeaseOff() = runTest {
+        // The workspace screen sends a connect and then a lease request. onStop occurs during the connect, so the
+        // lease request comes from the control queue when the app is in the background.
+        val backend = RecordingSshBackend(onOpenSurface = { inForeground = false })
+        val manager = manager(backend, foregroundState = foreground)
+        assertTrue(manager.connect(lanBox), debugLogDump())
+
+        manager.handleRequest(SshRequest.SetSurfaceLease(lanBox.id, active = true))
+
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        assertFalse(assertNotNull(backend.surfaceGates[lanBox.id]).invoke())
+        assertTrue(
+            debugLog.entries.value.any { it.message == "The app is in the background, so the surface lease stays off." },
+            debugLogDump(),
+        )
+    }
+
+    @Test
+    fun aReconnectInTheBackgroundKeepsTheLeaseOffAndAnOnStartTurnsItOn() = runTest {
+        inForeground = false
+        val backend = RecordingSshBackend()
+        val manager = manager(backend, foregroundState = foreground)
+        connectAll(manager, backend, lanBox)
+        val events = assertNotNull(backend.sessionEvents)
+        val pollGate = assertNotNull(backend.surfaceGates[lanBox.id])
+
+        events.onReconnecting(lanBox.id, IOException("Connection reset"))
+        assertFalse(queuePrompt(manager), "The prompt was not queued")
+        events.onReconnected(lanBox.id)
+
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        assertFalse(pollGate(), "The poll must read nothing after a reconnect in the background")
+        // The reconnect reads no surface, but it sends the queued prompt.
+        assertEquals(listOf("sendEndpointCommand lan-box"), backend.calls)
+        assertTrue(stateManager.queuedPromptsForMachine(lanBox.id).isEmpty())
+
+        // onStart: MainActivity changes the foreground state, and then sends a lease request for each connected
+        // machine.
+        inForeground = true
+        manager.handleRequest(SshRequest.SetSurfaceLease(lanBox.id, active = true))
+
+        assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value[lanBox.id])
+        assertTrue(pollGate(), "The poll must read again after onStart")
+    }
+
+    @Test
+    fun aNetworkCheckInTheBackgroundKeepsTheParkedStatus() = runTest {
+        inForeground = false
+        val backend = RecordingSshBackend()
+        val manager = manager(backend, foregroundState = foreground)
+        connectAll(manager, backend, lanBox)
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+
+        manager.onNetworkLost()
+        assertEquals(RoamingStatus.RoamingReconnect, stateManager.roamingState.value[lanBox.id])
+        manager.onNetworkAvailable()
+
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        assertFalse(assertNotNull(backend.surfaceGates[lanBox.id]).invoke())
+    }
+
+    @Test
+    fun anOnStartDuringTheConnectTurnsTheLeaseOnWhenTheConnectCompletes() = runTest {
+        // The connect starts in the background. onStart occurs during the connect, and MainActivity sends no lease
+        // request, because the machine is not connected yet.
+        inForeground = false
+        val backend = RecordingSshBackend(onOpenSurface = { inForeground = true })
+        val manager = manager(backend, foregroundState = foreground)
+
+        assertTrue(manager.connect(lanBox), debugLogDump())
+
+        assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value[lanBox.id])
+        assertTrue(assertNotNull(backend.surfaceGates[lanBox.id]).invoke(), "The poll must read in the foreground")
     }
 
     @Test
