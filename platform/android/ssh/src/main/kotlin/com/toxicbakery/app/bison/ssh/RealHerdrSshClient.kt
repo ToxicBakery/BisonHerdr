@@ -6,6 +6,7 @@ import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SocketFactory
 import com.toxicbakery.app.bison.model.ActiveBackbone
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -126,6 +127,10 @@ import kotlinx.serialization.json.put
  * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
  * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
  * second. A connect, a disconnect, and a reconnect of the supervisor start a new average.
+ *
+ * A machine with a FIDO2 security key logs in with a [HardwareKeyJschIdentity] over [hardwareKeySigner]. The user
+ * touches the key for each new session. A ProxyJump machine thus needs two touches: one for the bastion and one for
+ * the target. When [hardwareKeySigner] is null, the client refuses such a machine before the network connection.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -165,6 +170,11 @@ internal class RealHerdrSshClient(
     private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
     /** Gives the address of each socket, and finds the connections that the local network protection stops. */
     internal val localNetworkGuard: LocalNetworkGuard,
+    /**
+     * Signs the login of a machine with a FIDO2 security key. It is null when [FeatureFlags.hardwareSecurityKeys] is
+     * false. Then the client refuses such a machine.
+     */
+    private val hardwareKeySigner: HardwareKeySigner? = null,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -2149,9 +2159,22 @@ internal class RealHerdrSshClient(
                     )
                     "publickey,password,keyboard-interactive"
                 }
-                // This version does not support the method (issue #23). Stop before the network connection.
-                is SshAuthMethod.HardwareSecurityKey ->
-                    throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
+                is SshAuthMethod.HardwareSecurityKey -> {
+                    // Without the signer, this build does not support the method. Stop before the network connection.
+                    val signer = hardwareKeySigner
+                        ?: throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
+                    if (!auth.isEnrolled) throw HardwareKeyException(HardwareKeyException.Reason.NotEnrolled)
+                    jsch.addIdentity(
+                        HardwareKeyJschIdentity(
+                            machineId = machine.id,
+                            key = auth,
+                            signer = signer,
+                            callerJob = currentCoroutineContext()[Job],
+                        ),
+                        null,
+                    )
+                    "publickey,password,keyboard-interactive"
+                }
             }
             val passwordAuth = machine.authMethod as? SshAuthMethod.Password
             val loginPassword = passwordAuth?.let { loginPassword(machine, route, it) }
@@ -2268,6 +2291,9 @@ internal class RealHerdrSshClient(
             session.setServerAliveCountMax(SERVER_ALIVE_COUNT_MAX)
         }
         JschAndroidCrypto.configureSession(session)
+        if (logins.machine.authMethod is SshAuthMethod.HardwareSecurityKey) {
+            JschAndroidCrypto.enableSecurityKeyAlgorithms(session)
+        }
         return session
     }
 

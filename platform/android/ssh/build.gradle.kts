@@ -31,6 +31,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.core)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.yubikit.core)
+    implementation(libs.yubikit.fido)
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.testJunit)

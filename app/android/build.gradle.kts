@@ -15,6 +15,27 @@ plugins {
     alias(libs.plugins.composeCompiler)
 }
 
+// The feature flag of FIDO2 hardware security keys. See FeatureFlags.hardwareSecurityKeys.
+val hardwareSecurityKeys: Boolean = providers.gradleProperty("bison.hardwareSecurityKeys")
+    .map(String::toBoolean)
+    .getOrElse(false)
+
+// Stop a release build with FIDO2 security keys on, because nobody did the manual test yet (issue #23). The debug and
+// benchmark build types are test builds, so they can have the flag. The pull request that turns on the flag removes
+// this check.
+val checkReleaseFeatureFlags = tasks.register("checkReleaseFeatureFlags") {
+    val enabled = hardwareSecurityKeys
+    doLast {
+        if (enabled) {
+            throw GradleException(
+                "bison.hardwareSecurityKeys=true is only for a debug or benchmark test build (issue #23). " +
+                    "Remove the property to build a release.",
+            )
+        }
+    }
+}
+tasks.named { it == "preReleaseBuild" }.configureEach { dependsOn(checkReleaseFeatureFlags) }
+
 android {
     namespace = "com.toxicbakery.app.bison"
     compileSdk {
@@ -31,6 +52,11 @@ android {
         versionName = project.version.toString()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // FIDO2 hardware security keys (issue #23). Off in each build type until the manual test in
+        // docs/testing/fido2-security-keys.md passes. Add -Pbison.hardwareSecurityKeys=true to a debug or benchmark
+        // build to test it. A release build with the property stops (checkReleaseFeatureFlags).
+        buildConfigField("boolean", "HARDWARE_SECURITY_KEYS", hardwareSecurityKeys.toString())
     }
 
     buildFeatures {
@@ -143,6 +169,8 @@ dependencies {
     implementation(libs.kotlinx.datetime)
     implementation(libs.kotlinx.io)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.yubikit.android)
+    implementation(libs.yubikit.core)
 
     debugImplementation(libs.compose.ui.tooling)
 

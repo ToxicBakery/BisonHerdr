@@ -70,6 +70,10 @@ class ConfigureMachineHerdrSessionTest {
 
             viewModel.onEvent(Event.SaveMachine)
             assertNull(machineStore.getMachine(MACHINE_ID))
+            // The field shows the error. "Save & Connect" shows no other error, for example for a hardware key.
+            viewModel.onEvent(Event.SaveAndConnect)
+            assertNull(machineStore.getMachine(MACHINE_ID))
+            assertNull(viewModel.state.value.validationError)
 
             viewModel.onEvent(Event.UpdateHerdrSessionName(" work "))
             viewModel.onEvent(Event.SaveMachine)

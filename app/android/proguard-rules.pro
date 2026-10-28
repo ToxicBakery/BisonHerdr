@@ -2,6 +2,7 @@
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+# This rule also keeps the classes that JSch loads by name: AndroidJschSignatureEd25519 and AndroidJschXdh.
 -keep class com.toxicbakery.app.bison.ssh.** { *; }
 -keep class com.toxicbakery.app.bison.protocol.** { *; }
 -keep class com.toxicbakery.app.bison.model.** { *; }

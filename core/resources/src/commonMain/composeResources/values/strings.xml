@@ -104,6 +104,7 @@
     <string name="machine_key_regenerate_warning_body">The app replaces the key %1$s with a new key. Hosts that have only the old public key then refuse the login. Add the new public key to ~/.ssh/authorized_keys on each host. All machines that use this key alias use the new key.</string>
     <string name="machine_key_regenerate_confirm">Replace the Key</string>
     <string name="machine_auth_password">Password / Keyboard-Interactive</string>
+    <string name="machine_auth_hardware_key">FIDO2 Security Key</string>
     <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
     <string name="machine_bastion_credentials_hint">The app also uses the password or key of this machine for the bastion.</string>
     <string name="machine_bastion_host_name_hint">The bastion resolves the host name of this machine. When the bastion uses Tailscale MagicDNS, it also resolves a MagicDNS short name, for example devbox.</string>
