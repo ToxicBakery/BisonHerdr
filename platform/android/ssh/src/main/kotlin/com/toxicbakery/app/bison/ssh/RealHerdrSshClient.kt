@@ -94,6 +94,8 @@ import kotlinx.serialization.json.put
  * over `TCP_NODELAY` sockets with client-side optimistic local echo (`<1ms`), keystroke coalescing, and
  * focused-pane-only reads so interactive typing never spawns per-key SSH channels or blocks behind background polls.
  *
+ * Each `herdr` command has `--session <name>` when the machine has a Herdr session name. See [HerdrCommand].
+ *
  * Each session checks the server host key against [knownHostsStore] through [KnownHostsRepository] before it
  * sends credentials. An unknown or changed key stops the session with a [HostKeyRejectedException].
  *
@@ -466,7 +468,7 @@ internal class RealHerdrSshClient(
                 machine = machine,
                 route = route,
                 lane = WorkerLane.Poll,
-                commands = listOf(RemoteShellCommand.Exec("herdr --version || true")),
+                commands = listOf(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} --version || true")),
             )
             sshDebugLog.record(
                 machineId = machine.id,
@@ -776,7 +778,7 @@ internal class RealHerdrSshClient(
         }.orEmpty()
 
         val initialCommands = buildList {
-            add(RemoteShellCommand.Exec("herdr api snapshot"))
+            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot"))
             predictedVisiblePanes.forEach { paneId ->
                 add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
             }
@@ -2547,7 +2549,7 @@ internal class RealHerdrSshClient(
             runCatching {
                 val worker = getOrOpenWorkerLocked(machine.id, lane, session)
                 val timing = onRoundTrip.takeIf { worker.ranBatch }
-                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands) }
+                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, machine.herdrSessionName) }
                     .also { worker.ranBatch = true }
             }.recoverCatching {
                 // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
@@ -2555,9 +2557,10 @@ internal class RealHerdrSshClient(
                 val freshSession = getOrOpenSession(machine, route)
                 runCatching {
                     val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
-                    runCommandsOnWorker(freshWorker, commands).also { freshWorker.ranBatch = true }
+                    runCommandsOnWorker(freshWorker, commands, machine.herdrSessionName)
+                        .also { freshWorker.ranBatch = true }
                 }.getOrElse {
-                    execBatchOneShot(freshSession, commands)
+                    execBatchOneShot(freshSession, commands, machine.herdrSessionName)
                 }
             }.getOrThrow()
         }
@@ -2598,9 +2601,10 @@ internal class RealHerdrSshClient(
     private fun runCommandsOnWorker(
         worker: PersistentShellWorker,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): String {
         val batchId = shellBatchCounter.incrementAndGet()
-        val (script, sentinel) = buildShellBatchScript(batchId, commands)
+        val (script, sentinel) = buildShellBatchScript(batchId, commands, herdrSessionName)
         worker.stdin.write(script.toByteArray(Charsets.UTF_8))
         worker.stdin.flush()
 
@@ -2627,12 +2631,9 @@ internal class RealHerdrSshClient(
     private fun execBatchOneShot(
         session: Session,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): String {
-        val batchId = shellBatchCounter.incrementAndGet()
-        val body = buildString(commands.size * 160 + 96) {
-            append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
-            appendBatchCommands(batchId, commands, HERDR_COMMAND)
-        }
+        val body = buildOneShotBatchScript(shellBatchCounter.incrementAndGet(), commands, herdrSessionName)
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(body)
         val stdout = channel.inputStream
@@ -2645,13 +2646,35 @@ internal class RealHerdrSshClient(
         }
     }
 
+    /**
+     * Builds the script of [execBatchOneShot]. Each `herdr` call of a [RemoteShellCommand.ApiBridgeLine] uses the Herdr
+     * session [herdrSessionName]. See [HerdrCommand].
+     */
+    internal fun buildOneShotBatchScript(
+        batchId: Long,
+        commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
+    ): String {
+        val herdr = HerdrCommand.forSession(herdrSessionName)
+        return buildString(commands.size * 160 + 96) {
+            append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
+            appendBatchCommands(batchId, commands, herdr)
+        }
+    }
+
+    /**
+     * Builds the script of one batch on a persistent worker, and the sentinel line at its end. Each `herdr` call of a
+     * [RemoteShellCommand.ApiBridgeLine] uses the Herdr session [herdrSessionName]. See [HerdrCommand].
+     */
     internal fun buildShellBatchScript(
         batchId: Long,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): Pair<String, String> {
         val sentinel = "__BISON_DONE_${batchId}__"
+        val herdr = HerdrCommand.forSession(herdrSessionName)
         val script = buildString(commands.size * 160 + 64) {
-            appendBatchCommands(batchId, commands, HERDR_COMMAND)
+            appendBatchCommands(batchId, commands, herdr)
             append("printf '\\n")
             append(sentinel)
             append("\\n'\n")
@@ -2661,7 +2684,8 @@ internal class RealHerdrSshClient(
 
     /**
      * Adds the POSIX shell lines of [commands] to this script. Each [RemoteShellCommand.ApiBridgeLine] runs
-     * `<herdr> remote-api-bridge`, so [herdr] is the start of the command, for example `herdr`.
+     * `<herdr> remote-api-bridge`, so [herdr] is the start of the command, for example `herdr --session 'work'`. See
+     * [HerdrCommand].
      *
      * Herdr writes nothing to the pane for a request with a key that it does not know (`invalid_key`). After such
      * an answer, the script does not run the next [RemoteShellCommand.ApiBridgeLine.paneInput] lines of the batch.
@@ -3381,9 +3405,6 @@ internal class RealHerdrSshClient(
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
         private const val MAX_OPTIMISTIC_EDITS = 128
         private const val PANE_SCROLL_ACCEPTED_RESPONSE = """{"id":"pane_scroll","result":{"type":"pane_scroll_queued"}}"""
-
-        /** The command that starts Herdr on a host. */
-        private const val HERDR_COMMAND = "herdr"
 
         /** The text of an `invalid_key` answer of Herdr, for a key name that Herdr does not know. */
         private const val INVALID_KEY_ANSWER = "\"code\":\"invalid_key\""

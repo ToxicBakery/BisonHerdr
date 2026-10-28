@@ -100,7 +100,8 @@ jobs:
 
   validate:
     name: Validate (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    # Pin the image, so that the mosh package of the real mosh-server tests does not change.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       # setup-gradle writes a PR comment when a job fails (add-job-summary-as-pr-comment).
@@ -113,14 +114,15 @@ jobs:
       matrix:
         # Each target family builds on its OWN runner:
         #   jvm     — composite build-logic unit tests, :core:resources:localizationCheck, and all
-        #             KMP/JVM unit tests across :core:* modules
+        #             KMP/JVM unit tests across :core:* modules, with the real mosh-server tests of
+        #             :core:mosh
         #   android — :app:android debug and release APKs, a check of the release classes (no debug-only
         #             class, RealSshBackend present), compile checks of the baseline profile generator and
         #             Android instrumented tests, unit tests for :platform:android:ssh and :app:android
         #             (the release unit tests check the release bindings), plus `lint` across all modules
         include:
           - target: jvm
-            tasks: ":core:app-version:check :core:common:check :core:di:check :core:fake-server:check :core:model:check :core:protocol:check :core:resources:localizationCheck :core:ssh:check :core:store:check :core:util:check"
+            tasks: ":core:app-version:check :core:common:check :core:di:check :core:fake-server:check :core:model:check :core:mosh:check :core:protocol:check :core:resources:localizationCheck :core:ssh:check :core:store:check :core:util:check"
           - target: android
             tasks: ":app:android:assembleDebug :app:android:assembleRelease :app:android:checkReleaseClasses :app:android:baseline:compileBenchmarkReleaseKotlin :app:android:compileDebugAndroidTestKotlin :platform:android:ssh:testDebugUnitTest :app:android:testDebugUnitTest :app:android:testReleaseUnitTest lint"
     steps:
@@ -171,7 +173,15 @@ jobs:
         if: matrix.target == 'jvm'
         run: ./gradlew -p composite test --no-daemon --stacktrace -Dorg.gradle.console=plain
 
+      # The jvm target runs the :core:mosh tests against a real mosh-server.
+      - name: Install mosh
+        if: matrix.target == 'jvm'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mosh
+
       - name: Build ${{ matrix.target }}
+        env:
+          # With the value 1, a real mosh-server test fails when mosh-server is absent. It does not skip.
+          BISON_REQUIRE_MOSH: ${{ matrix.target == 'jvm' && '1' || '0' }}
         run: ./gradlew ${{ matrix.tasks }} --stacktrace -Dorg.gradle.console=plain
 
       # The console gives only the name of a failed test. The reports hold the message and the
