@@ -71,13 +71,18 @@ class AgyCursorPlacementE2ETest {
         val stateManager = SshStateManager()
         val surfaceBus = PaneSurfaceBus()
         val transport = SshTransportManager(
-            context = InstrumentationRegistry.getInstrumentation().targetContext,
+            backend = RealSshBackend(
+                sshStateManager = stateManager,
+                sshDebugLog = debugLog,
+                endpointSnapshotBus = EndpointSnapshotBus(),
+                paneSurfaceBus = surfaceBus,
+                semanticNotificationBus = SemanticNotificationBus(),
+                keystoreKeyManager = AndroidKeystoreKeyManager(),
+            ),
             moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
-            endpointSnapshotBus = EndpointSnapshotBus(),
             paneSurfaceBus = surfaceBus,
-            semanticNotificationBus = SemanticNotificationBus(),
         )
         val machine = HostMachine(
             id = MACHINE_ID,

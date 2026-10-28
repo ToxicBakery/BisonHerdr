@@ -215,16 +215,6 @@ internal class RealHerdrSshClient(
 
     private data class PendingPaneScroll(val paneId: String, val offsetFromBottom: Int)
 
-    fun isSimulatedHost(machine: HostMachine): Boolean {
-        val host = machine.hostname.trim().lowercase()
-        val bastion = machine.proxyJump?.bastionHost?.trim()?.lowercase().orEmpty()
-        if (host.isEmpty()) return true
-        if (host.endsWith(".local") || host.endsWith(".example.com") || host.endsWith(".invalid")) return true
-        if (host.endsWith(".ts.net") || host.startsWith("100.64.")) return true
-        if (bastion.endsWith(".example.com") || bastion.endsWith(".invalid") || bastion.startsWith("100.64.")) return true
-        return false
-    }
-
     private fun sessionMutexFor(machineId: String): Mutex =
         sessionOpenLocks.computeIfAbsent(machineId) { Mutex() }
 

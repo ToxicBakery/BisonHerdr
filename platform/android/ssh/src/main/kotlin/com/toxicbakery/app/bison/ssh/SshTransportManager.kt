@@ -1,48 +1,21 @@
 package com.toxicbakery.app.bison.ssh
 
-import android.content.Context
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
-import com.toxicbakery.app.bison.model.SshAuthMethod
-import com.toxicbakery.app.bison.model.TransportMode
-import com.toxicbakery.app.bison.protocol.AgentStatus
-import com.toxicbakery.app.bison.protocol.CellData
-import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
-import com.toxicbakery.app.bison.protocol.ClientShellAgent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
-import com.toxicbakery.app.bison.protocol.ClientShellPane
-import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
-import com.toxicbakery.app.bison.protocol.ClientShellTab
-import com.toxicbakery.app.bison.protocol.ClientShellWorkspace
 import com.toxicbakery.app.bison.protocol.ClientSurfaceSize
-import com.toxicbakery.app.bison.protocol.CursorShape
-import com.toxicbakery.app.bison.protocol.CursorState
 import com.toxicbakery.app.bison.protocol.EndpointClientHello
-import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
-import com.toxicbakery.app.bison.protocol.MoshConnectInfo
-import com.toxicbakery.app.bison.protocol.PaneLayoutPane
-import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
-import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
-import com.toxicbakery.app.bison.protocol.PaneSurfacePane
-import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
-import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
-import com.toxicbakery.app.bison.protocol.SurfaceRect
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Android SSH2 + Mosh UDP SSP + Herdr Endpoint Generation 1 transport coordinator.
@@ -59,52 +32,22 @@ import kotlinx.serialization.json.jsonPrimitive
  *    `agent.read` (`source: "visible"`), `agent.prompt`, and routing Mosh focus RPCs via `herdr.sock`
  *    ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]).
  * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]).
+ *
+ * The manager keeps the connection state. [backend] does the work that uses the connection to the machine.
  */
 class SshTransportManager(
-    private val context: Context?,
+    private val backend: SshBackend,
     private val moshUdpEngine: MoshUdpEngine,
     private val sshStateManager: SshStateManager,
     private val sshDebugLog: SshDebugLog,
-    private val endpointSnapshotBus: EndpointSnapshotBus,
     private val paneSurfaceBus: PaneSurfaceBus,
-    private val semanticNotificationBus: SemanticNotificationBus,
-    var keystoreKeyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(),
-    var yubiKeyFido2Manager: YubiKeyFido2Manager = YubiKeyFido2Manager(
-        sshStateManager = sshStateManager,
-        sshDebugLog = sshDebugLog,
-    ),
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
 ) {
-    internal var moshBootstrapBannerProvider: ((HostMachine) -> String?)? = null
-    internal var moshUdpReachabilityProbe: (suspend (HostMachine, MoshConnectInfo) -> Boolean)? = null
-    internal var sshRouteProbe: (suspend (HostMachine, ResolvedSshRoute) -> Boolean)? = null
-    internal var passwordAuthenticator: (suspend (HostMachine, SshAuthMethod.Password) -> Boolean)? = null
-
-    private val json = Json { ignoreUnknownKeys = true }
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
     private val surfaceLeaseActive = ConcurrentHashMap<String, Boolean>()
     private val connectLocks = ConcurrentHashMap<String, Mutex>()
     private val presentationEpochCounter = AtomicLong(1L)
-    private val realHerdrSshClient = RealHerdrSshClient(
-        sshDebugLog = sshDebugLog,
-        endpointSnapshotBus = endpointSnapshotBus,
-        paneSurfaceBus = paneSurfaceBus,
-        semanticNotificationBus = semanticNotificationBus,
-        keystoreKeyManagerProvider = { keystoreKeyManager },
-    )
-
-    private fun shouldUseRealSsh(machine: HostMachine): Boolean {
-        if (context == null) return false
-        if (moshBootstrapBannerProvider != null ||
-            moshUdpReachabilityProbe != null ||
-            sshRouteProbe != null ||
-            passwordAuthenticator != null
-        ) {
-            return false
-        }
-        return !realHerdrSshClient.isSimulatedHost(machine)
-    }
 
     /**
      * Dispatches a cross-layer [SshRequest] from `MainActivity` or `BisonSessionService`.
@@ -194,18 +137,7 @@ class SshTransportManager(
             return false
         }
         val route = proxyJumpTunnel.resolveRoute(machine)
-        val routeReachable = sshRouteProbe?.invoke(machine, route) ?: true
-        if (!routeReachable) {
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "ProxyJump",
-                message = "SSH route unreachable for ${route.entryHost}:${route.entryPort}",
-                isError = true,
-            )
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
-            return false
-        }
-        val authSucceeded = authenticateSshSession(machine, route)
+        val authSucceeded = backend.authenticate(machine, route)
         if (!authSucceeded) {
             sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
             return false
@@ -213,7 +145,7 @@ class SshTransportManager(
 
         // Phase 2: BootstrappingMoshOrBridge
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.BootstrappingMoshOrBridge)
-        val backbone = negotiateBackbone(machine, route)
+        val backbone = backend.negotiateBackbone(machine, route)
         if (backbone == null) {
             sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
             return false
@@ -221,7 +153,7 @@ class SshTransportManager(
 
         // Phase 4: SyncingHerdrSnapshot -> Connected
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.SyncingHerdrSnapshot)
-        startControlSidebandAndSeedSnapshot(machine, backbone)
+        startControlSideband(machine, route, backbone)
 
         sshStateManager.markMachineConnected(machineId, backbone)
         flushOfflinePrompts(machineId)
@@ -232,7 +164,7 @@ class SshTransportManager(
      * Disconnects [machineId], stopping any active Mosh UDP session and clearing cached control streams.
      */
     suspend fun disconnect(machineId: String) {
-        realHerdrSshClient.disconnect(machineId)
+        backend.disconnect(machineId)
         moshUdpEngine.stopSession(machineId)
         surfaceDeltaAssembler.clear(machineId)
         surfaceLeaseActive.remove(machineId)
@@ -309,11 +241,7 @@ class SshTransportManager(
             !MoshBootstrapConfig.isClientShellSupportedMethod(request.method) ||
             !isLeaseActive
 
-        val transportLane = if (useApiSocket) {
-            "herdr remote-api-bridge (herdr.sock)"
-        } else {
-            "herdr remote-client-bridge (herdr-client.sock)"
-        }
+        val transportLane = if (useApiSocket) API_BRIDGE_LANE else CLIENT_BRIDGE_LANE
         val wireLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
         sshDebugLog.record(
             machineId = machineId,
@@ -321,15 +249,10 @@ class SshTransportManager(
             message = "[$transportLane] $wireLine",
         )
         val machine = activeMachines[machineId]
-        if (machine != null && shouldUseRealSsh(machine)) {
-            val route = proxyJumpTunnel.resolveRoute(machine)
-            val realResp = realHerdrSshClient.executeEndpointRpc(machine, route, request)
-            if (realResp != null) {
-                return realResp
-            }
+        val response = machine?.let {
+            backend.sendEndpointCommand(it, proxyJumpTunnel.resolveRoute(it), request, isMoshActive)
         }
-        applyFocusRpcMutation(machineId, request, isMoshActive)
-        return """{"id":"${request.id}","result":{"type":"ok","lane":"$transportLane"}}"""
+        return response ?: """{"id":"${request.id}","result":{"type":"ok","lane":"$transportLane"}}"""
     }
 
     suspend fun sendEndpointCommand(
@@ -354,29 +277,22 @@ class SshTransportManager(
         event: ClientPaneInputEvent,
     ): Boolean {
         val machine = activeMachines[machineId]
-        if (machine != null && shouldUseRealSsh(machine)) {
-            val route = proxyJumpTunnel.resolveRoute(machine)
-            val sent = realHerdrSshClient.sendPaneInput(machine, route, paneId, event)
+        if (machine == null) {
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "PaneInput",
-                message = "Sent real SSH input to $paneId: $event (ok=$sent)",
+                message = "No active machine $machineId; did not send input to $paneId",
+                isError = true,
             )
-            return sent
+            return false
         }
-        val backbone = sshStateManager.activeTransportBackbone.value[machineId]
-        if (backbone is ActiveBackbone.MoshUdp) {
-            val bytes = encodeInputEventToBytes(event)
-            if (bytes.isNotEmpty()) {
-                moshUdpEngine.sendInput(machineId, bytes)
-            }
-        }
+        val sent = backend.sendInput(machine, proxyJumpTunnel.resolveRoute(machine), paneId, event)
         sshDebugLog.record(
             machineId = machineId,
             tag = "PaneInput",
-            message = "Sent input to $paneId: $event",
+            message = "Sent input to $paneId: $event (ok=$sent)",
         )
-        return true
+        return sent
     }
 
     /**
@@ -439,7 +355,7 @@ class SshTransportManager(
         if (moshUdpEngine.isSessionActive(machineId)) {
             moshUdpEngine.resize(machineId, cols, rows)
         }
-        realHerdrSshClient.resizeViewport(machineId, cols, rows)
+        backend.resize(machineId, cols, rows)
         sshDebugLog.record(
             machineId = machineId,
             tag = "Resize",
@@ -491,209 +407,9 @@ class SshTransportManager(
         onNetworkAvailable(machineId)
     }
 
-    /**
-     * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet
-     * `HERDR_CONFIG_PATH` config, and launches `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`.
-     */
-    fun buildMoshServerBootstrapCommand(machine: HostMachine): String {
-        val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
-        val portRange = machine.moshUdpPortRange.ifBlank { HostMachine.DEFAULT_MOSH_UDP_PORT_RANGE }
-        val sessionArg = machine.herdrSessionName?.takeIf { it.isNotBlank() }?.let { " --session $it" }.orEmpty()
-        return "command -v $moshBin >/dev/null 2>&1 && " +
-            "$moshBin new -s -c 256 -l LANG=en_US.UTF-8 -p $portRange -- " +
-            "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
-    }
-
-    fun buildSshEndpointBridgeCommand(idleTimeoutV1: Boolean = true): String =
-        if (idleTimeoutV1) {
-            "herdr remote-client-bridge --idle-timeout-v1"
-        } else {
-            "herdr remote-client-bridge"
-        }
-
-    fun buildSshApiBridgeCommand(): String = "herdr remote-api-bridge"
-
-    private suspend fun authenticateSshSession(
+    private suspend fun startControlSideband(
         machine: HostMachine,
         route: ResolvedSshRoute,
-    ): Boolean {
-        if (shouldUseRealSsh(machine)) {
-            return realHerdrSshClient.connectAndVerify(machine, route)
-        }
-        val challenge = "ssh-userauth:${machine.id}:${route.targetHost}:${route.targetPort}".toByteArray(Charsets.UTF_8)
-        return when (val auth = machine.authMethod) {
-            is SshAuthMethod.KeystoreKey -> {
-                val exported = keystoreKeyManager.getOrCreatePublicKey(
-                    keyAlias = auth.keyAlias,
-                    algorithm = auth.algorithm,
-                    requireBiometric = auth.requireBiometric,
-                )
-                val sig = keystoreKeyManager.signSshChallenge(
-                    keyAlias = auth.keyAlias,
-                    algorithm = auth.algorithm,
-                    challenge = challenge,
-                )
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "SSHAuth",
-                    message = "Authenticated ${machine.displayAddress} with AndroidKeyStore ${auth.algorithm.sshKeyType} " +
-                        "(alias=${exported.keyAlias}, sigBytes=${sig.size}, viaBastion=${route.viaBastion})",
-                )
-                sig.isNotEmpty()
-            }
-
-            is SshAuthMethod.Password -> {
-                val isValid = auth.encryptedPasswordRef.isNotBlank() &&
-                    (passwordAuthenticator?.invoke(machine, auth) ?: !auth.encryptedPasswordRef.startsWith("invalid:"))
-                if (!isValid) {
-                    sshDebugLog.record(
-                        machineId = machine.id,
-                        tag = "SSHAuth",
-                        message = "Password authentication failed for ${machine.displayAddress}: invalid or blank credential",
-                        isError = true,
-                    )
-                    return false
-                }
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "SSHAuth",
-                    message = "Authenticated ${machine.displayAddress} via encrypted password credential (viaBastion=${route.viaBastion})",
-                )
-                true
-            }
-
-            is SshAuthMethod.HardwareSecurityKey -> {
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "SSHAuth",
-                    message = "Requesting hardware security key assertion (${auth.keyType.opensshKeyType}, transport=${auth.transport})",
-                )
-                val result = yubiKeyFido2Manager.signChallenge(
-                    machineId = machine.id,
-                    keyType = auth.keyType.opensshKeyType,
-                    applicationId = auth.applicationId,
-                    challenge = challenge,
-                )
-                result.isSuccess
-            }
-        }
-    }
-
-    private suspend fun negotiateBackbone(
-        machine: HostMachine,
-        route: ResolvedSshRoute,
-    ): ActiveBackbone? {
-        val machineId = machine.id
-        if (shouldUseRealSsh(machine)) {
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
-            val hasMosh = if (machine.transportMode != TransportMode.SshEndpointOnly) {
-                realHerdrSshClient.checkMoshServerAvailable(machine, route)
-            } else {
-                false
-            }
-            return if (hasMosh) {
-                val defaultPort = machine.parsedMoshPortRange().first
-                ActiveBackbone.MoshUdp(
-                    udpPort = defaultPort,
-                    rttMs = 9,
-                    localEchoEnabled = true,
-                    roamedCount = 0,
-                )
-            } else {
-                ActiveBackbone.SshEndpoint(
-                    rttMs = 12,
-                    fallbackReason = null,
-                )
-            }
-        }
-        var moshFallbackReason: String? = null
-        if (machine.transportMode != TransportMode.SshEndpointOnly) {
-            val bootstrapCmd = buildMoshServerBootstrapCommand(machine)
-            val configToml = MoshBootstrapConfig.buildTabletHerdrConfigToml()
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "MoshBootstrap",
-                message = "Executing: $bootstrapCmd (configBytes=${configToml.length})",
-            )
-
-            val defaultPort = machine.parsedMoshPortRange().first
-            val banner = moshBootstrapBannerProvider?.invoke(machine)
-                ?: "MOSH CONNECT $defaultPort 4k9X2vL8pQ1mN7rT3wY6zA"
-            val connectInfo = MoshBootstrapConfig.parseMoshConnectLine(banner)
-
-            if (connectInfo != null) {
-                sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
-                val udpVerified = withTimeoutOrNull(MOSH_UDP_HANDSHAKE_TIMEOUT_MS) {
-                    val probeAllowed = moshUdpReachabilityProbe?.invoke(machine, connectInfo) ?: true
-                    if (!probeAllowed) {
-                        false
-                    } else {
-                        moshUdpEngine.startSession(
-                            machineId = machineId,
-                            host = route.targetHost,
-                            udpPort = connectInfo.udpPort,
-                            sessionKey = connectInfo.sessionKey,
-                            cols = DEFAULT_COLS,
-                            rows = DEFAULT_ROWS,
-                            localEcho = true,
-                        )
-                    }
-                } == true
-
-                if (udpVerified) {
-                    return ActiveBackbone.MoshUdp(
-                        udpPort = connectInfo.udpPort,
-                        rttMs = 11,
-                        localEchoEnabled = true,
-                        roamedCount = 0,
-                    )
-                }
-                moshUdpEngine.stopSession(machineId)
-                moshFallbackReason = "Mosh UDP unreachable or blocked by firewall (${MOSH_UDP_HANDSHAKE_TIMEOUT_MS}ms timeout)"
-            } else {
-                moshFallbackReason = "mosh-server unavailable on remote host"
-            }
-
-            if (machine.transportMode == TransportMode.MoshOnly) {
-                sshDebugLog.record(
-                    machineId = machineId,
-                    tag = "MoshBootstrap",
-                    message = "MoshOnly mode requested, but mosh-server or UDP handshake failed ($moshFallbackReason)",
-                    isError = true,
-                )
-                return null
-            }
-
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "Fallback",
-                message = "$moshFallbackReason; falling back to ${buildSshEndpointBridgeCommand()}",
-            )
-        }
-
-        // SSH Endpoint Generation 1 fallback (`herdr remote-client-bridge --idle-timeout-v1`)
-        sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
-        val hello = EndpointClientHello(
-            surfaceSize = ClientSurfaceSize(cols = DEFAULT_COLS, rows = DEFAULT_ROWS),
-            surfaceActive = true,
-        )
-        sshDebugLog.record(
-            machineId = machineId,
-            tag = "EndpointGen1",
-            message = "Negotiated ${buildSshEndpointBridgeCommand()} (hello.generation=${hello.generation}, surfaceActive=${hello.surfaceActive})",
-        )
-        return ActiveBackbone.SshEndpoint(
-            rttMs = 24,
-            fallbackReason = if (machine.transportMode == TransportMode.AutoPreferMosh) {
-                moshFallbackReason ?: "Mosh UDP unavailable"
-            } else {
-                null
-            },
-        )
-    }
-
-    private suspend fun startControlSidebandAndSeedSnapshot(
-        machine: HostMachine,
         backbone: ActiveBackbone,
     ) {
         val machineId = machine.id
@@ -708,286 +424,8 @@ class SshTransportManager(
             message = "Started ${buildSshEndpointBridgeCommand()} (surface_active=${sidebandHello.surfaceActive}) + " +
                 "multiplexed ${buildSshApiBridgeCommand()} events.subscribe stream",
         )
-
-        if (shouldUseRealSsh(machine)) {
-            val route = proxyJumpTunnel.resolveRoute(machine)
-            realHerdrSshClient.refreshSnapshotAndSurface(machine, route)
-            realHerdrSshClient.startLivePolling(machine, route) {
-                surfaceLeaseActive[machineId] != false
-            }
-            return
-        }
-
-        // Fetch initial pane.layout and agent.read(source = "visible") over herdr remote-api-bridge
-        sendEndpointCommand(machineId, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
-        sendEndpointCommand(
-            machineId = machineId,
-            request = HerdrRpcBuilder.agentRead(
-                paneId = "w1:p1",
-                agentStatus = AgentStatus.Working,
-            ),
-        )
-
-        val existingSnapshot = endpointSnapshotBus.snapshotFor(machineId)
-        if (existingSnapshot == null) {
-            val snapshot = ClientShellSnapshot(
-                bootId = "boot-$machineId",
-                revision = 1u,
-                focusedWorkspaceId = "w1",
-                focusedTabId = "w1:t1",
-                focusedPaneId = "w1:p1",
-                workspaces = listOf(
-                    ClientShellWorkspace(
-                        workspaceId = "w1",
-                        activeTabId = "w1:t1",
-                        label = "herdr-core",
-                        branch = "main",
-                        focused = true,
-                        agentStatus = AgentStatus.Working,
-                    ),
-                    ClientShellWorkspace(
-                        workspaceId = "w2",
-                        activeTabId = "w2:t1",
-                        label = "wt/roaming",
-                        branch = "feat/roaming",
-                        focused = false,
-                        agentStatus = AgentStatus.Idle,
-                    ),
-                ),
-                tabs = listOf(
-                    ClientShellTab(
-                        tabId = "w1:t1",
-                        workspaceId = "w1",
-                        number = 1,
-                        label = "main",
-                        focused = true,
-                        agentStatus = AgentStatus.Working,
-                    ),
-                    ClientShellTab(
-                        tabId = "w1:t2",
-                        workspaceId = "w1",
-                        number = 2,
-                        label = "tests",
-                        focused = false,
-                        agentStatus = AgentStatus.Idle,
-                    ),
-                ),
-                panes = listOf(
-                    ClientShellPane(
-                        paneId = "w1:p1",
-                        workspaceId = "w1",
-                        tabId = "w1:t1",
-                        label = "${machine.name} · shell #1",
-                        cwd = "~/workspace",
-                        focused = true,
-                    ),
-                    ClientShellPane(
-                        paneId = "w1:p2",
-                        workspaceId = "w1",
-                        tabId = "w1:t1",
-                        label = "${machine.name} · shell #2",
-                        cwd = "~/workspace",
-                        focused = false,
-                    ),
-                ),
-                agents = listOf(
-                    ClientShellAgent(
-                        paneId = "w1:p1",
-                        workspaceId = "w1",
-                        tabId = "w1:t1",
-                        name = "claude",
-                        displayAgent = "Claude Code",
-                        agent = "claude",
-                        title = "Connected to ${machine.displayAddress}",
-                        agentStatus = AgentStatus.Working,
-                        focused = true,
-                    ),
-                    ClientShellAgent(
-                        paneId = "w1:p2",
-                        workspaceId = "w1",
-                        tabId = "w1:t1",
-                        name = "codex",
-                        displayAgent = "Codex CLI",
-                        agent = "codex",
-                        title = "Monitoring ${machine.displayAddress}",
-                        agentStatus = AgentStatus.Idle,
-                        focused = false,
-                    ),
-                ),
-            )
-            endpointSnapshotBus.publish(machineId, snapshot)
-        }
-
-        if (isMosh) {
-            moshUdpEngine.updateLayoutSnapshot(
-                machineId = machineId,
-                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = "w1:p1"),
-                tabCount = 1,
-            )
-        } else if (paneSurfaceBus.surfaceFor(machineId) == null) {
-            val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
-            val initialFrame = PaneSurfaceFrame(
-                bootId = "boot-$machineId",
-                revision = 1u,
-                frame = FrameData(
-                    width = DEFAULT_COLS,
-                    height = DEFAULT_ROWS,
-                    cells = List(DEFAULT_COLS.toInt() * DEFAULT_ROWS.toInt()) { BLANK_CELL },
-                    cursor = CursorState(x = 0u, y = 0u, shape = CursorShape.Block, visible = true),
-                ),
-                panes = listOf(
-                    PaneSurfacePane(
-                        paneId = "w1:p1",
-                        rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
-                        focused = true,
-                        title = "${machine.name} · SSH Endpoint Gen 1",
-                        agentStatus = AgentStatus.Working,
-                    ),
-                    PaneSurfacePane(
-                        paneId = "w1:p2",
-                        rect = SurfaceRect(halfCols, 0u, (DEFAULT_COLS - halfCols).toUShort(), DEFAULT_ROWS),
-                        focused = false,
-                        title = "${machine.name} · Pane #2",
-                        agentStatus = AgentStatus.Idle,
-                    ),
-                ),
-            )
-            val assembled = surfaceDeltaAssembler.commitFullFrame(machineId, initialFrame)
-            paneSurfaceBus.publish(machineId, assembled.frame)
-        }
-
-        semanticNotificationBus.updateAgentSnippet(
-            machineId = machineId,
-            paneId = "w1:p1",
-            snippet = "Connected to ${machine.displayAddress} via ${if (isMosh) "Mosh UDP SSP" else "SSH Endpoint Gen 1"}",
-        )
-        semanticNotificationBus.tryPublishNotification(
-            machineId = machineId,
-            notification = SemanticNotification(
-                bootId = "boot-$machineId",
-                sequence = 1u,
-                title = "Connected to ${machine.name}",
-                body = if (isMosh) "Mosh UDP SSP zero-drop roaming active" else "SSH Endpoint Gen 1 active",
-                paneId = "w1:p1",
-                agentName = "claude",
-                agentStatus = AgentStatus.Working,
-            ),
-        )
-    }
-
-    private fun buildTwoPaneLayoutSnapshot(focusedPaneId: String): PaneLayoutSnapshot {
-        val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
-        val rightCols = (DEFAULT_COLS - halfCols).toUShort()
-        return PaneLayoutSnapshot(
-            workspaceId = "w1",
-            tabId = "w1:t1",
-            zoomed = false,
-            panes = listOf(
-                PaneLayoutPane(
-                    paneId = "w1:p1",
-                    rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
-                    focused = focusedPaneId == "w1:p1",
-                ),
-                PaneLayoutPane(
-                    paneId = "w1:p2",
-                    rect = SurfaceRect(halfCols, 0u, rightCols, DEFAULT_ROWS),
-                    focused = focusedPaneId == "w1:p2",
-                ),
-            ),
-            splits = listOf(
-                PaneLayoutSplit(
-                    id = "s0:root",
-                    direction = PaneSurfaceSplitDirection.Vertical,
-                    ratio = 0.5f,
-                    rect = SurfaceRect(0u, 0u, DEFAULT_COLS, DEFAULT_ROWS),
-                ),
-            ),
-        )
-    }
-
-    private fun parseParamsObject(paramsJson: String): JsonObject =
-        runCatching { json.parseToJsonElement(paramsJson).jsonObject }
-            .getOrElse { JsonObject(emptyMap()) }
-
-    private fun applyFocusRpcMutation(
-        machineId: String,
-        request: ClientShellEndpointRequest,
-        isMoshActive: Boolean,
-    ) {
-        val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId) ?: return
-
-        when (request.method) {
-            "workspace.focus" -> {
-                val params = parseParamsObject(request.paramsJson)
-                val wsId = params["workspace_id"]?.jsonPrimitive?.content ?: return
-                val updated = currentSnapshot.copy(
-                    revision = currentSnapshot.revision + 1u,
-                    focusedWorkspaceId = wsId,
-                    workspaces = currentSnapshot.workspaces.map { it.copy(focused = it.workspaceId == wsId) },
-                )
-                endpointSnapshotBus.publish(machineId, updated)
-            }
-
-            "tab.focus" -> {
-                val params = parseParamsObject(request.paramsJson)
-                val tabId = params["tab_id"]?.jsonPrimitive?.content ?: return
-                val updated = currentSnapshot.copy(
-                    revision = currentSnapshot.revision + 1u,
-                    focusedTabId = tabId,
-                    tabs = currentSnapshot.tabs.map { it.copy(focused = it.tabId == tabId) },
-                )
-                endpointSnapshotBus.publish(machineId, updated)
-            }
-
-            "pane.focus" -> {
-                val params = parseParamsObject(request.paramsJson)
-                val paneId = params["pane_id"]?.jsonPrimitive?.content ?: return
-                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, paneId, isMoshActive)
-            }
-
-            "agent.focus" -> {
-                val params = parseParamsObject(request.paramsJson)
-                val requestedPaneId = params["pane_id"]?.jsonPrimitive?.content
-                val requestedName = params["name"]?.jsonPrimitive?.content
-                val resolvedPaneId = requestedPaneId
-                    ?: currentSnapshot.agents.firstOrNull { it.name == requestedName }?.paneId
-                    ?: return
-                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, resolvedPaneId, isMoshActive)
-            }
-        }
-    }
-
-    private fun focusPaneInSnapshotAndSurface(
-        machineId: String,
-        currentSnapshot: ClientShellSnapshot,
-        paneId: String,
-        isMoshActive: Boolean,
-    ) {
-        val updatedSnapshot = currentSnapshot.copy(
-            revision = currentSnapshot.revision + 1u,
-            focusedPaneId = paneId,
-            panes = currentSnapshot.panes.map { it.copy(focused = it.paneId == paneId) },
-            agents = currentSnapshot.agents.map { it.copy(focused = it.paneId == paneId) },
-        )
-        endpointSnapshotBus.publish(machineId, updatedSnapshot)
-
-        if (isMoshActive) {
-            moshUdpEngine.updateLayoutSnapshot(
-                machineId = machineId,
-                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = paneId),
-                tabCount = updatedSnapshot.tabs.size.coerceAtLeast(1),
-            )
-        } else {
-            val currentSurface = paneSurfaceBus.surfaceFor(machineId)
-            if (currentSurface != null) {
-                paneSurfaceBus.publish(
-                    machineId = machineId,
-                    frame = currentSurface.copy(
-                        revision = currentSurface.revision + 1u,
-                        panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
-                    ),
-                )
-            }
+        backend.openSurface(machine, route, backbone) {
+            surfaceLeaseActive[machineId] != false
         }
     }
 
@@ -1003,69 +441,34 @@ class SshTransportManager(
         }
     }
 
-    private fun encodeInputEventToBytes(event: ClientPaneInputEvent): ByteArray =
-        when (event) {
-            is ClientPaneInputEvent.TextCommit -> event.text.encodeToByteArray()
-            is ClientPaneInputEvent.Paste -> event.text.encodeToByteArray()
-            is ClientPaneInputEvent.Key -> encodeKeyEventToBytes(event)
-            is ClientPaneInputEvent.Mouse -> EMPTY_BYTES
-        }
-
-    private fun encodeKeyEventToBytes(keyEvent: ClientPaneInputEvent.Key): ByteArray {
-        val ev = keyEvent.event
-        return when (ev.code) {
-            ClientKeyCode.Enter -> ENTER_BYTES
-            ClientKeyCode.Escape -> ESCAPE_BYTES
-            ClientKeyCode.Tab -> TAB_BYTES
-            ClientKeyCode.Backspace -> BACKSPACE_BYTES
-            ClientKeyCode.Up -> UP_BYTES
-            ClientKeyCode.Down -> DOWN_BYTES
-            ClientKeyCode.Right -> RIGHT_BYTES
-            ClientKeyCode.Left -> LEFT_BYTES
-            ClientKeyCode.Home -> HOME_BYTES
-            ClientKeyCode.End -> END_BYTES
-            ClientKeyCode.PageUp -> PAGE_UP_BYTES
-            ClientKeyCode.PageDown -> PAGE_DOWN_BYTES
-            ClientKeyCode.Delete -> DELETE_BYTES
-            ClientKeyCode.CharC -> if (ev.ctrl) CTRL_C_BYTES else CHAR_C_BYTES
-            ClientKeyCode.CharB -> if (ev.ctrl) CTRL_B_BYTES else CHAR_B_BYTES
-            ClientKeyCode.CharD -> if (ev.ctrl) CTRL_D_BYTES else CHAR_D_BYTES
-            ClientKeyCode.CharZ -> if (ev.ctrl) CTRL_Z_BYTES else CHAR_Z_BYTES
-            ClientKeyCode.CharY -> CHAR_Y_BYTES
-            ClientKeyCode.CharN -> CHAR_N_BYTES
-        }
-    }
-
     companion object {
         const val MOSH_UDP_HANDSHAKE_TIMEOUT_MS: Long = 1_500L
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
-        private val DEFAULT_COLS: UShort = 120u
-        private val DEFAULT_ROWS: UShort = 36u
-        private val BLANK_CELL = CellData()
+        internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
+        internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
+        internal val DEFAULT_COLS: UShort = 120u
+        internal val DEFAULT_ROWS: UShort = 36u
 
-        private val EMPTY_BYTES = ByteArray(0)
-        private val ENTER_BYTES = "\r".encodeToByteArray()
-        private val ESCAPE_BYTES = "\u001b".encodeToByteArray()
-        private val TAB_BYTES = "\t".encodeToByteArray()
-        private val BACKSPACE_BYTES = "\u007f".encodeToByteArray()
-        private val UP_BYTES = "\u001b[A".encodeToByteArray()
-        private val DOWN_BYTES = "\u001b[B".encodeToByteArray()
-        private val RIGHT_BYTES = "\u001b[C".encodeToByteArray()
-        private val LEFT_BYTES = "\u001b[D".encodeToByteArray()
-        private val HOME_BYTES = "\u001b[H".encodeToByteArray()
-        private val END_BYTES = "\u001b[F".encodeToByteArray()
-        private val PAGE_UP_BYTES = "\u001b[5~".encodeToByteArray()
-        private val PAGE_DOWN_BYTES = "\u001b[6~".encodeToByteArray()
-        private val DELETE_BYTES = "\u001b[3~".encodeToByteArray()
-        private val CTRL_C_BYTES = byteArrayOf(0x03)
-        private val CTRL_B_BYTES = byteArrayOf(0x02)
-        private val CTRL_D_BYTES = byteArrayOf(0x04)
-        private val CTRL_Z_BYTES = byteArrayOf(0x1a)
-        private val CHAR_C_BYTES = "c".encodeToByteArray()
-        private val CHAR_B_BYTES = "b".encodeToByteArray()
-        private val CHAR_D_BYTES = "d".encodeToByteArray()
-        private val CHAR_Z_BYTES = "z".encodeToByteArray()
-        private val CHAR_Y_BYTES = "y".encodeToByteArray()
-        private val CHAR_N_BYTES = "n".encodeToByteArray()
+        /**
+         * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet
+         * `HERDR_CONFIG_PATH` config, and launches `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`.
+         */
+        fun buildMoshServerBootstrapCommand(machine: HostMachine): String {
+            val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
+            val portRange = machine.moshUdpPortRange.ifBlank { HostMachine.DEFAULT_MOSH_UDP_PORT_RANGE }
+            val sessionArg = machine.herdrSessionName?.takeIf { it.isNotBlank() }?.let { " --session $it" }.orEmpty()
+            return "command -v $moshBin >/dev/null 2>&1 && " +
+                "$moshBin new -s -c 256 -l LANG=en_US.UTF-8 -p $portRange -- " +
+                "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
+        }
+
+        fun buildSshEndpointBridgeCommand(idleTimeoutV1: Boolean = true): String =
+            if (idleTimeoutV1) {
+                "herdr remote-client-bridge --idle-timeout-v1"
+            } else {
+                "herdr remote-client-bridge"
+            }
+
+        fun buildSshApiBridgeCommand(): String = "herdr remote-api-bridge"
     }
 }

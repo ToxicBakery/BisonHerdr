@@ -10,9 +10,10 @@ import org.kodein.di.instance
  *
  * Wired into `:app:android` via `debugImplementation(projects.core.fakeServer)` only;
  * release builds bind `NoDebugServer` so zero simulated server code ships in production.
+ * The debug bindings also get [FakeHerdrServer] by its own type to ask [FakeHerdrServer.isFakeMachine].
  */
 val fakeServerModule = DI.Module("fakeServerModule") {
-    bindSingleton<DebugServer> {
+    bindSingleton {
         FakeHerdrServer(
             machineStore = instance(),
             sshStateManager = instance(),
@@ -22,4 +23,5 @@ val fakeServerModule = DI.Module("fakeServerModule") {
             semanticNotificationBus = instance(),
         )
     }
+    bindSingleton<DebugServer> { instance<FakeHerdrServer>() }
 }
