@@ -25,6 +25,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
@@ -223,6 +224,57 @@ class ControlRequestRunnerTest {
 
         assertEquals(LocalNetworkOutcome.Cancelled, waiting.await())
         assertEquals(0L, currentTime, "The connect waited for the time-out")
+    }
+
+    @Test
+    fun theRouterEndsTheWaitsOfADisconnectAndQueuesIt() = runTest {
+        val localNetworkAccess = LocalNetworkAccess()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            localNetworkAccess.hostRequests { awaitCancellation() }
+        }
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.hostUserAuthPrompts { awaitCancellation() }
+        }
+        val localNetworkWait = async { localNetworkAccess.request("workbox", "192.168.1.42:22", 60.seconds) }
+        val userAuthWait = async {
+            stateManager.requestUserAuth("workbox", "workbox", "bison_default_ed25519", timeoutMs = 60_000L)
+        }
+        runCurrent()
+        val fastQueue = Channel<SshRequest>(Channel.UNLIMITED)
+        val controlQueue = Channel<SshRequest>(Channel.UNLIMITED)
+
+        val input = SshRequest.ResizeShell("workbox", cols = 80u, rows = 24u)
+        routeSshRequest(input, stateManager, localNetworkAccess, fastQueue, controlQueue)
+        runCurrent()
+        assertTrue(localNetworkWait.isActive, "Pane input ended the wait")
+        assertSame(input, fastQueue.tryReceive().getOrNull())
+
+        val disconnect = SshRequest.Disconnect("workbox")
+        routeSshRequest(disconnect, stateManager, localNetworkAccess, fastQueue, controlQueue)
+
+        assertEquals(LocalNetworkOutcome.Cancelled, localNetworkWait.await())
+        assertEquals(UserAuthOutcome.Cancelled, userAuthWait.await())
+        assertSame(disconnect, controlQueue.tryReceive().getOrNull())
+        assertNull(fastQueue.tryReceive().getOrNull())
+    }
+
+    @Test
+    fun disconnectAllAlsoDisconnectsTheMachinesThatWaitedForTheLocalNetworkPermission() = runTest {
+        val localNetworkAccess = LocalNetworkAccess()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            localNetworkAccess.hostRequests { awaitCancellation() }
+        }
+        stateManager.markMachineConnected("gpu-rig", ActiveBackbone.SshEndpoint(rttMs = 1))
+        // The connect of workbox waits for the answer to the system dialog.
+        val waiting = async { localNetworkAccess.request("workbox", "192.168.1.42:22", 60.seconds) }
+        runCurrent()
+
+        val machineIds = endWaitsForDisconnectAll(stateManager, localNetworkAccess)
+
+        // The connect of workbox stops with the local network cause. Its disconnect removes the cause, so that a
+        // later grant does not connect it again.
+        assertEquals(setOf("gpu-rig", "workbox"), machineIds)
+        assertEquals(LocalNetworkOutcome.Cancelled, waiting.await())
     }
 
     private companion object {

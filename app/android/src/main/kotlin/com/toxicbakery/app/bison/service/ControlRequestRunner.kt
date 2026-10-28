@@ -3,9 +3,11 @@ package com.toxicbakery.app.bison.service
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.isConnectStep
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
+import com.toxicbakery.app.bison.ssh.NeedsUserCause
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 
@@ -38,6 +40,44 @@ internal suspend fun SshStateManager.runControlRequest(
  */
 internal fun SshStateManager.cancelUserAuthBeforeQueue(request: SshRequest) {
     if (request is SshRequest.Disconnect) cancelUserAuth(request.machineId)
+}
+
+/**
+ * Sends [request] to its queue. Pane input and a resize go to [fastQueue]. Each other request goes to [controlQueue].
+ * A disconnect first ends the waits of its machine for the user ([cancelUserAuthBeforeQueue] and
+ * [cancelRequestBeforeQueue]).
+ */
+internal fun routeSshRequest(
+    request: SshRequest,
+    sshStateManager: SshStateManager,
+    localNetworkAccess: LocalNetworkAccess,
+    fastQueue: SendChannel<SshRequest>,
+    controlQueue: SendChannel<SshRequest>,
+) {
+    when (request) {
+        is SshRequest.SendPaneInput,
+        is SshRequest.ResizeShell -> fastQueue.trySend(request)
+        else -> {
+            sshStateManager.cancelUserAuthBeforeQueue(request)
+            localNetworkAccess.cancelRequestBeforeQueue(request)
+            controlQueue.trySend(request)
+        }
+    }
+}
+
+/**
+ * Ends all waits for the user before **Disconnect All**, and returns the machines to disconnect. These are the
+ * connected machines and the machines whose wait for the local network permission ended. Such a machine is at a
+ * connect step. Without a disconnect, its connect stops with [NeedsUserCause.LocalNetworkPermission], and a later grant
+ * connects it again.
+ */
+internal fun endWaitsForDisconnectAll(
+    sshStateManager: SshStateManager,
+    localNetworkAccess: LocalNetworkAccess,
+): Set<String> {
+    sshStateManager.cancelAllUserAuth()
+    val waiting = localNetworkAccess.cancelAll()
+    return sshStateManager.connectedMachines.value + waiting
 }
 
 /**
