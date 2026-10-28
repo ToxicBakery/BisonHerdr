@@ -342,6 +342,7 @@ class SshTransportManager(
         activeMachines.remove(machineId)
         sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.clearNeedsUser(machineId)
+        sshStateManager.cancelUserAuth(machineId)
         sshStateManager.markMachineDisconnected(machineId)
         sshDebugLog.record(
             machineId = machineId,

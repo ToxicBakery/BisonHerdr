@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
+import com.toxicbakery.app.bison.ssh.UserAuthOutcome
 import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -13,10 +14,13 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
@@ -143,6 +147,28 @@ class ControlRequestRunnerTest {
 
         assertIs<IOException>(error)
         assertEquals(ConnectionProgress.VerifyingUdpOrHello, progress())
+    }
+
+    @Test
+    fun aDisconnectEndsTheUserAuthWaitOfItsMachineBeforeTheQueue() = runTest {
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.hostUserAuthPrompts { awaitCancellation() }
+        }
+        // The connect in the control queue waits for the user.
+        val waiting = async {
+            stateManager.requestUserAuth("workbox", "workbox", "bison_default_ed25519", timeoutMs = 60_000L)
+        }
+        runCurrent()
+
+        stateManager.cancelUserAuthBeforeQueue(SshRequest.Disconnect("gpu-rig"))
+        stateManager.cancelUserAuthBeforeQueue(SshRequest.Connect("workbox"))
+        runCurrent()
+        assertTrue(waiting.isActive, "A request that is not a disconnect of the machine ended the wait")
+
+        stateManager.cancelUserAuthBeforeQueue(SshRequest.Disconnect("workbox"))
+
+        assertEquals(UserAuthOutcome.Cancelled, waiting.await())
+        assertEquals(0L, currentTime, "The connect waited for the time-out")
     }
 
     private companion object {

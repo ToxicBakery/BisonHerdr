@@ -138,6 +138,37 @@ class UserAuthPromptTest {
     }
 
     @Test
+    fun cancelUserAuthEndsTheWaitOfThatMachineAtOnce() = runTest {
+        startUi { awaitCancellation() }
+        val workbox = async { request(machineId = "workbox") }
+        val gpuRig = async { request(machineId = "gpu-rig") }
+        runCurrent()
+
+        stateManager.cancelUserAuth("workbox")
+
+        assertEquals(UserAuthOutcome.Cancelled, workbox.await())
+        assertEquals(0L, currentTime, "The request waited")
+        assertEquals(listOf("gpu-rig"), stateManager.userAuthPrompts.value.map { it.machineId })
+        assertTrue(gpuRig.isActive)
+        gpuRig.cancel()
+    }
+
+    @Test
+    fun cancelAllUserAuthEndsAllWaitsAtOnce() = runTest {
+        startUi { awaitCancellation() }
+        val workbox = async { request(machineId = "workbox") }
+        val gpuRig = async { request(machineId = "gpu-rig") }
+        runCurrent()
+
+        stateManager.cancelAllUserAuth()
+
+        assertEquals(UserAuthOutcome.Cancelled, workbox.await())
+        assertEquals(UserAuthOutcome.Cancelled, gpuRig.await())
+        assertEquals(0L, currentTime, "The requests waited")
+        assertTrue(stateManager.userAuthPrompts.value.isEmpty())
+    }
+
+    @Test
     fun aNewPromptForTheSameMachineCancelsTheOldPrompt() = runTest {
         val answers = mutableMapOf<UserAuthPrompt, CompletableDeferred<UserAuthOutcome>>()
         startUi { prompt -> CompletableDeferred<UserAuthOutcome>().also { answers[prompt] = it }.await() }

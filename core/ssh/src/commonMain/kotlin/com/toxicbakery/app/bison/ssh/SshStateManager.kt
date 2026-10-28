@@ -205,10 +205,24 @@ class SshStateManager {
                     if (prompt != null) answerUserAuth(prompt, showSafely(prompt, show))
                 }
         } finally {
-            if (userAuthHosts.updateAndGet { it - 1 } == 0) {
-                _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
-            }
+            if (userAuthHosts.updateAndGet { it - 1 } == 0) cancelAllUserAuth()
         }
+    }
+
+    /**
+     * Gives [UserAuthOutcome.Cancelled] to the open user authentication prompt of [machineId]. The wait of
+     * [requestUserAuth] then ends at once. A disconnect calls it before its request goes into a queue, because the
+     * connect that waits for the prompt can hold that queue.
+     */
+    fun cancelUserAuth(machineId: String) {
+        _userAuthPrompts.value
+            .filter { it.machineId == machineId }
+            .forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+    }
+
+    /** Gives [UserAuthOutcome.Cancelled] to all open user authentication prompts. */
+    fun cancelAllUserAuth() {
+        _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
     }
 
     /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */
