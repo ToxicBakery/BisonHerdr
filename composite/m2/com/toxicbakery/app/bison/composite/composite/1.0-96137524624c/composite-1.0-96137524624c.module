@@ -3,14 +3,14 @@
   "component": {
     "group": "com.toxicbakery.app.bison.composite",
     "module": "composite",
-    "version": "1.0-23da83fe9c70",
+    "version": "1.0-96137524624c",
     "attributes": {
       "org.gradle.status": "release"
     }
   },
   "createdBy": {
     "gradle": {
-      "version": "9.3.1"
+      "version": "9.8.2"
     }
   },
   "variants": [
@@ -27,13 +27,13 @@
       },
       "files": [
         {
-          "name": "composite-1.0-23da83fe9c70.jar",
-          "url": "composite-1.0-23da83fe9c70.jar",
-          "size": 30966,
-          "sha512": "33732b2c43187aef652f0f2f104c893eaf9a4155f0389326982280bf5bd41c028db553b2cd659914701f629aa3ff37378099031cf13521b95332b7daffe195d8",
-          "sha256": "863252f374341d50aa8064ced40a8675ecae31c2401ecda3f4d5cbfd33fccc48",
-          "sha1": "a41d8760e89bd00f00e23afe8c7da3024e319944",
-          "md5": "be3be7e4d69c4f4a44a0d2c66bb640d4"
+          "name": "composite-1.0-96137524624c.jar",
+          "url": "composite-1.0-96137524624c.jar",
+          "size": 48596,
+          "sha512": "4d0158a484e2bf0e928e975c2ce750b7f3d3f5c167e9a32b05750e9365d4289d46503bf02b223e78599b9e391ef34d28269079da71cc5204688739b75f7fa1d1",
+          "sha256": "e949350078462918405f50b6b9c63a3b100a4642a33b6c0acab5971258513839",
+          "sha1": "8106f57367c3b8bce8bee82b9e95482063c38ee0",
+          "md5": "66768f0a501817eef018061fe34801be"
         }
       ]
     },
@@ -50,13 +50,13 @@
       },
       "files": [
         {
-          "name": "composite-1.0-23da83fe9c70.jar",
-          "url": "composite-1.0-23da83fe9c70.jar",
-          "size": 30966,
-          "sha512": "33732b2c43187aef652f0f2f104c893eaf9a4155f0389326982280bf5bd41c028db553b2cd659914701f629aa3ff37378099031cf13521b95332b7daffe195d8",
-          "sha256": "863252f374341d50aa8064ced40a8675ecae31c2401ecda3f4d5cbfd33fccc48",
-          "sha1": "a41d8760e89bd00f00e23afe8c7da3024e319944",
-          "md5": "be3be7e4d69c4f4a44a0d2c66bb640d4"
+          "name": "composite-1.0-96137524624c.jar",
+          "url": "composite-1.0-96137524624c.jar",
+          "size": 48596,
+          "sha512": "4d0158a484e2bf0e928e975c2ce750b7f3d3f5c167e9a32b05750e9365d4289d46503bf02b223e78599b9e391ef34d28269079da71cc5204688739b75f7fa1d1",
+          "sha256": "e949350078462918405f50b6b9c63a3b100a4642a33b6c0acab5971258513839",
+          "sha1": "8106f57367c3b8bce8bee82b9e95482063c38ee0",
+          "md5": "66768f0a501817eef018061fe34801be"
         }
       ]
     }
