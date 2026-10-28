@@ -18,7 +18,6 @@ androidx-testRunner = "1.7.0"
 androidx-uiautomator = "2.4.0"
 arbor = "3.0.136"
 coil = "3.6.3"
-compose-hot-reload = "1.2.0"
 compose-material-icons = "1.7.3"
 compose-multiplatform = "1.12.2"
 jna = "5.19.1"
@@ -98,7 +97,6 @@ androidBaseline = { id = "androidx.baselineprofile", version.ref = "android-base
 androidLibrary = { id = "com.android.library", version.ref = "agp" }
 androidMultiplatformLibrary = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
 androidTest = { id = "com.android.test" }
-composeHotReload = { id = "org.jetbrains.compose.hot-reload", version.ref = "compose-hot-reload" }
 composeMultiplatform = { id = "org.jetbrains.compose", version.ref = "compose-multiplatform" }
 composeCompiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 composite = { id = "composite", version = "1.0" }
