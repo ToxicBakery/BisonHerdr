@@ -55,10 +55,16 @@ data class HostMachine(
  */
 @Serializable
 enum class TransportMode {
-    /** Probe `mosh-server` and negotiate UDP SSP first; fall back to SSH Endpoint Gen 1 if UDP is blocked. */
+    /**
+     * Prefer Mosh UDP when it is available. This version has no Mosh transport (issue #22), so the app connects
+     * over SSH Endpoint Gen 1. It checks for `mosh-server` and tells when the host has it.
+     */
     AutoPreferMosh,
 
-    /** Require Mosh UDP SSP backbone and fail connection if `mosh-server` or UDP is unreachable. */
+    /**
+     * Use only Mosh UDP. This version has no Mosh transport (issue #22), so the app connects over SSH Endpoint
+     * Gen 1, as for [AutoPreferMosh].
+     */
     MoshOnly,
 
     /** Connect exclusively over SSH TCP using `herdr remote-client-bridge` (Endpoint Generation 1). */

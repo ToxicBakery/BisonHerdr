@@ -48,10 +48,12 @@ data class AppSettings(
  */
 @Serializable
 sealed interface ActiveBackbone {
+    /** The average round trip time of the session in milliseconds. It is 0 until the app measures a round trip. */
     val rttMs: Int
 
     /**
-     * Primary Mosh UDP SSP (`AES-128-OCB`) backbone paired with Herdr's Endpoint/API control sideband.
+     * Mosh UDP SSP (`AES-128-OCB`) backbone paired with Herdr's Endpoint/API control sideband. This version never
+     * selects it, because the Mosh transport is planned (issue #22).
      */
     @Serializable
     @SerialName("mosh_udp")
@@ -63,7 +65,8 @@ sealed interface ActiveBackbone {
     ) : ActiveBackbone
 
     /**
-     * Fallback SSH TCP Endpoint Generation 1 stream (`herdr remote-client-bridge`).
+     * SSH TCP Endpoint Generation 1 stream (`herdr remote-client-bridge`). This version uses it for each machine.
+     * [fallbackReason] tells why the app does not use Mosh, or is null.
      */
     @Serializable
     @SerialName("ssh_endpoint")

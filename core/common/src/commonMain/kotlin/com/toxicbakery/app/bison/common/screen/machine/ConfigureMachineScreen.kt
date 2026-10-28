@@ -69,9 +69,15 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
+import com.toxicbakery.app.bison.resources.machine_field_mosh_ports_label
+import com.toxicbakery.app.bison.resources.machine_field_transport_mode_label
 import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
 import com.toxicbakery.app.bison.resources.machine_key_error_no_secure_lock_screen
 import com.toxicbakery.app.bison.resources.machine_key_error_other
+import com.toxicbakery.app.bison.resources.machine_transport_auto_prefer_mosh
+import com.toxicbakery.app.bison.resources.machine_transport_mosh_only
+import com.toxicbakery.app.bison.resources.machine_transport_mosh_planned_hint
+import com.toxicbakery.app.bison.resources.machine_transport_ssh_only
 import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.stringResource
@@ -234,24 +240,24 @@ fun ConfigureMachineScreen(
                     }
                 }
 
-                // 2. Dual-Transport Selection (Mosh UDP SSP + Herdr Endpoint Gen 1)
-                SectionCard(title = "Dual-Transport Mode (Mosh UDP SSP + Herdr Bridge)") {
+                // 2. Transport selection. This version has no Mosh transport (issue #22).
+                SectionCard(title = stringResource(Res.string.machine_field_transport_mode_label)) {
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         TransportMode.entries.forEach { mode ->
                             val label = when (mode) {
-                                TransportMode.AutoPreferMosh -> "Auto (Prefer Mosh UDP SSP)"
-                                TransportMode.MoshOnly -> "Mosh UDP SSP Only"
-                                TransportMode.SshEndpointOnly -> "SSH Endpoint Gen 1 Only"
+                                TransportMode.AutoPreferMosh -> Res.string.machine_transport_auto_prefer_mosh
+                                TransportMode.MoshOnly -> Res.string.machine_transport_mosh_only
+                                TransportMode.SshEndpointOnly -> Res.string.machine_transport_ssh_only
                             }
                             FilterChip(
                                 selected = state.transportMode == mode,
                                 onClick = {
                                     viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateTransportMode(mode))
                                 },
-                                label = { Text(label) },
+                                label = { Text(stringResource(label)) },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = palette.accentPrimary.copy(alpha = 0.22f),
                                     selectedLabelColor = palette.accentPrimary,
@@ -259,6 +265,11 @@ fun ConfigureMachineScreen(
                             )
                         }
                     }
+                    Text(
+                        text = stringResource(Res.string.machine_transport_mosh_planned_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -269,7 +280,7 @@ fun ConfigureMachineScreen(
                             onValueChange = {
                                 viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateMoshUdpPortRange(it))
                             },
-                            label = { Text("Mosh UDP Port Range") },
+                            label = { Text(stringResource(Res.string.machine_field_mosh_ports_label)) },
                             placeholder = { Text("60000:61000") },
                             singleLine = true,
                             modifier = Modifier.weight(1f),

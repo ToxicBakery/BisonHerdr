@@ -48,7 +48,7 @@ import org.jetbrains.compose.resources.stringResource
 /**
  * Slide-Over Floating Agent Command Center Drawer on the right edge of the Zen Canvas.
  *
- * Aggregates [FederatedAgentItem] entries across all connected SSH/Mosh machines sorted by
+ * Aggregates [FederatedAgentItem] entries across all connected SSH machines sorted by
  * priority (`Blocked` -> `Done` -> `Working` -> `Idle`), shows live bottom-buffer snippets
  * (`agent.read` with `source = "visible"`), and provides one-tap `[ ✓ Approve ]`, `[ ✕ Reject ]`,
  * and `[ Jump to Pane ]` actions.

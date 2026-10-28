@@ -108,7 +108,7 @@ data class TerminalSelectionRange(
  *
  * Renders [PaneSurfaceFrame] edge-to-edge across 96%+ of the tablet display with:
  * - TrueColor (`0x02_RR_GG_BB`), 256-color (`0x01_00_00_XX`), and 16-ANSI color resolution
- * - Bold, italic, dim, reverse, underline, curly underline, strikethrough, and Mosh predictive echo
+ * - Bold, italic, dim, reverse, underline, curly underline, strikethrough, and predictive echo
  * - Block, Underline, and Bar cursors
  * - Crisp `2.dp` accent border on the focused pane and per-pane scrollbars
  * - Interactive `24.dp` BSP split handles (`PaneSurfaceFrame.splits`) with magnetic snapping

@@ -73,7 +73,7 @@ sealed interface PromptTarget {
  *   - Displays inline `[ ✓ Approve ]` and `[ ✕ Reject ]` buttons whenever the focused pane's agent is `Blocked`.
  *   - Expands on tap into a multi-line native Compose `OutlinedTextField` supporting Android voice
  *     dictation, swipe typing, target selector (Focused Pane, Specific Agent, or Broadcast), and
- *     offline Mosh roaming queue badge.
+ *     offline roaming queue badge.
  * - **Right Thumb Cluster**: Swipeable directional arrow cluster (`[←]`, `[↓]`, `[↑]`, `[→]`) + `[⏎ Enter]`.
  */
 @Composable

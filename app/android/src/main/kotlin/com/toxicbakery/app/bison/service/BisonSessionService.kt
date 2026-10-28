@@ -54,7 +54,7 @@ import org.kodein.di.android.closestDI
 import org.kodein.di.instance
 
 /**
- * Persistent foreground service keeping SSH/Mosh sessions alive across activity backgrounding,
+ * Persistent foreground service keeping SSH sessions alive across activity backgrounding,
  * supervising `ConnectivityManager.NetworkCallback` fast-roaming, collecting [SshRequestManager.bus],
  * and posting actionable notifications for `Blocked` and `Done` coding agents.
  *
@@ -467,7 +467,7 @@ class BisonSessionService : Service(), DIAware {
         val builder = NotificationCompat.Builder(this, CHANNEL_SESSION_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("BisonHerdr: $connectedCount machines ($transportSummary)")
-            .setContentText("$activeAgentCount coding agents active · Zero-drop roaming armed")
+            .setContentText("$activeAgentCount coding agents active")
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -570,7 +570,7 @@ class BisonSessionService : Service(), DIAware {
             "BisonHerdr Active Sessions",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Persistent SSH and Mosh UDP terminal sessions"
+            description = "Persistent SSH terminal sessions"
         }
         val agentAlertsChannel = NotificationChannel(
             CHANNEL_AGENT_ALERTS_ID,

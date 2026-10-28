@@ -253,11 +253,12 @@ class ConnectingMachineViewModel(
             ConnectionProgress.AuthenticatingSsh to (
                 "1. Authenticating SSH2" to "Verifying host fingerprint & signing with Keystore key or password"
                 ),
+            // This version has no Mosh transport (issue #22), so step 2 always selects the SSH endpoint bridge.
             ConnectionProgress.BootstrappingMoshOrBridge to (
-                "2. Bootstrapping Dual-Transport" to "Probing mosh-server UDP SSP & Herdr remote-client-bridge"
+                "2. Select the Transport" to "SSH endpoint bridge (herdr remote-client-bridge); check for mosh-server"
                 ),
             ConnectionProgress.VerifyingUdpOrHello to (
-                "3. Verifying UDP SSP / Hello Handshake" to "Negotiating AES-128-OCB datagrams & Herdr Endpoint Gen 1"
+                "3. Herdr Endpoint Hello" to "Send the Herdr Endpoint Gen 1 hello over SSH"
                 ),
             ConnectionProgress.SyncingHerdrSnapshot to (
                 "4. Syncing Herdr Workspace Snapshot" to "Acquiring surface lease & initial BSP layout tree"

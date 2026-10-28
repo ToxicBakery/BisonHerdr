@@ -81,11 +81,13 @@ import com.toxicbakery.app.bison.protocol.ClientShellSnapshot
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.app_version_label
 import com.toxicbakery.app.bison.resources.frame_update_available
+import com.toxicbakery.app.bison.resources.machine_federation_welcome_body
 import com.toxicbakery.app.bison.resources.settings_about_new
 import com.toxicbakery.app.bison.resources.settings_about_open_release
 import com.toxicbakery.app.bison.resources.settings_about_update_available
 import com.toxicbakery.app.bison.resources.settings_app_check_updates
 import com.toxicbakery.app.bison.resources.settings_app_check_updates_summary
+import com.toxicbakery.app.bison.resources.settings_predictive_echo_label
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialState
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
@@ -625,7 +627,7 @@ private fun EmptyFleetBanner(
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = "Connect to any unmodified upstream Herdr server over Mosh UDP SSP + SSH Endpoint Generation 1.",
+                    text = stringResource(Res.string.machine_federation_welcome_body),
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.fgMuted,
                 )
@@ -717,7 +719,7 @@ internal fun ThemeAndSettingsBottomSheet(
                 },
             )
             SettingToggleRow(
-                label = "Mosh Predictive Local Echo Underlines",
+                label = stringResource(Res.string.settings_predictive_echo_label),
                 checked = settings.predictiveEchoUnderlines,
                 onCheckedChange = { enabled ->
                     onUpdateSettings { it.copy(predictiveEchoUnderlines = enabled) }
