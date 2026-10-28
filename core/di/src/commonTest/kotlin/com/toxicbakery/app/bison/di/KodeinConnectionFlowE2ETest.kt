@@ -305,7 +305,7 @@ class KodeinConnectionFlowE2ETest {
             // 3. Instantiate WorkspaceTerminalViewModel for machineId and verify state, agent approval, split drag, and prompt submission
             val workspaceVm = workspaceFactory(machineId)
             assertEquals(machineId, workspaceVm.state.value.activeMachineId)
-            assertIs<ActiveBackbone.MoshUdp>(workspaceVm.activeBackbone.value)
+            assertIs<ActiveBackbone.SshEndpoint>(workspaceVm.activeBackbone.value)
 
             val initialSnapshot = assertNotNull(workspaceVm.activeSnapshot.value)
             val initialSurface = assertNotNull(workspaceVm.activeSurfaceFrame.value)
