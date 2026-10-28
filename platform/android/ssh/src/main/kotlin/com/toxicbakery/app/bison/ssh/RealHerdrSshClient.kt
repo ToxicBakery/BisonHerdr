@@ -168,6 +168,12 @@ internal class RealHerdrSshClient(
      * [frameLocks]). A test gives a function that stops a step at this point.
      */
     private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
+    /**
+     * Puts a snapshot of a machine on [endpointSnapshotBus]. The client calls it in the frame lock of the machine. A
+     * test gives a function that stops a step at this point.
+     */
+    private val snapshotPublisher: (machineId: String, snapshot: ClientShellSnapshot) -> Unit =
+        endpointSnapshotBus::publish,
     /** Gives the address of each socket, and finds the connections that the local network protection stops. */
     internal val localNetworkGuard: LocalNetworkGuard,
     /**
@@ -215,6 +221,22 @@ internal class RealHerdrSshClient(
             override val paneId: String,
             override val createdAtMs: Long = System.currentTimeMillis(),
         ) : OptimisticEdit
+    }
+
+    /** An RPC method that changes the client selection. See [applySelection]. */
+    private enum class FocusMethod(val method: String) {
+        Workspace("workspace.focus"),
+        Tab("tab.focus"),
+        Pane("pane.focus"),
+        Agent("agent.focus"),
+        ;
+
+        companion object {
+            private val byMethod = entries.associateBy { it.method }
+
+            /** Returns the focus method of [method], or null for a method that does not change the client selection. */
+            fun of(method: String): FocusMethod? = byMethod[method]
+        }
     }
 
     private data class ClientSelectionState(
@@ -397,14 +419,23 @@ internal class RealHerdrSshClient(
      * [MachineFrames.minPollSeq], so that an older poll cannot replace the data of a newer poll or a newer selection.
      * Thus a frame of these steps cannot replace a newer frame of these steps.
      *
-     * The lock does not cover a frame of [MoshUdpEngine]. This version has no Mosh session (issue #22).
+     * These limits stay:
+     * - The lock does not cover a frame of [MoshUdpEngine]. This version has no Mosh session (issue #22).
+     * - The input flush puts its pane text in the cache after it releases the Input lane. Thus a scroll answer can
+     *   publish first, and the frame of the flush then shows older text at the new position until the next frame.
+     * - A poll publishes its snapshot in its first locked step, and it can drop its frame in its second locked step.
+     *   Then the snapshot bus is newer than the frame bus until the next poll.
+     * - A poll can show the older position of its snapshot for one poll. This occurs when Herdr answers a scroll
+     *   request during the poll, and a later request of that pane fails. For example, the snapshot shows 12, Herdr
+     *   answers 30, and a request to 40 fails. Then the poll shows 12, and the next poll shows 30.
      *
      * Each machine has its own lock, so a step does not wait for the frames of a different machine. No step holds the
-     * lock across network I/O. In the app, [sendPaneInput] and [resizeViewport] run on the serial fast-input queue of
-     * the session service, on `Dispatchers.Default`. A Java monitor is not fair, so such a step can wait for more than
-     * one frame build of the same machine. A frame build has no network I/O. [disconnect] clears the data in the lock,
-     * and stops the polls that still run. It keeps the lock, so that a step that still runs and a new step use the
-     * same lock.
+     * lock across network I/O. A frame build has no network I/O. In the app, [sendPaneInput] and [resizeViewport] run
+     * on the serial fast-input queue of the session service, on `Dispatchers.Default`. A Java monitor is not fair, so
+     * such a step can wait for more than one frame build of the same machine.
+     *
+     * [disconnect] clears the data in the lock, and stops the polls that still run. It keeps the lock, so that a step
+     * that still runs and a new step use the same lock.
      */
     private val frameLocks = ConcurrentHashMap<String, MachineFrames>()
 
@@ -416,7 +447,7 @@ internal class RealHerdrSshClient(
         /** The newest request that the scroll worker did not send yet. Older requests of the pane are dropped. */
         var queued: PaneScrollRequest? = null
 
-        /** The newest request that did not fail: not sent yet, in flight, or answered. */
+        /** The newest request that did not fail: not sent yet, sent with no answer yet, or answered. */
         var newest: PaneScrollRequest? = null
 
         /** The newest request that Herdr answered, or that failed. */
@@ -424,6 +455,9 @@ internal class RealHerdrSshClient(
 
         /** True when the answer of [answered] had the pane text, and the client put that text in [cachedInputs]. */
         var answerHasText: Boolean = false
+
+        /** The number of the answered request before [answered], or zero. */
+        var previousAnsweredSeq: Long = 0L
     }
 
     /** The frame lock of one machine and its data. Only the holder of the lock reads or writes the fields. */
@@ -434,8 +468,8 @@ internal class RealHerdrSshClient(
         /**
          * A poll with a lower number publishes nothing, because its data is older than the data on the buses. A poll
          * that publishes sets this value to its own number. A change of the selection and [disconnect] set it to a new
-         * number, because a poll that started before can have read the old selection, or can end after the
-         * disconnect. See [refreshSnapshotAndSurface].
+         * number. A poll that got its number before such a step asked for its snapshot before the step. Thus that poll
+         * publishes nothing. See [refreshSnapshotAndSurface].
          */
         var minPollSeq: Long = 0L
     }
@@ -446,6 +480,10 @@ internal class RealHerdrSshClient(
         return synchronized(frames) { block(frames) }
     }
 
+    /** Returns the panes of [machineId] that have scroll requests. A test uses it for closed panes. */
+    internal fun scrollRequestPaneIds(machineId: String): Set<String> =
+        withFrames(machineId) { frames -> frames.scrollRequests.keys.toSet() }
+
     /**
      * Runs [block] in the frame lock of [machineId], and returns its result. A step of a different class uses it to
      * read the frame of the machine from [paneSurfaceBus] and publish a changed copy. See [frameLocks].
@@ -454,7 +492,7 @@ internal class RealHerdrSshClient(
 
     /**
      * Stops the polls of [machineId] that started before this call: they publish nothing. Call it after a change of
-     * the selection, because these polls can have read the old selection.
+     * the selection. These polls asked for their snapshots before the change.
      */
     private fun discardRunningPolls(machineId: String) {
         withFrames(machineId) { frames -> frames.minPollSeq = pollSequence.incrementAndGet() }
@@ -614,7 +652,14 @@ internal class RealHerdrSshClient(
         inputFlushJobs.remove(machineId)?.cancel()
         inputFlushSignals.remove(machineId)?.close()
         pendingInputQueues.remove(machineId)?.clear()
-        // A poll that still runs, for example the refresh of an RPC, publishes nothing after this step.
+        lastInputConfirmedSeq.remove(machineId)
+        machinesWithoutSnapshot.remove(machineId)
+        inputWorkers.remove(machineId)?.close()
+        pollWorkers.remove(machineId)?.close()
+        closeSessions(machineId)
+        // A poll that got its number before this step, for example the refresh of an RPC, publishes nothing after this
+        // step. The step comes after the sessions close. A poll that gets the lane after this step gets a higher
+        // number, but its batch fails, because the machine has no session. Thus it also publishes nothing.
         withFrames(machineId) { frames ->
             discardRunningPolls(machineId)
             frames.scrollRequests.clear()
@@ -624,11 +669,6 @@ internal class RealHerdrSshClient(
             cachedInputs.remove(machineId)
             viewportSizes.remove(machineId)
         }
-        lastInputConfirmedSeq.remove(machineId)
-        machinesWithoutSnapshot.remove(machineId)
-        inputWorkers.remove(machineId)?.close()
-        pollWorkers.remove(machineId)?.close()
-        closeSessions(machineId)
     }
 
     /**
@@ -784,7 +824,7 @@ internal class RealHerdrSshClient(
      *
      * Each poll gets a number when its first batch gets the lock of the Poll lane. Thus the numbers of two polls have
      * the order of their snapshots. The poll publishes its snapshot and its frame only while its number is not lower
-     * than [MachineFrames.minPollSeq]. Thus the data of an older poll cannot replace the data of a newer poll, and a
+     * than [MachineFrames.minPollSeq]. Thus the data of an older poll cannot replace the data of a newer poll. Also, a
      * poll that read the selection before a change publishes nothing.
      */
     suspend fun refreshSnapshotAndSurface(
@@ -859,15 +899,15 @@ internal class RealHerdrSshClient(
         machinesWithoutSnapshot.remove(machine.id)
         val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
 
-        val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
         // The parse reads and writes the selection. In the lock, a change of the selection cannot occur during the
         // parse.
         val parsed = withFrames(machine.id) { frames ->
             // A newer poll or a change of the selection occurred. This poll has older data, so it publishes nothing.
             if (pollSeq < frames.minPollSeq) return@withFrames null
             frames.minPollSeq = pollSeq
+            val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
             parseSnapshotObject(machine.id, resolvedSnapshotObj, sel).also { parsed ->
-                endpointSnapshotBus.publish(machine.id, parsed.snapshot)
+                snapshotPublisher(machine.id, parsed.snapshot)
             }
         } ?: return@withContext true
 
@@ -917,7 +957,7 @@ internal class RealHerdrSshClient(
             pruneScrollRequests(frames, snapshotPaneIds)
             mergePaneScrolls(machine.id, frames, serverScrolls, snapshotPaneIds, answeredBeforeSnapshot)
 
-            // The input lane can update the focused pane while this poll is in flight. Then the cache has newer text
+            // The input lane can update the focused pane while this poll waits for Herdr. Then the cache has newer text
             // of that pane. Keep that text, so that the poll does not remove recent keystrokes.
             val currentConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
             val currentInputSeq = inputSequence.get()
@@ -985,8 +1025,9 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Removes the scroll requests of each pane that is not in [snapshotPaneIds] and has no request in the queue or in
-     * flight. Thus the requests of closed panes do not stay until [disconnect]. The caller holds the frame lock.
+     * Removes the scroll requests of each closed pane, that is, a pane that is not in [snapshotPaneIds]. The client
+     * keeps the requests of a closed pane while it has a request in the queue or a request with no answer. Thus the
+     * requests of closed panes do not stay until [disconnect]. The caller holds the frame lock.
      */
     private fun pruneScrollRequests(frames: MachineFrames, snapshotPaneIds: Set<String>) {
         frames.scrollRequests.entries.removeAll { (paneId, requests) ->
@@ -1000,9 +1041,10 @@ internal class RealHerdrSshClient(
      * frame lock of the machine, and gives its [frames].
      *
      * For each pane, Herdr answered the scroll requests up to the number in [answeredBeforeSnapshot] before the
-     * snapshot, so the snapshot shows their positions. A newer request can be newer than the snapshot: it is not sent
-     * yet, it is in flight, or Herdr answered it during the poll. Thus each pane of the snapshot with such a request
-     * keeps the position of its newest request. A pane that is not in [snapshotPaneIds] gets no position.
+     * snapshot, so the snapshot shows their positions. A newer request can be newer than the snapshot. Such a request
+     * is not sent yet, or Herdr did not answer it yet, or Herdr answered it during the poll. Thus each pane of the
+     * snapshot with such a request keeps the position of its newest request. A pane that is not in [snapshotPaneIds]
+     * gets no position.
      */
     private fun mergePaneScrolls(
         machineId: String,
@@ -1031,11 +1073,18 @@ internal class RealHerdrSshClient(
      * when all of these conditions are true:
      * - Herdr answered a scroll request of the pane during the batch that read the pane.
      * - The answer had the pane text, so the cache has text that is newer than the scroll.
-     * - The poll read the pane before the scroll. For a pane of the first batch, the snapshot does not show the
-     *   position of the answer. A pane of the second batch has no position at the time of its read, so the client
-     *   cannot tell the order. Then it keeps the cached text.
+     * - The order of the read and the scroll is not known. This is the case when the snapshot does not show the
+     *   position of that answer. It is also the case when Herdr answered two or more requests of the pane after the
+     *   snapshot. Then the pane can move and come back between the snapshot and the read, for example from 12 to 40
+     *   and back to 12.
      *
-     * Otherwise the poll keeps the text that it read. A failed request gives no text.
+     * The second batch reads after the snapshot. Two conditions show that both batches read the pane after the
+     * scroll. The snapshot shows the position of the answer, and Herdr answered only that request after the snapshot.
+     * Then the poll keeps the text that it read. A failed request gives no text.
+     *
+     * The rule for two answers has a cost in the first batch. A poll that reads the pane after two answers shows the
+     * cached answer text for one poll, not the newer output of the shell. The position is correct. The fake Herdr of
+     * the tests cannot stop between the snapshot and the reads of one batch. Thus no test covers this case.
      */
     private fun keepScrollAnswerText(
         machineId: String,
@@ -1051,7 +1100,8 @@ internal class RealHerdrSshClient(
             val secondBatch = paneId in missingPaneIds
             val answeredBeforeRead = (if (secondBatch) answeredBeforeMissingReads else answeredBeforeSnapshot)[paneId]
             val answeredDuringRead = answered.seq > (answeredBeforeRead ?: 0L)
-            val readBeforeScroll = secondBatch ||
+            val twoAnswersAfterSnapshot = requests.previousAnsweredSeq > (answeredBeforeSnapshot[paneId] ?: 0L)
+            val readBeforeScroll = twoAnswersAfterSnapshot ||
                 serverScrolls[paneId]?.offsetFromBottom != answered.offsetFromBottom.toUInt()
             if (answeredDuringRead && requests.answerHasText && readBeforeScroll && paneId in ansiByPane) {
                 cachedInputs[machineId]?.ansiByPane?.get(paneId)?.let { ansiByPane[paneId] = it }
@@ -1073,11 +1123,12 @@ internal class RealHerdrSshClient(
         route: ResolvedSshRoute,
         request: ClientShellEndpointRequest,
     ): String? = withContext(Dispatchers.IO) {
-        val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
-
-        // A focus request changes the selection at once. In the frame lock, a poll cannot parse the snapshot during
-        // the change.
-        withFrames(machine.id) { applySelection(machine.id, sel, request) }
+        // A focus request changes the client selection at once. In the frame lock, a poll cannot parse the snapshot
+        // during the change. Other requests do not change the client selection, so they do not take the lock.
+        val focusMethod = FocusMethod.of(request.method)
+        if (focusMethod != null) {
+            withFrames(machine.id) { applySelection(machine.id, focusMethod, request) }
+        }
 
         // Scroll gestures send one request per line. Keep only the newest request, so that the pane
         // follows the finger, and do not refresh the full snapshot for each line.
@@ -1100,7 +1151,7 @@ internal class RealHerdrSshClient(
             val paramsObj = parseParamsObject(request.paramsJson)
             val targetPaneId = paramsObj["pane_id"]?.jsonPrimitive?.content
                 ?.takeIf { it.isNotBlank() }
-                ?: sel.focusedPaneId
+                ?: selectionState[machine.id]?.focusedPaneId
                 ?: endpointSnapshotBus.snapshotFor(machine.id)?.focusedPaneId
             val ndjsonLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
             return@withContext runCatching {
@@ -1162,9 +1213,10 @@ internal class RealHerdrSshClient(
      * shows at once. The caller holds the frame lock of the machine, so that a poll cannot parse the snapshot during
      * the change. After a change, the polls that started before the change publish nothing.
      */
-    private fun applySelection(machineId: String, sel: ClientSelectionState, request: ClientShellEndpointRequest) {
-        when (request.method) {
-            "workspace.focus" -> {
+    private fun applySelection(machineId: String, focusMethod: FocusMethod, request: ClientShellEndpointRequest) {
+        val sel = selectionState.computeIfAbsent(machineId) { ClientSelectionState() }
+        when (focusMethod) {
+            FocusMethod.Workspace -> {
                 val paramsObj = parseParamsObject(request.paramsJson)
                 val wsId = paramsObj["workspace_id"]?.jsonPrimitive?.content
                 if (!wsId.isNullOrBlank()) {
@@ -1185,7 +1237,7 @@ internal class RealHerdrSshClient(
                 }
             }
 
-            "tab.focus" -> {
+            FocusMethod.Tab -> {
                 val paramsObj = parseParamsObject(request.paramsJson)
                 val tabId = paramsObj["tab_id"]?.jsonPrimitive?.content
                 if (!tabId.isNullOrBlank()) {
@@ -1203,7 +1255,7 @@ internal class RealHerdrSshClient(
                 }
             }
 
-            "pane.focus", "agent.focus" -> {
+            FocusMethod.Pane, FocusMethod.Agent -> {
                 val paramsObj = parseParamsObject(request.paramsJson)
                 val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
                 if (!paneId.isNullOrBlank()) {
@@ -1226,7 +1278,7 @@ internal class RealHerdrSshClient(
      * 1. When the pane is not at the bottom, it requests the bottom ([requestPaneScroll]).
      * 2. It publishes an optimistic local echo on [paneSurfaceBus], with no network I/O. The echo uses the frame lock
      *    of the machine, so it can wait for the frame builds of the same machine. See [frameLocks].
-     * 3. It adds the event to the input queue of the machine, and does not wait. Thus fast typing does not wait for
+     * 3. It adds the event to the input queue of the machine, and does not wait. Thus a key press does not wait for
      *    a round trip.
      * 4. The input flush sends the queued events in one batch on the persistent [WorkerLane.Input] channel
      *    (`pane.send_text`, `pane.send_keys`, or `pane.send_input`, and a `pane.read` of the pane). The poll uses the
@@ -1671,6 +1723,7 @@ internal class RealHerdrSshClient(
                 val requests = frames.scrollRequests[scroll.paneId] ?: return@withFrames
                 // A late answer of an older worker must not replace a newer answer.
                 if (scroll.seq > (requests.answered?.seq ?: 0L)) {
+                    requests.previousAnsweredSeq = requests.answered?.seq ?: 0L
                     requests.answered = scroll
                     requests.answerHasText = paneAnsi != null
                 }
@@ -1688,11 +1741,13 @@ internal class RealHerdrSshClient(
                 }
             }
         }.onFailure { err ->
-            // [disconnect] cancels the worker. That is not a failure of the request.
-            if (err is CancellationException) throw err
+            // [disconnect] cancels the worker and closes its channel. In a cancelled worker, the error comes from the
+            // disconnect: a cancellation, or an error of the closed channel. That is not a failure of the request.
+            currentCoroutineContext().ensureActive()
             withFrames(machine.id) { frames ->
                 val requests = frames.scrollRequests[scroll.paneId] ?: return@withFrames
                 if (scroll.seq > (requests.answered?.seq ?: 0L)) {
+                    requests.previousAnsweredSeq = requests.answered?.seq ?: 0L
                     requests.answered = scroll
                     requests.answerHasText = false
                 }
@@ -1750,8 +1805,8 @@ internal class RealHerdrSshClient(
     /**
      * Puts the pane text [paneAnsi] of [paneId] in [cachedInputs], and publishes the new frame of [machineId]. A
      * [confirmedSeq] above zero also confirms the input events up to that number. The input flush, the input RPCs,
-     * and the scroll worker use it. It does all steps in the frame lock of the machine, so that a poll or a scroll
-     * request cannot occur between the build and the publish of the frame.
+     * and the scroll worker use it. It does all steps in the frame lock of the machine. Thus a poll or a scroll request
+     * cannot occur between the build and the publish of the frame.
      */
     private fun updateFocusedPaneSurfaceFromInput(
         machineId: String,
@@ -1793,7 +1848,7 @@ internal class RealHerdrSshClient(
         withFrames(machineId) {
             val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId)
             if (currentSnapshot != null && currentSnapshot.focusedPaneId != paneId) {
-                endpointSnapshotBus.publish(
+                snapshotPublisher(
                     machineId,
                     currentSnapshot.copy(
                         revision = revisionCounter.incrementAndGet().toULong(),
@@ -2532,8 +2587,10 @@ internal class RealHerdrSshClient(
      * time. See [timeRoundTrip].
      *
      * [onLaneLocked] runs when the batch has the lane lock, before the batch goes to the worker. The lane runs one batch
-     * at a time, so the order of these calls is the order of the batches on the lane. [remoteBatchExecutor] has no lane
-     * lock, so with it [onLaneLocked] runs just before the call.
+     * at a time, so the order of these calls is the order of the batches on the lane.
+     *
+     * [remoteBatchExecutor] runs in the same lane lock, so that a test has the order of production. It does not wait
+     * for a reconnect, because a test with this executor has no session.
      */
     private suspend fun executeBatchOnLane(
         machine: HostMachine,
@@ -2546,8 +2603,10 @@ internal class RealHerdrSshClient(
         if (commands.isEmpty()) return ""
         val customExecutor = remoteBatchExecutor
         if (customExecutor != null) {
-            onLaneLocked?.invoke()
-            return timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            return laneMutexFor(machine.id, lane).withLock {
+                onLaneLocked?.invoke()
+                timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            }
         }
         // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
         // the lane.
