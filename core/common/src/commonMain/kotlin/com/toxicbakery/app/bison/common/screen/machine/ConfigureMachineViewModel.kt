@@ -2,8 +2,6 @@ package com.toxicbakery.app.bison.common.screen.machine
 
 import androidx.lifecycle.viewModelScope
 import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
-import com.toxicbakery.app.bison.model.HardwareKeyTransport
-import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
@@ -26,10 +24,16 @@ class ConfigureMachineViewModel(
         .copy(canShowPublicKey = sshPublicKeyProvider != null),
 ), MachineViewModelDelegate by machineViewModelDelegate {
 
-    enum class AuthType {
+    /**
+     * The SSH login methods. [isSupported] is false for a method that this version cannot use. The screen
+     * does not offer such a method, but a loaded machine can still have it.
+     */
+    enum class AuthType(val isSupported: Boolean = true) {
         KeystoreKey,
         Password,
-        HardwareSecurityKey,
+
+        /** This version does not support hardware security keys. See issue #23. */
+        HardwareSecurityKey(isSupported = false),
     }
 
     data class State(
@@ -56,8 +60,11 @@ class ConfigureMachineViewModel(
         val isLoadingPublicKey: Boolean = false,
         val publicKeyError: String? = null,
         val passwordRef: String = "",
-        val hardwareKeyType: HardwareKeyType = HardwareKeyType.SkSshEd25519,
-        val hardwareKeyTransport: HardwareKeyTransport = HardwareKeyTransport.UsbAndNfc,
+        /**
+         * The hardware security key of a loaded machine. The screen cannot change it, so "Save Host" keeps
+         * it with all of its fields. This version does not support the method (issue #23).
+         */
+        val hardwareKey: SshAuthMethod.HardwareSecurityKey? = null,
         val proxyJumpEnabled: Boolean = false,
         val bastionHost: String = "",
         val bastionPortText: String = "22",
@@ -72,6 +79,14 @@ class ConfigureMachineViewModel(
 
         val canSave: Boolean
             get() = hostname.isNotBlank() && username.isNotBlank() && parsedPort != null
+
+        /** The login methods that the screen offers. */
+        val authChoices: List<AuthType>
+            get() = AUTH_CHOICES
+
+        /** False when this version cannot log in with [authType]. The screen then blocks the connect. */
+        val canConnect: Boolean
+            get() = canSave && authType.isSupported
     }
 
     sealed interface Event {
@@ -91,8 +106,6 @@ class ConfigureMachineViewModel(
         data object ShowPublicKey : Event
         data class UpdateRequireBiometric(val require: Boolean) : Event
         data class UpdatePasswordRef(val passwordRef: String) : Event
-        data class UpdateHardwareKeyType(val keyType: HardwareKeyType) : Event
-        data class UpdateHardwareKeyTransport(val transport: HardwareKeyTransport) : Event
         data class UpdateProxyJumpEnabled(val enabled: Boolean) : Event
         data class UpdateBastionHost(val host: String) : Event
         data class UpdateBastionPort(val portText: String) : Event
@@ -119,7 +132,9 @@ class ConfigureMachineViewModel(
             is Event.UpdateMoshServerPath -> updateState { it.copy(moshServerPath = event.path) }
             is Event.UpdateMoshUdpPortRange -> updateState { it.copy(moshUdpPortRange = event.range) }
             is Event.UpdateHerdrSessionName -> updateState { it.copy(herdrSessionName = event.sessionName) }
-            is Event.UpdateAuthType -> updateState { it.copy(authType = event.authType) }
+            is Event.UpdateAuthType -> if (event.authType.isSupported) {
+                updateState { it.copy(authType = event.authType) }
+            }
             is Event.UpdateKeystoreAlias -> updateState { it.copy(keystoreAlias = event.alias).withoutPublicKey() }
             is Event.UpdateKeyAlgorithm -> updateState { current ->
                 if (event.algorithm !in current.availableKeyAlgorithms) {
@@ -134,8 +149,6 @@ class ConfigureMachineViewModel(
             is Event.UpdateRequireBiometric -> updateState { it.copy(requireBiometric = event.require) }
             is Event.ShowPublicKey -> loadPublicKey()
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
-            is Event.UpdateHardwareKeyType -> updateState { it.copy(hardwareKeyType = event.keyType) }
-            is Event.UpdateHardwareKeyTransport -> updateState { it.copy(hardwareKeyTransport = event.transport) }
             is Event.UpdateProxyJumpEnabled -> updateState { it.copy(proxyJumpEnabled = event.enabled) }
             is Event.UpdateBastionHost -> updateState { it.copy(bastionHost = event.host) }
             is Event.UpdateBastionPort -> updateState { it.copy(bastionPortText = event.portText) }
@@ -192,6 +205,10 @@ class ConfigureMachineViewModel(
             }
             return
         }
+        if (connectImmediately && !current.authType.isSupported) {
+            updateState { it.copy(validationError = UNSUPPORTED_AUTH_ERROR) }
+            return
+        }
 
         val resolvedId = current.id.ifBlank {
             val slug = current.hostname.trim().lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
@@ -208,10 +225,8 @@ class ConfigureMachineViewModel(
             AuthType.Password -> SshAuthMethod.Password(
                 encryptedPasswordRef = current.passwordRef,
             )
-            AuthType.HardwareSecurityKey -> SshAuthMethod.HardwareSecurityKey(
-                keyType = current.hardwareKeyType,
-                transport = current.hardwareKeyTransport,
-            )
+            // The view model does not select this method, so it is the method of the loaded machine.
+            AuthType.HardwareSecurityKey -> current.hardwareKey ?: SshAuthMethod.HardwareSecurityKey()
         }
 
         val proxyJump = if (current.proxyJumpEnabled && current.bastionHost.isNotBlank()) {
@@ -252,6 +267,16 @@ class ConfigureMachineViewModel(
     }
 
     companion object {
+        /** The text that the app shows for a login method that this version does not support. */
+        const val UNSUPPORTED_AUTH_LABEL: String = "Not supported in this version"
+
+        /** The error that "Save & Connect" shows for a login method that this version does not support. */
+        const val UNSUPPORTED_AUTH_ERROR: String =
+            "$UNSUPPORTED_AUTH_LABEL: hardware security keys. Select a different authentication method to connect."
+
+        /** The login methods that the screen offers: only the methods that this version supports. */
+        val AUTH_CHOICES: List<AuthType> = AuthType.entries.filter { it.isSupported }
+
         /**
          * Returns the alias for a change from [previous] to [next]. A blank alias or the default
          * alias of [previous] becomes the default alias of [next], so that two key types never
@@ -283,7 +308,6 @@ class ConfigureMachineViewModel(
             }
             val keystoreAuth = existing.authMethod as? SshAuthMethod.KeystoreKey
             val passwordAuth = existing.authMethod as? SshAuthMethod.Password
-            val hwAuth = existing.authMethod as? SshAuthMethod.HardwareSecurityKey
             // A key type that this device cannot create changes to the default type. Such a key
             // was never created on this device, so no working key is lost.
             val storedAlgorithm = keystoreAuth?.algorithm ?: keystoreKeySupport.defaultAlgorithm
@@ -311,8 +335,7 @@ class ConfigureMachineViewModel(
                 availableKeyAlgorithms = available,
                 requireBiometric = keystoreAuth?.requireBiometric ?: false,
                 passwordRef = passwordAuth?.encryptedPasswordRef.orEmpty(),
-                hardwareKeyType = hwAuth?.keyType ?: HardwareKeyType.SkSshEd25519,
-                hardwareKeyTransport = hwAuth?.transport ?: HardwareKeyTransport.UsbAndNfc,
+                hardwareKey = existing.authMethod as? SshAuthMethod.HardwareSecurityKey,
                 proxyJumpEnabled = pj != null,
                 bastionHost = pj?.bastionHost.orEmpty(),
                 bastionPortText = (pj?.bastionPort ?: 22).toString(),

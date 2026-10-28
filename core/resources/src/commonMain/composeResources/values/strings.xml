@@ -99,7 +99,6 @@
     <string name="machine_field_auth_method_label">Authentication Method</string>
     <string name="machine_auth_keystore">Android Keystore Private Key (Ed25519 / RSA / ECDSA)</string>
     <string name="machine_auth_password">Password / Keyboard-Interactive</string>
-    <string name="machine_auth_hardware_key">Hardware Security Key (YubiKey / FIDO2 NFC &amp; USB-C)</string>
     <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
     <string name="machine_connecting_title">Connecting to %1$s</string>
     <string name="machine_connecting_step_ssh">1. Authenticating SSH &amp; verifying host key&#8230;</string>

@@ -3,7 +3,6 @@ package com.toxicbakery.app.bison.common.screen.machine
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -62,8 +61,6 @@ import com.toxicbakery.app.bison.common.platform.plainTextClipEntry
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.theme.BisonThemes
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
-import com.toxicbakery.app.bison.model.HardwareKeyTransport
-import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import kotlinx.coroutines.launch
@@ -285,11 +282,12 @@ fun ConfigureMachineScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        ConfigureMachineViewModel.AuthType.entries.forEach { type ->
+                        state.authChoices.forEach { type ->
                             val label = when (type) {
                                 ConfigureMachineViewModel.AuthType.KeystoreKey -> "Android Keystore Key"
-                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> "YubiKey / FIDO2 / PIV"
                                 ConfigureMachineViewModel.AuthType.Password -> "Password / Passphrase"
+                                // The choices do not contain this method (issue #23), so it has no chip.
+                                ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> return@forEach
                             }
                             FilterChip(
                                 selected = state.authType == type,
@@ -363,38 +361,18 @@ fun ConfigureMachineScreen(
                             }
                         }
 
+                        // Only a loaded machine can have this method. See issue #23.
                         ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            ) {
-                                HardwareKeyType.entries.forEach { kt ->
-                                    FilterChip(
-                                        selected = state.hardwareKeyType == kt,
-                                        onClick = {
-                                            viewModel.onEvent(
-                                                ConfigureMachineViewModel.Event.UpdateHardwareKeyType(kt)
-                                            )
-                                        },
-                                        label = { Text(kt.opensshKeyType, fontFamily = FontFamily.Monospace) },
-                                    )
-                                }
-                            }
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                HardwareKeyTransport.entries.forEach { tr ->
-                                    FilterChip(
-                                        selected = state.hardwareKeyTransport == tr,
-                                        onClick = {
-                                            viewModel.onEvent(
-                                                ConfigureMachineViewModel.Event.UpdateHardwareKeyTransport(tr)
-                                            )
-                                        },
-                                        label = { Text(tr.name) },
-                                    )
-                                }
-                            }
+                            Text(
+                                text = "Hardware security key: ${ConfigureMachineViewModel.UNSUPPORTED_AUTH_LABEL}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = palette.accentError,
+                            )
+                            Text(
+                                text = "Select a different authentication method to connect to this host.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
 
                         ConfigureMachineViewModel.AuthType.Password -> {
@@ -549,7 +527,7 @@ fun ConfigureMachineScreen(
                     }
                     Button(
                         onClick = { viewModel.onEvent(ConfigureMachineViewModel.Event.SaveAndConnect) },
-                        enabled = state.canSave,
+                        enabled = state.canConnect,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = palette.accentPrimary,
                             contentColor = palette.bgDeep,

@@ -1,6 +1,5 @@
 package com.toxicbakery.app.bison.ssh
 
-import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
@@ -17,7 +16,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotSame
-import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
@@ -107,26 +105,6 @@ class SshPlatformTest {
             update(edChallenge)
         }
         assertTrue(jschEdVerifier.verify(wrappedEdSig))
-    }
-
-    @Test
-    fun yubiKeyFido2ManagerSignsSkChallengeAndDismissesTouchPrompt() = runTest {
-        val stateManager = SshStateManager()
-        val debugLog = SshDebugLog()
-        val yubiKey = YubiKeyFido2Manager(
-            sshStateManager = stateManager,
-            sshDebugLog = debugLog,
-        )
-
-        val result = yubiKey.signChallenge(
-            machineId = "workbox",
-            keyType = HardwareKeyType.SkSshEd25519.opensshKeyType,
-            applicationId = "ssh:herdr",
-            challenge = "fido2-challenge".toByteArray(),
-        )
-        assertTrue(result.isSuccess)
-        assertTrue(result.getOrThrow().isNotEmpty())
-        assertNull(stateManager.hardwareKeyTouchPrompt.value)
     }
 
     @Test

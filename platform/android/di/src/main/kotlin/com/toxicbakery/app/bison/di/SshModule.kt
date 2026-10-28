@@ -3,14 +3,12 @@ package com.toxicbakery.app.bison.di
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.ssh.AndroidKeystoreKeyManager
 import com.toxicbakery.app.bison.ssh.AndroidKeystoreKeySupport
-import com.toxicbakery.app.bison.ssh.HardwareKeySigner
 import com.toxicbakery.app.bison.ssh.MoshSessionEngine
 import com.toxicbakery.app.bison.ssh.MoshUdpEngine
 import com.toxicbakery.app.bison.ssh.ProxyJumpTunnel
 import com.toxicbakery.app.bison.ssh.RealSshBackend
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.ssh.SshTransportManager
-import com.toxicbakery.app.bison.ssh.YubiKeyFido2Manager
 import org.kodein.di.DI
 import org.kodein.di.bindSingleton
 import org.kodein.di.instance
@@ -24,15 +22,6 @@ internal val sshModule = DI.Module("sshModule") {
     }
     bindSingleton<SshPublicKeyProvider> {
         instance<AndroidKeystoreKeyManager>()
-    }
-    bindSingleton {
-        YubiKeyFido2Manager(
-            sshStateManager = instance(),
-            sshDebugLog = instance(),
-        )
-    }
-    bindSingleton<HardwareKeySigner> {
-        instance<YubiKeyFido2Manager>()
     }
     bindSingleton {
         ProxyJumpTunnel(

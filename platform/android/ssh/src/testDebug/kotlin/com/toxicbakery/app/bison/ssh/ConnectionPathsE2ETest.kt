@@ -2,8 +2,6 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
-import com.toxicbakery.app.bison.model.HardwareKeyTransport
-import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
@@ -29,7 +27,7 @@ import kotlinx.coroutines.test.runTest
  * End-to-End connection lifecycle and transport path tests for `:platform:android:ssh`.
  *
  * Covers Paths 1A..6C across [SshTransportManager], [SimulatedSshBackend], [MoshUdpEngine], [ProxyJumpTunnel],
- * [AndroidKeystoreKeyManager], [YubiKeyFido2Manager], [SshStateManager], [EndpointSnapshotBus],
+ * [AndroidKeystoreKeyManager], [SshStateManager], [EndpointSnapshotBus],
  * [PaneSurfaceBus], and [SemanticNotificationBus].
  *
  * [SimulatedSshBackend] is in the `src/debug` source set, so these tests are in `src/testDebug`.
@@ -47,10 +45,6 @@ class ConnectionPathsE2ETest {
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
         )
-        val yubiKey = YubiKeyFido2Manager(
-            sshStateManager = stateManager,
-            sshDebugLog = debugLog,
-        )
         val backend = SimulatedSshBackend(
             moshUdpEngine = moshEngine,
             sshStateManager = stateManager,
@@ -59,7 +53,6 @@ class ConnectionPathsE2ETest {
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
             keystoreKeyManager = AndroidKeystoreKeyManager(),
-            yubiKeyFido2Manager = yubiKey,
         )
         val transport = SshTransportManager(
             backend = backend,
@@ -286,7 +279,7 @@ class ConnectionPathsE2ETest {
     }
 
     @Test
-    fun path4A_4B_4C_allSshAuthMethodVariants_keystore_password_andHardwareSecurityKeys() = runTest {
+    fun path4A_4B_sshAuthMethodVariants_keystore_andPassword() = runTest {
         // Path 4A: KeystoreKey across Ed25519, Rsa4096, EcdsaP256
         for (algorithm in listOf(KeyAlgorithm.Ed25519, KeyAlgorithm.Rsa4096, KeyAlgorithm.EcdsaP256)) {
             val h = Harness()
@@ -338,51 +331,6 @@ class ConnectionPathsE2ETest {
                 it.isError && it.tag == "SSHAuth" && it.message.contains("failed: AuthFailed")
             },
         )
-
-        // Path 4C: HardwareSecurityKey across SkSshEd25519, SkEcdsaSha2Nistp256, PivSmartCard and all transports
-        val keyTypes = listOf(
-            HardwareKeyType.SkSshEd25519,
-            HardwareKeyType.SkEcdsaSha2Nistp256,
-            HardwareKeyType.PivSmartCard,
-        )
-        val transports = listOf(
-            HardwareKeyTransport.UsbAndNfc,
-            HardwareKeyTransport.NfcOnly,
-            HardwareKeyTransport.UsbOnly,
-        )
-
-        for (keyType in keyTypes) {
-            for (hwTransport in transports) {
-                val h = Harness()
-                val machineId = "auth-hw-${keyType.name}-${hwTransport.name}"
-                var capturedPromptDuringSign: SshRequest.PromptHardwareKeyTouch? = null
-                h.yubiKey.onTouchPromptActive = { prompt ->
-                    // Verify prompt is actively published on SshStateManager while waiting for touch
-                    capturedPromptDuringSign = h.stateManager.hardwareKeyTouchPrompt.value
-                    assertEquals(prompt, capturedPromptDuringSign)
-                }
-
-                val machine = HostMachine(
-                    id = machineId,
-                    name = "YubiKey $keyType $hwTransport",
-                    hostname = "10.1.0.30",
-                    username = "ian",
-                    authMethod = SshAuthMethod.HardwareSecurityKey(
-                        keyType = keyType,
-                        transport = hwTransport,
-                        applicationId = "ssh:bison-e2e",
-                    ),
-                )
-                assertTrue(h.transport.connect(machine))
-                assertNotNull(capturedPromptDuringSign, "Touch prompt must be emitted during $keyType/$hwTransport auth")
-                assertEquals(machineId, capturedPromptDuringSign?.machineId)
-                assertEquals(keyType.opensshKeyType, capturedPromptDuringSign?.keyType)
-                assertNull(
-                    h.stateManager.hardwareKeyTouchPrompt.value,
-                    "Touch prompt must be cleared after signing completes",
-                )
-            }
-        }
     }
 
     @Test
@@ -595,7 +543,6 @@ class ConnectionPathsE2ETest {
             hostname = "100.64.0.25",
             username = "ian",
             transportMode = TransportMode.AutoPreferMosh,
-            authMethod = SshAuthMethod.HardwareSecurityKey(),
         )
         assertTrue(transport.connect(fallbackHost))
         assertIs<ActiveBackbone.SshEndpoint>(stateManager.activeTransportBackbone.value["gpu-rig"])

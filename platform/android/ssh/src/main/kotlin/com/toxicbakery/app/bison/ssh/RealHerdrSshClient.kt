@@ -1408,7 +1408,9 @@ internal class RealHerdrSshClient(
                     )
                     "publickey,password,keyboard-interactive"
                 }
-                is SshAuthMethod.HardwareSecurityKey -> "publickey,keyboard-interactive,password"
+                // This version does not support the method (issue #23). Stop before the network connection.
+                is SshAuthMethod.HardwareSecurityKey ->
+                    throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
             }
             val session = jsch.getSession(
                 route.entryUsername.ifBlank { machine.username },

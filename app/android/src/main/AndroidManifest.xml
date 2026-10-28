@@ -6,11 +6,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.NFC" />
     <uses-permission android:name="android.permission.VIBRATE" />
-
-    <uses-feature android:name="android.hardware.nfc" android:required="false" />
-    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <application
         android:name=".Application"

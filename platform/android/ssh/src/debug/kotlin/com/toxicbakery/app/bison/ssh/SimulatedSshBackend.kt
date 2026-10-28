@@ -34,6 +34,7 @@ import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_COLS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_ROWS
+import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.HARDWARE_KEY_NOT_SUPPORTED
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.MOSH_UDP_HANDSHAKE_TIMEOUT_MS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildMoshServerBootstrapCommand
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildSshEndpointBridgeCommand
@@ -61,7 +62,6 @@ class SimulatedSshBackend(
     private val paneSurfaceBus: PaneSurfaceBus,
     private val semanticNotificationBus: SemanticNotificationBus,
     private val keystoreKeyManager: AndroidKeystoreKeyManager,
-    private val yubiKeyFido2Manager: YubiKeyFido2Manager,
 ) : SshBackend {
     internal var moshBootstrapBannerProvider: ((HostMachine) -> String?)? = null
     internal var moshUdpReachabilityProbe: (suspend (HostMachine, MoshConnectInfo) -> Boolean)? = null
@@ -132,23 +132,9 @@ class SimulatedSshBackend(
                 SshAuthResult.Success
             }
 
-            is SshAuthMethod.HardwareSecurityKey -> {
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "SSHAuth",
-                    message = "Requesting hardware security key assertion (${auth.keyType.opensshKeyType}, transport=${auth.transport})",
-                )
-                val result = yubiKeyFido2Manager.signChallenge(
-                    machineId = machine.id,
-                    keyType = auth.keyType.opensshKeyType,
-                    applicationId = auth.applicationId,
-                    challenge = challenge,
-                )
-                result.fold(
-                    onSuccess = { SshAuthResult.Success },
-                    onFailure = { SshAuthResult.Failed(it) },
-                )
-            }
+            // SshTransportManager refuses this method before it calls a backend (issue #23).
+            is SshAuthMethod.HardwareSecurityKey ->
+                SshAuthResult.Failed(UnsupportedOperationException(HARDWARE_KEY_NOT_SUPPORTED))
         }
     }
 

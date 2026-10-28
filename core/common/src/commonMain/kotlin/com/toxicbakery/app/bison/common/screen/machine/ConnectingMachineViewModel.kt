@@ -155,7 +155,7 @@ class ConnectingMachineViewModel(
     companion object {
         private val ORDERED_STAGES = listOf(
             ConnectionProgress.AuthenticatingSsh to (
-                "1. Authenticating SSH2" to "Verifying host fingerprint & signing with Keystore / YubiKey"
+                "1. Authenticating SSH2" to "Verifying host fingerprint & signing with Keystore key or password"
                 ),
             ConnectionProgress.BootstrappingMoshOrBridge to (
                 "2. Bootstrapping Dual-Transport" to "Probing mosh-server UDP SSP & Herdr remote-client-bridge"
