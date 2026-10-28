@@ -11,6 +11,8 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.AgentStatus
+import com.toxicbakery.app.bison.protocol.AgentStatusTransitions
+import com.toxicbakery.app.bison.protocol.AgentStatusUpdate
 import com.toxicbakery.app.bison.protocol.CellData
 import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientKeyEvent
@@ -32,6 +34,7 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
 import com.toxicbakery.app.bison.protocol.PaneSurfaceScroll
 import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
+import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
 import com.toxicbakery.app.bison.store.KnownHostsStore
@@ -65,6 +68,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -131,6 +135,13 @@ import kotlinx.serialization.json.put
  * A machine with a FIDO2 security key logs in with a [HardwareKeyJschIdentity] over [hardwareKeySigner]. The user
  * touches the key for each new session. A ProxyJump machine thus needs two touches: one for the bastion and one for
  * the target. When [hardwareKeySigner] is null, the client refuses such a machine before the network connection.
+ *
+ * The client finds the agents that go to `Blocked` or `Done` (issue #53). It compares the agents of each snapshot and
+ * each status event with the last known agents of the machine ([AgentStatusTransitions]), and puts one
+ * [SemanticNotification] on [semanticNotificationBus] for each transition. The first snapshot after a connect gives
+ * no alert. A disconnect clears the known agents. A reconnect of the supervisor keeps them, so that a transition
+ * during the reconnect also gives its alert. While the surface lease is off, an [AgentStatusWatch] gets the status
+ * events of the host. See [startLivePolling].
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -181,6 +192,16 @@ internal class RealHerdrSshClient(
      * false. Then the client refuses such a machine.
      */
     private val hardwareKeySigner: HardwareKeySigner? = null,
+    /**
+     * Opens the event stream of the agent watch of a machine. A test gives a fake stream. With no opener, the client
+     * uses `herdr remote-api-bridge` on the SSH session ([openBridgeEventStream]). A client with a
+     * [remoteBatchExecutor] and no opener has no session, so it starts no agent watch.
+     */
+    private val agentEventStreamOpener: (
+        suspend (machine: HostMachine, route: ResolvedSshRoute, requestLine: String) -> AgentEventStream
+    )? = null,
+    /** Gives the delay of the agent watch after a number of failed subscriptions in sequence. */
+    private val agentWatchRetryDelay: (failures: Int) -> Duration = AgentStatusWatch::defaultRetryDelay,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -406,6 +427,9 @@ internal class RealHerdrSshClient(
 
     private val paneScrollSequence = AtomicLong(0L)
     private val pollSequence = AtomicLong(0L)
+
+    /** The [SemanticNotification.sequence] of the agent alerts of all machines. */
+    private val agentAlertSequence = AtomicLong(0L)
     private val paneScrollSignals = ConcurrentHashMap<String, Channel<Unit>>()
     private val paneScrollJobs = ConcurrentHashMap<String, Job>()
 
@@ -472,6 +496,19 @@ internal class RealHerdrSshClient(
          * publishes nothing. See [refreshSnapshotAndSurface].
          */
         var minPollSeq: Long = 0L
+
+        /**
+         * The last known agent of each pane, by pane id, or null before the first snapshot after a connect. See
+         * [AgentStatusTransitions].
+         */
+        var knownAgents: Map<String, ClientShellAgent>? = null
+
+        /**
+         * The number of the newest snapshot or status event in [knownAgents]. A snapshot gets its number when its
+         * batch gets the lock of the Poll lane, and an event gets its number when the client reads it. Thus older
+         * data cannot replace newer data. See [recordAgents].
+         */
+        var agentSeq: Long = 0L
     }
 
     /** Runs [block] in the frame lock of [machineId], and gives it the frame data of the machine. */
@@ -518,7 +555,8 @@ internal class RealHerdrSshClient(
      * not open, so that the caller can tell the kind of the failure.
      *
      * This is a connect from the user. It stops the reconnect loop of an earlier connect, and [startLivePolling]
-     * starts a new loop after the connect.
+     * starts a new loop after the connect. The next snapshot is the first snapshot of the connect, so it gives no
+     * agent alert.
      */
     suspend fun connectAndVerify(
         machine: HostMachine,
@@ -526,6 +564,7 @@ internal class RealHerdrSshClient(
     ): Result<Unit> = withContext(Dispatchers.IO) {
         supervisors.remove(machine.id)?.stop()
         roundTripMeter.reset(machine.id)
+        withFrames(machine.id) { frames -> frames.knownAgents = null }
         // A new connect starts a new series of polls with no snapshot. See recordMissingSnapshot.
         machinesWithoutSnapshot.remove(machine.id)
         connectSteps += machine.id
@@ -604,6 +643,12 @@ internal class RealHerdrSshClient(
      *
      * The poll loop reads the snapshot and the surface each [LIVE_POLL_INTERVAL_MS] while [isSurfaceActive] returns
      * true. It pauses while the supervisor reconnects, and it stops when the supervisor stops.
+     *
+     * While [isSurfaceActive] returns false, the loop reads nothing. It runs an [AgentStatusWatch] for the agent
+     * alerts when the client has a snapshot of the machine (issue #53). The watch stops when the lease comes on,
+     * when the loop stops, and at [disconnect]. A closed session ends its stream. The watch then waits for its retry
+     * delay and for a live session. Its next command finds the closed session and tells the supervisor, as a
+     * command of the poll does.
      */
     fun startLivePolling(
         machine: HostMachine,
@@ -622,24 +667,63 @@ internal class RealHerdrSshClient(
         connectSteps -= machine.id
         pollJobs.remove(machine.id)?.cancel()
         val job = scope.launch {
-            while (isActive && supervisor.awaitLive()) {
-                if (isSurfaceActive()) {
-                    runCatching {
-                        refreshSnapshotAndSurface(machine, route)
-                    }.onFailure { err ->
-                        ensureActive()
-                        sshDebugLog.record(
-                            machineId = machine.id,
-                            tag = "RealSSH",
-                            message = "Live poll warning: ${err.message}",
-                            isError = true,
-                        )
+            var agentWatch: Job? = null
+            try {
+                while (isActive && supervisor.awaitLive()) {
+                    if (isSurfaceActive()) {
+                        agentWatch?.cancel()
+                        agentWatch = null
+                        runCatching {
+                            refreshSnapshotAndSurface(machine, route)
+                        }.onFailure { err ->
+                            ensureActive()
+                            sshDebugLog.record(
+                                machineId = machine.id,
+                                tag = "RealSSH",
+                                message = "Live poll warning: ${err.message}",
+                                isError = true,
+                            )
+                        }
+                    } else if (agentWatch?.isActive != true) {
+                        agentWatch = startAgentWatch(machine, route, supervisor)
                     }
+                    delay(LIVE_POLL_INTERVAL_MS)
                 }
-                delay(LIVE_POLL_INTERVAL_MS)
+            } finally {
+                agentWatch?.cancel()
             }
         }
         pollJobs[machine.id] = job
+    }
+
+    /**
+     * Starts the [AgentStatusWatch] of [machine] in the scope of the poll loop, and returns its job. Returns null when
+     * the client has no snapshot of the machine yet, or when it has no event stream (see [agentEventStreamOpener]).
+     */
+    private fun CoroutineScope.startAgentWatch(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        supervisor: SessionSupervisor,
+    ): Job? {
+        val opener = agentEventStreamOpener ?: if (remoteBatchExecutor == null) ::openBridgeEventStream else null
+        if (opener == null || withFrames(machine.id) { it.knownAgents } == null) return null
+        val watch = AgentStatusWatch(
+            knownPaneIds = { withFrames(machine.id) { it.knownAgents?.keys?.toSet() } },
+            readSnapshot = { readAgentSnapshot(machine, route) },
+            timeSource = timeSource,
+            openStream = { requestLine -> opener(machine, route, requestLine) },
+            onStatusEvent = { agent -> recordAgentStatusEvent(machine, agent) },
+            log = { message, isError ->
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = AGENT_ALERT_LOG_TAG,
+                    message = message,
+                    isError = isError,
+                )
+            },
+            retryDelay = agentWatchRetryDelay,
+        )
+        return launch { watch.run(awaitLive = supervisor::awaitLive) }
     }
 
     fun disconnect(machineId: String) {
@@ -662,6 +746,8 @@ internal class RealHerdrSshClient(
         // number, but its batch fails, because the machine has no session. Thus it also publishes nothing.
         withFrames(machineId) { frames ->
             discardRunningPolls(machineId)
+            frames.knownAgents = null
+            semanticNotificationBus.setAgentsNeedingUser(machineId, emptyMap())
             frames.scrollRequests.clear()
             paneScrolls.remove(machineId)
             optimisticEdits.remove(machineId)?.let { synchronized(it) { it.clear() } }
@@ -899,6 +985,7 @@ internal class RealHerdrSshClient(
         machinesWithoutSnapshot.remove(machine.id)
         val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
 
+        var agentAlerts = emptyList<ClientShellAgent>()
         // The parse reads and writes the selection. In the lock, a change of the selection cannot occur during the
         // parse.
         val parsed = withFrames(machine.id) { frames ->
@@ -908,8 +995,12 @@ internal class RealHerdrSshClient(
             val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
             parseSnapshotObject(machine.id, resolvedSnapshotObj, sel).also { parsed ->
                 snapshotPublisher(machine.id, parsed.snapshot)
+                agentAlerts = recordAgents(machine.id, frames, pollSeq) { known ->
+                    AgentStatusTransitions.fromSnapshot(known, parsed.snapshot.agents)
+                }
             }
         } ?: return@withContext true
+        publishAgentAlerts(machine.id, agentAlerts)
 
         val activeTabId = parsed.snapshot.focusedTabId
         val activeLayout = parsed.layoutsByTab[activeTabId]
@@ -1113,6 +1204,183 @@ internal class RealHerdrSshClient(
     private fun recordRoundTrip(machineId: String, elapsed: Duration) {
         roundTripMeter.record(machineId, elapsed) { rttMs -> roundTripListener?.invoke(machineId, rttMs) == true }
     }
+
+    /**
+     * Applies [step] to the known agents of [frames] of [machineId] when [seq] is newer than the data in them, and
+     * returns the alerts of the step. A step that returns null changes nothing. The caller holds the frame lock. See
+     * [MachineFrames.agentSeq].
+     *
+     * It also gives the known agents that need the user to [SemanticNotificationBus.setAgentsNeedingUser]. Thus the
+     * service removes an alert when its agent leaves `Blocked` or `Done`, or stops.
+     */
+    private inline fun recordAgents(
+        machineId: String,
+        frames: MachineFrames,
+        seq: Long,
+        step: (known: Map<String, ClientShellAgent>?) -> AgentStatusUpdate?,
+    ): List<ClientShellAgent> {
+        if (seq <= frames.agentSeq) return emptyList()
+        val update = step(frames.knownAgents) ?: return emptyList()
+        frames.agentSeq = seq
+        frames.knownAgents = update.known
+        semanticNotificationBus.setAgentsNeedingUser(machineId, update.known.mapValues { it.value.agentStatus })
+        return update.alerts
+    }
+
+    /**
+     * Reads a snapshot of [machine] for its [AgentStatusWatch]. It reads no panes and publishes nothing on the
+     * snapshot and surface buses. It records the agents, publishes their alerts, and returns the agent panes. Returns
+     * null when the output has no snapshot. Then it writes the cause to the debug log, as the poll does
+     * ([recordMissingSnapshot]).
+     */
+    private suspend fun readAgentSnapshot(machine: HostMachine, route: ResolvedSshRoute): Set<String>? =
+        withContext(Dispatchers.IO) {
+            var seq = 0L
+            val output = executeBatchOnLane(
+                machine = machine,
+                route = route,
+                lane = WorkerLane.Poll,
+                commands = listOf(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot 2>&1")),
+                onLaneLocked = { seq = pollSequence.incrementAndGet() },
+            )
+            val snapshotObj = findSnapshotObject(output) ?: run {
+                recordMissingSnapshot(machine, output)
+                return@withContext null
+            }
+            machinesWithoutSnapshot.remove(machine.id)
+            val agents = (snapshotObj["agents"] as? JsonArray).orEmpty().mapNotNull { element ->
+                (element as? JsonObject)?.let { parseAgentObject(it, focusedPaneId = null) }
+            }
+            // After a disconnect, a snapshot that ends late changes nothing.
+            ensureActive()
+            val alerts = withFrames(machine.id) { frames ->
+                recordAgents(machine.id, frames, seq) { known -> AgentStatusTransitions.fromSnapshot(known, agents) }
+            }
+            publishAgentAlerts(machine.id, alerts)
+            agents.mapTo(HashSet()) { it.paneId }
+        }
+
+    /** Records the status event of [agent] that the [AgentStatusWatch] of [machine] read, and publishes its alert. */
+    private fun recordAgentStatusEvent(machine: HostMachine, agent: ClientShellAgent) {
+        val seq = pollSequence.incrementAndGet()
+        val alerts = withFrames(machine.id) { frames ->
+            // With no known agents, the client has no snapshot since the last disconnect. Then it ignores the event.
+            recordAgents(machine.id, frames, seq) { known ->
+                known?.let { AgentStatusTransitions.fromEvent(it, agent) }
+            }
+        }
+        publishAgentAlerts(machine.id, alerts)
+    }
+
+    /**
+     * Puts one [SemanticNotification] for each agent of [alerts] on [semanticNotificationBus]. The title and the
+     * [SemanticNotification.agentName] are the name of the agent ([agentLabelOf]). The body is the title of the agent
+     * from Herdr, or empty. `BisonSessionService` makes the text of the Android notification from these fields.
+     */
+    private fun publishAgentAlerts(machineId: String, alerts: List<ClientShellAgent>) {
+        alerts.forEach { agent ->
+            val label = agentLabelOf(agent)
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = AGENT_ALERT_LOG_TAG,
+                message = "The agent $label in ${agent.paneId} is ${agent.agentStatus.wireName}",
+            )
+            semanticNotificationBus.tryPublishNotification(
+                machineId = machineId,
+                notification = SemanticNotification(
+                    bootId = "herdr-$machineId",
+                    sequence = agentAlertSequence.incrementAndGet().toULong(),
+                    title = label,
+                    body = (agent.title ?: agent.terminalTitleStripped).orEmpty().trim(),
+                    paneId = agent.paneId,
+                    agentName = label,
+                    agentStatus = agent.agentStatus,
+                ),
+            )
+        }
+    }
+
+    /** Returns the name of [agent] that the app shows: its Herdr name, its display name, its kind, or its pane. */
+    private fun agentLabelOf(agent: ClientShellAgent): String =
+        listOf(agent.name, agent.displayAgent, agent.agent).firstOrNull { !it.isNullOrBlank() } ?: agent.paneId
+
+    /**
+     * Opens an `exec` channel that runs `herdr remote-api-bridge` on the session of [machine], and sends
+     * [requestLine]. The channel keeps its input open, because Herdr ends a subscription when the bridge reads more
+     * input or the end of its input. The stream ends when the channel closes, for example when the session closes.
+     *
+     * A cancel during the open does not leave the channel open: [openNonCancellable] closes it. Each open channel
+     * uses one session of the `MaxSessions` limit of the host, and a subscription on the host.
+     */
+    private suspend fun openBridgeEventStream(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        requestLine: String,
+    ): AgentEventStream = withContext(Dispatchers.IO) {
+        awaitSession(machine)
+        val session = getOrOpenSession(machine, route)
+        openNonCancellable(
+            open = {
+                val channel = session.openChannel("exec") as ChannelExec
+                channel.setCommand("$REMOTE_PATH_EXPORT; exec ${HerdrCommand.of(machine)} remote-api-bridge")
+                val stdout = channel.inputStream
+                val stdin = channel.outputStream
+                val errors = TailOutputStream(MAX_LOGGED_CAUSE_LENGTH * 2)
+                channel.setErrStream(errors)
+                try {
+                    channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
+                    stdin.write("$requestLine\n".toByteArray(Charsets.UTF_8))
+                    stdin.flush()
+                } catch (error: Exception) {
+                    channel.disconnect()
+                    throw error
+                }
+                BridgeEventStream(channel, BufferedReader(InputStreamReader(stdout, Charsets.UTF_8)), errors)
+            },
+            close = { it.close() },
+        )
+    }
+
+    /** The output lines of one `herdr remote-api-bridge` channel. See [openBridgeEventStream]. */
+    private class BridgeEventStream(
+        private val channel: ChannelExec,
+        private val reader: BufferedReader,
+        private val errors: TailOutputStream,
+    ) : AgentEventStream {
+        override suspend fun readLine(): String? = runInterruptible(Dispatchers.IO) { reader.readLine() }
+
+        override fun errorText(): String? =
+            errors.text().lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }?.take(MAX_LOGGED_CAUSE_LENGTH)
+
+        override fun close() {
+            runCatching { channel.disconnect() }
+        }
+    }
+
+    /** Keeps the last [capacity] bytes of the error output of a channel that stays open for a long time. */
+    private class TailOutputStream(private val capacity: Int) : OutputStream() {
+        private val bytes = ArrayDeque<Byte>(capacity)
+
+        @Synchronized
+        override fun write(b: Int) {
+            if (bytes.size == capacity) bytes.removeFirst()
+            bytes.addLast(b.toByte())
+        }
+
+        @Synchronized
+        fun text(): String = bytes.toByteArray().toString(Charsets.UTF_8)
+    }
+
+    /** Returns the snapshot object of the `herdr api snapshot` output in [output], or null. */
+    private fun findSnapshotObject(output: String): JsonObject? =
+        output.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("{") && it.endsWith("}") }
+            .firstNotNullOfOrNull { line ->
+                runCatching {
+                    json.parseToJsonElement(line).jsonObject["result"]?.jsonObject?.get("snapshot")?.jsonObject
+                }.getOrNull()
+            }
 
     private fun parseParamsObject(paramsJson: String): JsonObject =
         runCatching { json.parseToJsonElement(paramsJson).jsonObject }
@@ -2877,30 +3145,7 @@ internal class RealHerdrSshClient(
         sel.focusedPaneId = effectivePaneId
 
         val agents = agentsArray.mapNotNull { el ->
-            val obj = el as? JsonObject ?: return@mapNotNull null
-            val pId = obj["pane_id"]?.jsonPrimitive?.content ?: return@mapNotNull null
-            val wsId = obj["workspace_id"]?.jsonPrimitive?.content.orEmpty()
-            val tId = obj["tab_id"]?.jsonPrimitive?.content.orEmpty()
-            val name = obj["name"]?.jsonPrimitive?.content
-            val agent = obj["agent"]?.jsonPrimitive?.content.orEmpty()
-            val displayAgent = obj["display_agent"]?.jsonPrimitive?.content ?: name ?: agent
-            val title = obj["title"]?.jsonPrimitive?.content
-            val terminalTitle = obj["terminal_title"]?.jsonPrimitive?.content
-            val terminalTitleStripped = obj["terminal_title_stripped"]?.jsonPrimitive?.content
-            val statusStr = (obj["agent_status"] ?: obj["state"])?.jsonPrimitive?.content
-            ClientShellAgent(
-                paneId = pId,
-                workspaceId = wsId,
-                tabId = tId,
-                name = name,
-                displayAgent = displayAgent,
-                agent = agent,
-                title = title,
-                terminalTitle = terminalTitle,
-                terminalTitleStripped = terminalTitleStripped,
-                agentStatus = parseAgentStatus(statusStr),
-                focused = pId == effectivePaneId,
-            )
+            (el as? JsonObject)?.let { parseAgentObject(it, effectivePaneId) }
         }
 
         // Propagate agent statuses up to workspaces and tabs so top bar pills show attention dots
@@ -2982,6 +3227,30 @@ internal class RealHerdrSshClient(
             agents = agents,
         )
         return ParsedSnapshotBundle(snapshot = snapshot, layoutsByTab = layoutsByTab)
+    }
+
+    /**
+     * Parses one agent of the `agents` list of a Herdr snapshot. The agent has the focus when its pane is
+     * [focusedPaneId]. Returns null when the agent has no pane.
+     */
+    private fun parseAgentObject(obj: JsonObject, focusedPaneId: String?): ClientShellAgent? {
+        val pId = obj["pane_id"]?.jsonPrimitive?.content ?: return null
+        val name = obj["name"]?.jsonPrimitive?.content
+        val agent = obj["agent"]?.jsonPrimitive?.content.orEmpty()
+        val statusStr = (obj["agent_status"] ?: obj["state"])?.jsonPrimitive?.content
+        return ClientShellAgent(
+            paneId = pId,
+            workspaceId = obj["workspace_id"]?.jsonPrimitive?.content.orEmpty(),
+            tabId = obj["tab_id"]?.jsonPrimitive?.content.orEmpty(),
+            name = name,
+            displayAgent = obj["display_agent"]?.jsonPrimitive?.content ?: name ?: agent,
+            agent = agent,
+            title = obj["title"]?.jsonPrimitive?.content,
+            terminalTitle = obj["terminal_title"]?.jsonPrimitive?.content,
+            terminalTitleStripped = obj["terminal_title_stripped"]?.jsonPrimitive?.content,
+            agentStatus = parseAgentStatus(statusStr),
+            focused = pId == focusedPaneId,
+        )
     }
 
     private fun buildCompositeSurfaceFrame(
@@ -3466,6 +3735,13 @@ internal class RealHerdrSshClient(
 
         /** The debug log tag of [recordTransport]. */
         internal const val TRANSPORT_LOG_TAG = "Transport"
+
+        /** The debug log tag of the agent alerts and the agent watch. */
+        internal const val AGENT_ALERT_LOG_TAG = "AgentAlert"
+
+        /** Puts the common install places of `herdr` at the start of the `PATH` of a remote command. */
+        private const val REMOTE_PATH_EXPORT =
+            "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\""
         private const val LIVENESS_POLL_INTERVAL_MS = 10L
         private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
