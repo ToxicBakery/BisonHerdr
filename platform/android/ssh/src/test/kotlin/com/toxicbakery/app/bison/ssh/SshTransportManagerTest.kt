@@ -108,6 +108,25 @@ class SshTransportManagerTest {
     }
 
     @Test
+    fun loginWithAMissingKeyLogsWhatTheUserMustDo() = runTest {
+        val backend = RecordingSshBackend(authResult = SshAuthResult.KeyMissing("work_key"))
+        val machine = HostMachine(id = "key-box", name = "key-box", hostname = "192.168.1.43", username = "ian")
+
+        assertFalse(manager(backend).connect(machine))
+
+        assertEquals(ConnectionProgress.Failed, stateManager.connectionProgress.value["key-box"])
+        assertTrue(stateManager.hostKeyPrompts.value.isEmpty())
+        assertTrue(
+            debugLog.entries.value.any {
+                it.isError && it.tag == "SSHAuth" && it.message.contains(
+                    "The key work_key does not exist. Open the machine settings and copy the public key.",
+                )
+            },
+            debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" },
+        )
+    }
+
+    @Test
     fun disconnectClosesTheHostKeyPrompt() = runTest {
         val backend = RecordingSshBackend(authResult = SshAuthResult.HostKeyUnknown(knownHost(fingerprint = "SHA256:new")))
         val machine = HostMachine(id = "lan-box", name = "lan-box", hostname = "192.168.1.42", username = "ian")

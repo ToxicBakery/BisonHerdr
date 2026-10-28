@@ -1410,7 +1410,6 @@ internal class RealHerdrSshClient(
                             keystoreKeyManager = keystoreKeyManagerProvider(),
                             keyAlias = auth.keyAlias,
                             algorithm = auth.algorithm,
-                            requireBiometric = auth.requireBiometric,
                         ),
                         null,
                     )

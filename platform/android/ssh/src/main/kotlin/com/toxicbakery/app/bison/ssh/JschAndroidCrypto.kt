@@ -167,21 +167,23 @@ class AndroidJschXdh : XDH {
 /**
  * Bridges [AndroidKeystoreKeyManager] hardware-backed / JCA keys (`Ed25519`, `RSA-4096`, `ECDSA-P256`)
  * into JSch's [Identity] interface for `publickey` authentication.
+ *
+ * The identity does not make a key. When [keyAlias] has no key, [getPublicKeyBlob] and [getSignature]
+ * throw a [MissingKeyException]. JSch lets this [RuntimeException] go through `JSch.addIdentity` and
+ * `Session.connect`, so the login error names the missing key.
  */
 internal class AndroidKeystoreJschIdentity(
     private val keystoreKeyManager: AndroidKeystoreKeyManager,
     private val keyAlias: String,
     private val algorithm: KeyAlgorithm,
-    private val requireBiometric: Boolean = false,
 ) : Identity {
 
     override fun setPassphrase(passphrase: ByteArray?): Boolean = true
 
     override fun getPublicKeyBlob(): ByteArray =
-        keystoreKeyManager.getOrCreatePublicKey(
+        keystoreKeyManager.getExistingPublicKey(
             keyAlias = keyAlias,
             algorithm = algorithm,
-            requireBiometric = requireBiometric,
         ).wireBlob
 
     override fun getSignature(data: ByteArray?): ByteArray? =

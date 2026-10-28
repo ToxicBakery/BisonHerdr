@@ -112,14 +112,20 @@ class RealSshBackend internal constructor(
 
         /**
          * Maps a login [error] from JSch to its [SshAuthResult] kind. A rejected host key is its
-         * [SshAuthResult.HostKeyRejected] kind. A refused login is [SshAuthResult.AuthFailed]. An
-         * [IOException] at any level of the cause chain is [SshAuthResult.NetworkError]. All other errors
+         * [SshAuthResult.HostKeyRejected] kind. A [MissingKeyException] at any level of the cause chain is
+         * [SshAuthResult.KeyMissing]. A refused login is [SshAuthResult.AuthFailed]. An [IOException] at
+         * any level of the cause chain is [SshAuthResult.NetworkError]. All other errors
          * are [SshAuthResult.Failed].
          */
         fun toAuthResult(error: Throwable): SshAuthResult {
             val message = error.message.orEmpty()
+            val missingKey = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH)
+                .filterIsInstance<MissingKeyException>()
+                .firstOrNull()
             return when {
                 error is HostKeyRejectedException -> error.rejection
+
+                missingKey != null -> SshAuthResult.KeyMissing(missingKey.keyAlias)
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)

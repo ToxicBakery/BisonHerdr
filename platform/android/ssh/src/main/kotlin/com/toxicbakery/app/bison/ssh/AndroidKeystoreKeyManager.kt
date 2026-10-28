@@ -66,20 +66,45 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
 
     /**
      * Generates or loads an existing key pair for [keyAlias] using [algorithm] and returns its
-     * OpenSSH `authorized_keys` representation.
+     * OpenSSH `authorized_keys` representation. This is the only function that makes a key.
      */
     fun getOrCreatePublicKey(
         keyAlias: String,
         algorithm: KeyAlgorithm = KeyAlgorithm.Ed25519,
         requireBiometric: Boolean = false,
-        comment: String = "bison-tablet",
+        comment: String = DEFAULT_KEY_COMMENT,
+    ): ExportedSshPublicKey =
+        exportedPublicKey(keyAlias, algorithm, comment) {
+            generateKeyPair(keyAlias, algorithm, requireBiometric).public
+        }
+
+    /**
+     * Returns the public key of the stored key for [keyAlias]. It does not make a key.
+     *
+     * Throws a [MissingKeyException] when [keyAlias] has no key.
+     */
+    fun getExistingPublicKey(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        comment: String = DEFAULT_KEY_COMMENT,
+    ): ExportedSshPublicKey =
+        exportedPublicKey(keyAlias, algorithm, comment) { throw MissingKeyException(keyAlias) }
+
+    /**
+     * Returns the exported public key of the stored key for [keyAlias]. When [keyAlias] has no usable key,
+     * [missingKey] gives the public key or throws.
+     */
+    private inline fun exportedPublicKey(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        comment: String,
+        missingKey: () -> PublicKey,
     ): ExportedSshPublicKey {
         val cacheKey = "$keyAlias:${algorithm.name}:$comment"
         exportedPublicKeys[cacheKey]?.let { return it }
         return synchronized(keyLock) {
             exportedPublicKeys[cacheKey]?.let { return@synchronized it }
-            val publicKey = usableStoredKey(keyAlias, algorithm, ::loadExistingPublicKey)
-                ?: generateKeyPair(keyAlias, algorithm, requireBiometric).public
+            val publicKey = usableStoredKey(keyAlias, algorithm, ::loadExistingPublicKey) ?: missingKey()
             val exported = exportPublicKey(
                 keyAlias = keyAlias,
                 algorithm = algorithm,
@@ -106,6 +131,9 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
     /**
      * Signs an SSH `SSH_MSG_USERAUTH_REQUEST` challenge payload using the private key for [keyAlias]
      * and returns the RFC 4253 / RFC 8332 / RFC 5656 / RFC 8709 formatted SSH signature blob.
+     *
+     * It does not make a key, because the host does not know a new key. Throws a [MissingKeyException]
+     * when [keyAlias] has no key. Use [getOrCreatePublicKey] to make the key.
      */
     fun signSshChallenge(
         keyAlias: String,
@@ -114,10 +142,8 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
         sshAlgorithmOverride: String? = null,
     ): ByteArray {
         val privateKey = loadPrivateKey(keyAlias)?.takeIf { isKeyOfAlgorithm(it, algorithm) }
-            ?: synchronized(keyLock) {
-                usableStoredKey(keyAlias, algorithm, ::loadPrivateKey)
-                    ?: generateKeyPair(keyAlias, algorithm, requireBiometric = false).private
-            }
+            ?: synchronized(keyLock) { usableStoredKey(keyAlias, algorithm, ::loadPrivateKey) }
+            ?: throw MissingKeyException(keyAlias)
         val resolvedSshAlg = sshAlgorithmOverride?.takeIf { it.isNotBlank() } ?: algorithm.sshKeyType
         val rawSignature = when (algorithm) {
             KeyAlgorithm.Ed25519 -> {
@@ -480,6 +506,7 @@ class AndroidKeystoreKeyManager : SshPublicKeyProvider {
         private const val ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val ED25519_CURVE = "ed25519"
         private const val ED25519_OID = "1.3.101.112"
+        private const val DEFAULT_KEY_COMMENT = "bison-tablet"
         private val log = Arbor.tag("AndroidKeystoreKeyManager")
     }
 }

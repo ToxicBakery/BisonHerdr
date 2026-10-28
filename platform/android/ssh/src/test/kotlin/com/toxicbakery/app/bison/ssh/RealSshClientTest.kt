@@ -1,5 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
+import com.jcraft.jsch.Identity
+import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -10,6 +12,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
@@ -113,6 +116,74 @@ class RealSshClientTest {
         assertEquals(SshAuthResult.Failed(error), RealSshBackend.toAuthResult(error))
     }
 
+    @Test
+    fun keyLoginWithAMissingKeyGivesKeyMissingAndMakesNoKey() = runTest {
+        val machine = machine(
+            id = "missing-key",
+            username = TestSshServer.KEY_USER,
+            authMethod = SshAuthMethod.KeystoreKey(keyAlias = MISSING_ALIAS, algorithm = server.keyAlgorithm),
+        )
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+
+        val result = assertIs<SshAuthResult.KeyMissing>(backend.authenticate(machine, route), debugLogDump())
+
+        assertEquals(MISSING_ALIAS, result.keyAlias)
+        assertEquals(
+            "The key $MISSING_ALIAS does not exist. Open the machine settings and copy the public key.",
+            result.message,
+        )
+        assertTrue(debugLog.entries.value.any { it.isError && it.message.contains(result.message) }, debugLogDump())
+        assertFailsWith<MissingKeyException> {
+            server.keyManager.getExistingPublicKey(MISSING_ALIAS, server.keyAlgorithm)
+        }
+    }
+
+    @Test
+    fun aMissingKeyInsideAJschErrorIsKeyMissing() {
+        val error = JSchException("Session.connect: key error", MissingKeyException(MISSING_ALIAS))
+
+        assertEquals(SshAuthResult.KeyMissing(MISSING_ALIAS), RealSshBackend.toAuthResult(error))
+    }
+
+    @Test
+    fun jschPassesAMissingKeyErrorFromTheSignatureThrough() {
+        // The server knows the public key, so JSch asks the identity for a signature.
+        val knownKey = AndroidKeystoreJschIdentity(server.keyManager, TestSshServer.KEY_ALIAS, server.keyAlgorithm)
+        val session = JSch().apply { addIdentity(SignFailsIdentity(knownKey), null) }
+            .getSession(TestSshServer.KEY_USER, TestSshServer.HOST, server.port)
+        session.setConfig("StrictHostKeyChecking", "no")
+        session.setConfig("PreferredAuthentications", "publickey")
+        JschAndroidCrypto.configureSession(session)
+
+        val error = assertFailsWith<MissingKeyException> { session.connect(CONNECT_TIMEOUT_MS) }
+
+        assertEquals(TestSshServer.KEY_ALIAS, error.keyAlias)
+        assertFalse(session.isConnected)
+    }
+
+    /** Gives the public key of [publicKey], but its sign fails as if the key store lost the private key. */
+    private class SignFailsIdentity(private val publicKey: Identity) : Identity {
+        override fun setPassphrase(passphrase: ByteArray?): Boolean = true
+
+        override fun getPublicKeyBlob(): ByteArray = publicKey.publicKeyBlob
+
+        override fun getSignature(data: ByteArray?): ByteArray = throw MissingKeyException(TestSshServer.KEY_ALIAS)
+
+        override fun getSignature(data: ByteArray?, alg: String?): ByteArray =
+            throw MissingKeyException(TestSshServer.KEY_ALIAS)
+
+        @Deprecated("Deprecated in JSch Identity")
+        override fun decrypt(): Boolean = true
+
+        override fun getAlgName(): String = publicKey.algName
+
+        override fun getName(): String = "sign-fails"
+
+        override fun isEncrypted(): Boolean = false
+
+        override fun clear() = Unit
+    }
+
     private fun machine(id: String, username: String, authMethod: SshAuthMethod): HostMachine =
         server.machine(id = id, username = username, authMethod = authMethod).also { machines += it }
 
@@ -122,5 +193,9 @@ class RealSshClientTest {
     private companion object {
         /** JSch starts the message of a failed login with this text. */
         const val AUTH_FAIL = "Auth fail"
+
+        /** A key alias that the key manager does not have. */
+        const val MISSING_ALIAS = "real_ssh_client_test_missing_key"
+        const val CONNECT_TIMEOUT_MS = 10_000
     }
 }
