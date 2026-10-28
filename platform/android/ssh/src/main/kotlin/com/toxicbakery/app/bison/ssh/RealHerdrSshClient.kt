@@ -220,9 +220,15 @@ internal class RealHerdrSshClient(
     private val paneScrollJobs = ConcurrentHashMap<String, Job>()
 
     /**
-     * Each change to [pendingPaneScrolls] and [paneScrolls] occurs in this lock, together with the frame that
-     * shows the change. This makes sure that a frame with an older scroll position does not replace a frame with
-     * a newer position.
+     * This lock makes these scroll steps atomic:
+     * - [requestPaneScroll] sets [pendingPaneScrolls] and [paneScrolls], and publishes the frame of the new position.
+     * - [sendPaneScroll] reads [pendingPaneScrolls], sets [paneScrolls], and publishes the frame of the Herdr answer.
+     * - [refreshSnapshotAndSurface] merges the queued position into [paneScrolls].
+     *
+     * Because of the lock, a frame from the scroll worker cannot replace a newer frame from a scroll request.
+     * The worker removes the next request outside the lock, because `remove` is atomic and publishes no frame.
+     * [disconnect] also does not use the lock. The poll and the input flush build and publish their frames outside
+     * the lock.
      */
     private val paneScrollLock = Any()
 
