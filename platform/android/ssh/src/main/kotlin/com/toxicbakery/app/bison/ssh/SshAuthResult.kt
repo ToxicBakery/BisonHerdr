@@ -119,6 +119,13 @@ sealed interface SshAuthResult {
      *
      * When [timedOut] is false, the client opened no socket, because Android stops the connection. When [timedOut] is
      * true, the connect to a private address failed after its time limit, and Android can be the cause.
+     *
+     * When [disconnected] is true, a disconnect of the machine ended the wait for the permission. Then the machine
+     * gets no local network cause, because a later grant connects again each machine with that cause.
      */
-    data class LocalNetworkBlocked(val hostPort: String, val timedOut: Boolean = false) : SshAuthResult
+    data class LocalNetworkBlocked(
+        val hostPort: String,
+        val timedOut: Boolean = false,
+        val disconnected: Boolean = false,
+    ) : SshAuthResult
 }

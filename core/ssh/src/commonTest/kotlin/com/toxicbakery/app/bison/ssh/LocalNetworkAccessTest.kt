@@ -113,7 +113,7 @@ class LocalNetworkAccessTest {
 
         access.cancel(MACHINE_ID)
 
-        assertEquals(LocalNetworkOutcome.Cancelled, first.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, first.await())
         // The dialog stays open for the other machine.
         assertEquals(HOST_PORT, access.openRequest.value?.hostPort)
         answer.complete(LocalNetworkOutcome.Granted)
@@ -137,7 +137,7 @@ class LocalNetworkAccessTest {
         assertEquals(setOf(MACHINE_ID), access.cancelAll())
         assertEquals(emptySet(), access.cancelAll())
 
-        assertEquals(LocalNetworkOutcome.Cancelled, result.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, result.await())
         runCurrent()
         assertTrue(dialogCancelled)
         assertNull(access.openRequest.value)

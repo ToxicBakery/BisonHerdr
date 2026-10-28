@@ -142,10 +142,12 @@ class RealSshBackend internal constructor(
         }
         val result = connectAndVerify(machine, route, keyAuth, promptOutcome)
         // A connect to a private address can time out because Android stops it. Ask, and try one more time.
-        if (mayRetryAfterGrant && result is SshAuthResult.LocalNetworkBlocked && result.timedOut &&
-            askForLocalNetwork(machine, result.hostPort, timedOut = true) == LocalNetworkOutcome.Granted
-        ) {
-            return authenticate(machine, route, mayRetryAfterGrant = false)
+        if (mayRetryAfterGrant && result is SshAuthResult.LocalNetworkBlocked && result.timedOut) {
+            return when (askForLocalNetwork(machine, result.hostPort, timedOut = true)) {
+                LocalNetworkOutcome.Granted -> authenticate(machine, route, mayRetryAfterGrant = false)
+                LocalNetworkOutcome.Disconnected -> result.copy(disconnected = true)
+                else -> result
+            }
         }
         return result
     }
@@ -178,7 +180,11 @@ class RealSshBackend internal constructor(
         if (!withContext(Dispatchers.IO) { guard.needsPermission(route.entryHost) }) return null
         val hostPort = KnownHost.formatHostPort(route.entryHost, route.entryPort)
         val outcome = askForLocalNetwork(machine, hostPort)
-        return if (outcome == LocalNetworkOutcome.Granted) null else SshAuthResult.LocalNetworkBlocked(hostPort)
+        return when (outcome) {
+            LocalNetworkOutcome.Granted -> null
+            LocalNetworkOutcome.Disconnected -> SshAuthResult.LocalNetworkBlocked(hostPort, disconnected = true)
+            else -> SshAuthResult.LocalNetworkBlocked(hostPort)
+        }
     }
 
     /**

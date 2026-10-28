@@ -45,8 +45,14 @@ enum class LocalNetworkOutcome {
     /** The user did not answer before the time limit. */
     TimedOut,
 
-    /** The UI stopped before the answer, or a disconnect ended the wait of the machine. */
+    /** The UI stopped before the answer, or a newer wait of the same machine ended this wait. */
     Cancelled,
+
+    /**
+     * A disconnect of the machine ended the wait. The machine must not keep a local network cause, because a later
+     * grant connects again each machine with that cause.
+     */
+    Disconnected,
 }
 
 /**
@@ -80,7 +86,7 @@ class LocalNetworkAccess {
      * - When no UI runs [hostRequests], it returns [LocalNetworkOutcome.NoUi] at once and puts no request.
      * - When a request is open, it waits for the answer to that request.
      * - When no answer comes in [timeout], it returns [LocalNetworkOutcome.TimedOut].
-     * - [cancel] for [machineId] makes it return [LocalNetworkOutcome.Cancelled] at once.
+     * - [cancel] for [machineId] makes it return [LocalNetworkOutcome.Disconnected] at once.
      * - When no other machine waits for the request, it removes the request at the end. A late answer has no effect.
      */
     suspend fun request(
@@ -122,18 +128,21 @@ class LocalNetworkAccess {
         }
     }
 
-    /** Ends the wait of [machineId] in [request] with [LocalNetworkOutcome.Cancelled]. It does nothing with no wait. */
+    /**
+     * Ends the wait of [machineId] in [request] with [LocalNetworkOutcome.Disconnected], for a disconnect of the
+     * machine. It does nothing when the machine has no wait.
+     */
     fun cancel(machineId: String) {
-        cancels.value[machineId]?.complete(LocalNetworkOutcome.Cancelled)
+        cancels.value[machineId]?.complete(LocalNetworkOutcome.Disconnected)
     }
 
     /**
-     * Ends the waits of all machines in [request] with [LocalNetworkOutcome.Cancelled]. Returns the ids of the
+     * Ends the waits of all machines in [request] with [LocalNetworkOutcome.Disconnected]. Returns the ids of the
      * machines whose wait it ended, so that the caller can disconnect them.
      */
     fun cancelAll(): Set<String> {
         val waits = cancels.value
-        return waits.filterValues { it.complete(LocalNetworkOutcome.Cancelled) }.keys
+        return waits.filterValues { it.complete(LocalNetworkOutcome.Disconnected) }.keys
     }
 
     /**

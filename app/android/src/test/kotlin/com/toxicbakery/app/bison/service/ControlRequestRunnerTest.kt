@@ -7,6 +7,7 @@ import com.toxicbakery.app.bison.ssh.KeyboardInteractivePrompt
 import com.toxicbakery.app.bison.ssh.KeyboardInteractiveQuestion
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
+import com.toxicbakery.app.bison.ssh.NeedsUserCause
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.UserAuthOutcome
@@ -222,7 +223,7 @@ class ControlRequestRunnerTest {
 
         localNetworkAccess.cancelRequestBeforeQueue(SshRequest.Disconnect("workbox"))
 
-        assertEquals(LocalNetworkOutcome.Cancelled, waiting.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, waiting.await())
         assertEquals(0L, currentTime, "The connect waited for the time-out")
     }
 
@@ -252,14 +253,14 @@ class ControlRequestRunnerTest {
         val disconnect = SshRequest.Disconnect("workbox")
         routeSshRequest(disconnect, stateManager, localNetworkAccess, fastQueue, controlQueue)
 
-        assertEquals(LocalNetworkOutcome.Cancelled, localNetworkWait.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, localNetworkWait.await())
         assertEquals(UserAuthOutcome.Cancelled, userAuthWait.await())
         assertSame(disconnect, controlQueue.tryReceive().getOrNull())
         assertNull(fastQueue.tryReceive().getOrNull())
     }
 
     @Test
-    fun disconnectAllAlsoDisconnectsTheMachinesThatWaitedForTheLocalNetworkPermission() = runTest {
+    fun disconnectAllAlsoDisconnectsTheMachinesThatWaitOrStoppedForTheLocalNetworkPermission() = runTest {
         val localNetworkAccess = LocalNetworkAccess()
         backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
             localNetworkAccess.hostRequests { awaitCancellation() }
@@ -269,12 +270,17 @@ class ControlRequestRunnerTest {
         val waiting = async { localNetworkAccess.request("workbox", "192.168.1.42:22", 60.seconds) }
         runCurrent()
 
+        // The user denied the permission for lan-box before. A later grant in the app settings connects it again,
+        // unless Disconnect All removes its cause.
+        stateManager.setNeedsUser("lan-box", NeedsUserCause.LocalNetworkPermission("192.168.1.43:22"))
+        stateManager.setNeedsUser("cloud-box", NeedsUserCause.LoginRefused("Auth fail"))
+
         val machineIds = endWaitsForDisconnectAll(stateManager, localNetworkAccess)
 
-        // The connect of workbox stops with the local network cause. Its disconnect removes the cause, so that a
-        // later grant does not connect it again.
-        assertEquals(setOf("gpu-rig", "workbox"), machineIds)
-        assertEquals(LocalNetworkOutcome.Cancelled, waiting.await())
+        // The connect of workbox ends with no cause. Its disconnect also removes a cause, so that a later grant does
+        // not connect it again.
+        assertEquals(setOf("gpu-rig", "workbox", "lan-box"), machineIds)
+        assertEquals(LocalNetworkOutcome.Disconnected, waiting.await())
     }
 
     private companion object {

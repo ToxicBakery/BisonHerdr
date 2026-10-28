@@ -66,10 +66,13 @@ internal fun routeSshRequest(
 }
 
 /**
- * Ends all waits for the user before **Disconnect All**, and returns the machines to disconnect. These are the
- * connected machines and the machines whose wait for the local network permission ended. Such a machine is at a
- * connect step. Without a disconnect, its connect stops with [NeedsUserCause.LocalNetworkPermission], and a later grant
- * connects it again.
+ * Ends all waits for the user before **Disconnect All**, and returns the machines to disconnect:
+ * - the connected machines;
+ * - the machines whose wait for the local network permission ended, at a connect step;
+ * - the machines that stopped with [NeedsUserCause.LocalNetworkPermission].
+ *
+ * A later grant connects again each machine with the local network cause. The disconnect removes the cause, so the
+ * grant does not connect these machines.
  */
 internal fun endWaitsForDisconnectAll(
     sshStateManager: SshStateManager,
@@ -77,7 +80,8 @@ internal fun endWaitsForDisconnectAll(
 ): Set<String> {
     sshStateManager.cancelAllUserAuth()
     val waiting = localNetworkAccess.cancelAll()
-    return sshStateManager.connectedMachines.value + waiting
+    val stopped = sshStateManager.needsUser.value.filterValues { it is NeedsUserCause.LocalNetworkPermission }.keys
+    return sshStateManager.connectedMachines.value + waiting + stopped
 }
 
 /**

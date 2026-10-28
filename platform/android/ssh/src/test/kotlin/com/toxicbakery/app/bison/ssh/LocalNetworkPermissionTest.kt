@@ -23,6 +23,8 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -86,6 +88,12 @@ class LocalNetworkPermissionTest {
     /** The host and port of each request that the UI of [startUi] got, in order. */
     private val shown: MutableList<String> = CopyOnWriteArrayList()
 
+    /** The reason (`timedOut`) of each request that the UI of [startUi] got, in order. */
+    private val reasons: MutableList<Boolean> = CopyOnWriteArrayList()
+
+    /** The number of requests that the UI of [startUi] got. A test waits for it. */
+    private val shownCount = MutableStateFlow(0)
+
     /** The delays that the reconnect loops asked for, in order. */
     private val delays = MutableStateFlow<List<Duration>>(emptyList())
     private val machines = mutableListOf<HostMachine>()
@@ -126,6 +134,7 @@ class LocalNetworkPermissionTest {
         assertTrue(transport.connect(machine), debugLogDump())
 
         assertEquals(listOf(hostPort(server)), shown)
+        assertEquals(listOf(false), reasons)
         assertNull(stateManager.needsUser.value[machine.id])
         assertEquals(TARGET, serverNameOf(machine))
     }
@@ -233,6 +242,7 @@ class LocalNetworkPermissionTest {
         assertEquals(SshAuthResult.Success, backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine)))
 
         assertEquals(listOf(ROUTED_HOST_PORT), shown)
+        assertEquals(listOf(true), reasons)
         assertEquals(listOf("timeout", "ok"), batches)
     }
 
@@ -246,6 +256,44 @@ class LocalNetworkPermissionTest {
 
         assertEquals(SshAuthResult.LocalNetworkBlocked(ROUTED_HOST_PORT, timedOut = true), result)
         assertEquals(listOf("timeout"), batches)
+    }
+
+    @Test
+    fun aDisconnectDuringTheDialogLeavesNoCauseForALaterGrant() = runTest {
+        val transport = startTransport()
+        startUi { awaitCancellation() }
+        val machine = passwordMachine("lan-disconnect")
+        // A real dispatcher, so that the time limit of the request does not pass in virtual time.
+        val connect = async(Dispatchers.Default) { transport.connect(machine) }
+        awaitValue(shownCount, "the request in the UI") { it == 1 }
+
+        // A disconnect ends the wait before the control queue.
+        localNetworkAccess.cancel(machine.id)
+
+        assertFalse(connect.await())
+        assertNull(stateManager.needsUser.value[machine.id], "A later grant connects a machine with the cause")
+        assertEquals(ConnectionProgress.Failed, stateManager.connectionProgress.value[machine.id])
+        assertEquals(0, server.credentialChecks)
+    }
+
+    @Test
+    fun aDisconnectDuringTheDialogAfterATimeoutGivesTheDisconnectedKind() = runTest {
+        val batches = CopyOnWriteArrayList<String>()
+        val backend = timeoutBackend(batches)
+        startUi { awaitCancellation() }
+        val machine = passwordMachine("routed-disconnect")
+        // A real dispatcher, so that the time limit of the request does not pass in virtual time.
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+        val result = async(Dispatchers.Default) { backend.authenticate(machine, route) }
+        awaitValue(shownCount, "the request in the UI") { it == 1 }
+
+        localNetworkAccess.cancelAll()
+
+        assertEquals(
+            SshAuthResult.LocalNetworkBlocked(ROUTED_HOST_PORT, timedOut = true, disconnected = true),
+            result.await(),
+        )
+        assertEquals(listOf(true), reasons)
     }
 
     @Test
@@ -292,6 +340,7 @@ class LocalNetworkPermissionTest {
 
         assertEquals(SshAuthResult.LocalNetworkBlocked(ROUTED_HOST_PORT, timedOut = true), result)
         assertEquals(listOf(ROUTED_HOST_PORT), shown)
+        assertEquals(listOf(true), reasons)
         assertEquals(listOf("timeout", "timeout"), batches)
     }
 
@@ -383,6 +432,8 @@ class LocalNetworkPermissionTest {
         backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
             localNetworkAccess.hostRequests { request ->
                 shown += request.hostPort
+                reasons += request.timedOut
+                shownCount.update { it + 1 }
                 answer()
             }
         }
