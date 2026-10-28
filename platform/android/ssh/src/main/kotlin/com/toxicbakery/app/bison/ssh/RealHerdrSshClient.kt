@@ -157,6 +157,12 @@ internal class RealHerdrSshClient(
      * [frameLocks]). A test gives a function that stops a step at this point.
      */
     private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
+    /**
+     * Puts a snapshot of a machine on [endpointSnapshotBus]. The client calls it in the frame lock of the machine. A
+     * test gives a function that stops a step at this point.
+     */
+    private val snapshotPublisher: (machineId: String, snapshot: ClientShellSnapshot) -> Unit =
+        endpointSnapshotBus::publish,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -412,6 +418,10 @@ internal class RealHerdrSshClient(
         val frames = frameLocks.computeIfAbsent(machineId) { MachineFrames() }
         return synchronized(frames) { block(frames) }
     }
+
+    /** Returns the panes of [machineId] that have scroll requests. A test uses it to check the prune. */
+    internal fun scrollRequestPaneIds(machineId: String): Set<String> =
+        withFrames(machineId) { frames -> frames.scrollRequests.keys.toSet() }
 
     /**
      * Runs [block] in the frame lock of [machineId], and returns its result. A step of a different class uses it to
@@ -825,7 +835,7 @@ internal class RealHerdrSshClient(
             if (pollSeq < frames.minPollSeq) return@withFrames null
             frames.minPollSeq = pollSeq
             parseSnapshotObject(machine.id, resolvedSnapshotObj, sel).also { parsed ->
-                endpointSnapshotBus.publish(machine.id, parsed.snapshot)
+                snapshotPublisher(machine.id, parsed.snapshot)
             }
         } ?: return@withContext true
 
@@ -1751,7 +1761,7 @@ internal class RealHerdrSshClient(
         withFrames(machineId) {
             val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId)
             if (currentSnapshot != null && currentSnapshot.focusedPaneId != paneId) {
-                endpointSnapshotBus.publish(
+                snapshotPublisher(
                     machineId,
                     currentSnapshot.copy(
                         revision = revisionCounter.incrementAndGet().toULong(),
@@ -2418,8 +2428,10 @@ internal class RealHerdrSshClient(
      * time. See [timeRoundTrip].
      *
      * [onLaneLocked] runs when the batch has the lane lock, before the batch goes to the worker. The lane runs one batch
-     * at a time, so the order of these calls is the order of the batches on the lane. [remoteBatchExecutor] has no lane
-     * lock, so with it [onLaneLocked] runs just before the call.
+     * at a time, so the order of these calls is the order of the batches on the lane.
+     *
+     * [remoteBatchExecutor] runs in the same lane lock, so that a test has the order of production. It does not wait
+     * for a reconnect, because a test with this executor has no session.
      */
     private suspend fun executeBatchOnLane(
         machine: HostMachine,
@@ -2432,8 +2444,10 @@ internal class RealHerdrSshClient(
         if (commands.isEmpty()) return ""
         val customExecutor = remoteBatchExecutor
         if (customExecutor != null) {
-            onLaneLocked?.invoke()
-            return timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            return laneMutexFor(machine.id, lane).withLock {
+                onLaneLocked?.invoke()
+                timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
+            }
         }
         // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
         // the lane.
