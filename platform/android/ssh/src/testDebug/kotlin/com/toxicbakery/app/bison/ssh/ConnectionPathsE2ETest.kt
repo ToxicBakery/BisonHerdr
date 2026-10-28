@@ -426,17 +426,18 @@ class ConnectionPathsE2ETest {
             hBlankBastion.stateManager.connectionProgress.value["route-invalid-blank"],
         )
 
-        // The transport has no host name rule. The simulated backend gives the network error of the bastion.
+        // The transport has no host name rule, so a `.invalid` bastion gets to the backend. The simulated backend
+        // gives the network error of the bastion. With the old rule, the cause was NeedsUserCause.Other.
         val hUnreachableBastion = Harness()
         val probedRoutes = mutableListOf<ResolvedSshRoute>()
         hUnreachableBastion.backend.sshRouteProbe = { _, route ->
             probedRoutes += route
-            route.entryHost != "dead-bastion.example.com"
+            route.entryHost != "dead-bastion.invalid"
         }
         val unreachableBastionHost = bastionHost.copy(
             id = "route-invalid-unreachable",
             proxyJump = ProxyJumpConfig(
-                bastionHost = "dead-bastion.example.com",
+                bastionHost = "dead-bastion.invalid",
                 bastionPort = 2222,
                 bastionUser = "jump",
             ),
@@ -446,7 +447,7 @@ class ConnectionPathsE2ETest {
             ConnectionProgress.Failed,
             hUnreachableBastion.stateManager.connectionProgress.value["route-invalid-unreachable"],
         )
-        assertEquals(setOf("dead-bastion.example.com"), probedRoutes.map { it.entryHost }.toSet())
+        assertEquals(setOf("dead-bastion.invalid"), probedRoutes.map { it.entryHost }.toSet())
         assertIs<NeedsUserCause.Unreachable>(
             hUnreachableBastion.stateManager.needsUser.value["route-invalid-unreachable"],
         )
