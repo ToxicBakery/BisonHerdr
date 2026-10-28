@@ -51,6 +51,7 @@ class UserAuthKeyDeviceTest {
         assertTrue(keyInfo.isUserAuthenticationRequired)
         assertEquals(AndroidKeystoreKeyManager.USER_AUTH_VALIDITY_SECONDS, keyInfo.userAuthenticationValidityDurationSeconds)
         assertEquals(AndroidKeystoreKeyManager.USER_AUTH_TYPES, keyInfo.userAuthenticationType)
+        assertEquals(KeyUserAuth.TimeBound, keyManager.storedKeyUserAuth(KEY_ALIAS))
         assertSignsOrNeedsTheUser()
     }
 
@@ -61,6 +62,7 @@ class UserAuthKeyDeviceTest {
         keyManager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = false)
 
         assertFalse(storedKeyInfo().isUserAuthenticationRequired)
+        assertEquals(KeyUserAuth.NotRequired, keyManager.storedKeyUserAuth(KEY_ALIAS))
         assertTrue(keyManager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE).isNotEmpty())
     }
 
@@ -83,11 +85,13 @@ class UserAuthKeyDeviceTest {
         val oldLine = AndroidKeystoreKeyManager()
             .getExistingPublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
             .openSshAuthorizedKeyLine
+        assertEquals(KeyUserAuth.EachSign, keyManager.storedKeyUserAuth(KEY_ALIAS))
 
         val newLine = keyManager.regenerateKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
             .openSshAuthorizedKeyLine
 
         assertNotEquals(oldLine, newLine)
+        assertEquals(KeyUserAuth.TimeBound, keyManager.storedKeyUserAuth(KEY_ALIAS))
         assertEquals(AndroidKeystoreKeyManager.USER_AUTH_VALIDITY_SECONDS, storedKeyInfo().userAuthenticationValidityDurationSeconds)
         assertEquals(newLine, AndroidKeystoreKeyManager().getExistingPublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256).openSshAuthorizedKeyLine)
         assertSignsOrNeedsTheUser()

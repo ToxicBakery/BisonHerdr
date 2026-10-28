@@ -12,6 +12,8 @@ import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import kotlin.time.Duration
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * The [SshBackend] that connects to a real Herdr host over JSch through [RealHerdrSshClient].
@@ -27,13 +29,16 @@ import kotlin.time.Duration
  * After a connect, the client reconnects on its own when the session closes, and sends the events of the loop to
  * the receiver of [setSessionEvents]. See [SessionSupervisor].
  *
- * Before the login with a key that has `requireBiometric`, [authenticate] asks the user to unlock the key
- * through [SshStateManager.requestUserAuth]. It waits for the answer for [USER_AUTH_TIMEOUT_MS] at most. The
- * bastion of a ProxyJump machine logs in with the same key, so the one prompt also unlocks the bastion login.
+ * Before the login with a stored key that needs a user authentication, [authenticate] asks the user to unlock
+ * the key through [SshStateManager.requestUserAuth]. The stored key decides, not the `requireBiometric` setting
+ * of the machine, because machines can share a key alias. [authenticate] waits for the answer for
+ * [USER_AUTH_TIMEOUT_MS] at most. The bastion of a ProxyJump machine logs in with the same key, so the one
+ * prompt also unlocks the bastion login.
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
     private val sshStateManager: SshStateManager,
+    private val keystoreKeyManager: AndroidKeystoreKeyManager,
 ) : SshBackend {
 
     constructor(
@@ -56,24 +61,35 @@ class RealSshBackend internal constructor(
             secretStore = secretStore,
         ),
         sshStateManager = sshStateManager,
+        keystoreKeyManager = keystoreKeyManager,
     )
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
         val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
-        // Do not ask the user for a key that does not need a user authentication.
-        val promptOutcome = if (keyAuth != null && keyAuth.requireBiometric) {
-            sshStateManager.requestUserAuth(
-                machineId = machine.id,
-                machineName = machine.name.ifBlank { machine.displayAddress },
-                keyAlias = keyAuth.keyAlias,
-                timeoutMs = USER_AUTH_TIMEOUT_MS,
-            )
-        } else {
-            null
-        }
-        if (keyAuth != null && promptOutcome != null && promptOutcome != UserAuthOutcome.Confirmed) {
-            // The key stays locked, so the login cannot sign. The app opens no connection.
-            return SshAuthResult.UserAuthRequired(keyAuth.keyAlias, promptOutcome)
+        var promptOutcome: UserAuthOutcome? = null
+        if (keyAuth != null) {
+            val keyUserAuth = withContext(Dispatchers.IO) { keystoreKeyManager.storedKeyUserAuth(keyAuth.keyAlias) }
+            if (keyUserAuth == KeyUserAuth.EachSign) {
+                // No prompt can unlock this key, so do not show one. The app opens no connection.
+                return SshAuthResult.UserAuthRequired(keyAuth.keyAlias, keyNeedsUserForEachSign = true)
+            }
+            // The stored key decides. When the key store does not tell, the machine setting decides. A missing key
+            // gets no prompt: the login then gives KeyMissing.
+            val needsPrompt = keyUserAuth == KeyUserAuth.TimeBound ||
+                (keyUserAuth == KeyUserAuth.Unknown && keyAuth.requireBiometric)
+            if (needsPrompt) {
+                val outcome = sshStateManager.requestUserAuth(
+                    machineId = machine.id,
+                    machineName = machine.name.ifBlank { machine.displayAddress },
+                    keyAlias = keyAuth.keyAlias,
+                    timeoutMs = USER_AUTH_TIMEOUT_MS,
+                )
+                if (outcome != UserAuthOutcome.Confirmed) {
+                    // The key stays locked, so the login cannot sign. The app opens no connection.
+                    return SshAuthResult.UserAuthRequired(keyAuth.keyAlias, outcome)
+                }
+                promptOutcome = outcome
+            }
         }
         return client.connectAndVerify(machine, route).fold(
             onSuccess = { SshAuthResult.Success },

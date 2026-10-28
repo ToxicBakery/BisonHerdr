@@ -11,9 +11,11 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
+import java.security.KeyStoreException
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.Signature
+import java.security.SignatureException
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -43,14 +45,19 @@ class UserAuthLoginTest {
     private val debugLog = SshDebugLog()
     private val stateManager = SshStateManager()
 
-    /** True while the [lockedKeyManager] key is locked: its sign throws a [UserNotAuthenticatedException]. */
+    /** The error of each sign with the [lockedKeyManager] key, or null when the key signs. */
     @Volatile
-    private var keyLocked = false
+    private var signError: Exception? = null
+
+    /** The user authentication that the key store tells for the [lockedKeyManager] key. */
+    @Volatile
+    private var storedKeyAuth = KeyUserAuth.NotRequired
     private val lockedKeyManager = AndroidKeystoreKeyManager(
         allowSoftwareKeys = true,
         signatureFactory = { algorithm ->
-            if (keyLocked) LockedKeySignature() else Signature.getInstance(algorithm)
+            signError?.let { FailingSignature(it) } ?: Signature.getInstance(algorithm)
         },
+        keyUserAuthReader = { storedKeyAuth },
     )
     private val server = TestSshServer(keyManager = lockedKeyManager).start()
 
@@ -164,8 +171,79 @@ class UserAuthLoginTest {
     }
 
     @Test
+    fun theStoredKeyAndNotTheMachineSettingDecidesThePrompt() = runTest {
+        startUi { UserAuthOutcome.Confirmed }
+        storedKeyAuth = KeyUserAuth.TimeBound
+        val sharedKey = machine("shared-key", server.keyAuthMethod.copy(requireBiometric = false))
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(sharedKey, route(sharedKey)), debugLogDump())
+        assertEquals(listOf(sharedKey.id), shown.map { it.first.machineId })
+
+        storedKeyAuth = KeyUserAuth.NotRequired
+        val plainKey = machine("plain-key", server.keyAuthMethod.copy(requireBiometric = true))
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(plainKey, route(plainKey)), debugLogDump())
+        assertEquals(1, shown.size, "The app asked for a key that needs no user authentication")
+    }
+
+    @Test
+    fun whenTheKeyStoreDoesNotTellTheMachineSettingDecides() = runTest {
+        startUi { UserAuthOutcome.Confirmed }
+        storedKeyAuth = KeyUserAuth.Unknown
+        val withSetting = machine("unknown-with-setting", server.keyAuthMethod.copy(requireBiometric = true))
+        val withoutSetting = machine("unknown-without-setting", server.keyAuthMethod)
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(withSetting, route(withSetting)), debugLogDump())
+        assertEquals(SshAuthResult.Success, backend.authenticate(withoutSetting, route(withoutSetting)), debugLogDump())
+
+        assertEquals(listOf(withSetting.id), shown.map { it.first.machineId })
+    }
+
+    @Test
+    fun aKeyThatNeedsTheUserForEachSignStopsWithNoPromptAndTellsTheUserToMakeANewKey() = runTest {
+        startUi { UserAuthOutcome.Confirmed }
+        storedKeyAuth = KeyUserAuth.EachSign
+        val machine = machine("each-sign", server.keyAuthMethod.copy(requireBiometric = true))
+
+        val result = assertIs<SshAuthResult.UserAuthRequired>(backend.authenticate(machine, route(machine)))
+
+        assertEquals(TestSshServer.KEY_ALIAS, result.keyAlias)
+        assertTrue(result.keyNeedsUserForEachSign)
+        assertTrue(result.message.contains("Make a new key"), result.message)
+        assertTrue(shown.isEmpty(), "The app showed a prompt that cannot unlock the key")
+        assertEquals(0, server.credentialChecks)
+    }
+
+    @Test
+    fun aMissingKeyGetsNoPrompt() = runTest {
+        startUi { UserAuthOutcome.Confirmed }
+        val missingKey = SshAuthMethod.KeystoreKey(
+            keyAlias = "user_auth_test_missing",
+            algorithm = server.keyAlgorithm,
+            requireBiometric = true,
+        )
+        val machine = machine("missing-key", missingKey)
+
+        assertIs<SshAuthResult.KeyMissing>(backend.authenticate(machine, route(machine)), debugLogDump())
+        assertTrue(shown.isEmpty(), "The app asked to unlock a key that does not exist")
+    }
+
+    @Test
+    fun aCheckedSignErrorIsNotHiddenAsAuthFail() = runTest {
+        // A key that needs a user authentication for each sign fails in this way on a device.
+        signError = SignatureException(KeyStoreException("Key user not authenticated"))
+        val machine = machine("checked-sign-error", server.keyAuthMethod)
+
+        val result = assertIs<SshAuthResult.Failed>(backend.authenticate(machine, route(machine)), debugLogDump())
+
+        val signFailure = assertIs<KeySignException>(result.cause)
+        assertEquals(TestSshServer.KEY_ALIAS, signFailure.keyAlias)
+        assertTrue(signFailure.message.orEmpty().contains("Key user not authenticated"), signFailure.message)
+    }
+
+    @Test
     fun aLockedKeyGivesUserAuthRequiredThroughJsch() = runTest {
-        keyLocked = true
+        signError = UserNotAuthenticatedException()
         val machine = machine("locked", server.keyAuthMethod)
 
         val result = backend.authenticate(machine, route(machine))
@@ -175,8 +253,8 @@ class UserAuthLoginTest {
 
     @Test
     fun aKeyThatStaysLockedAfterTheUserAuthenticationTellsTheUserToMakeANewKey() = runTest {
-        // A key from an earlier version needs a user authentication for each sign.
-        keyLocked = true
+        // The key store says that a prompt unlocks the key, but the key stays locked.
+        signError = UserNotAuthenticatedException()
         startUi { UserAuthOutcome.Confirmed }
         val machine = machine("old-key", biometricKey())
 
@@ -217,7 +295,7 @@ class UserAuthLoginTest {
 
     @Test
     fun aLockedKeyAtTheBastionGivesUserAuthRequired() = runTest {
-        keyLocked = true
+        signError = UserNotAuthenticatedException()
         startBastion()
         val machine = machineThroughBastion("bastion-locked", server.keyAuthMethod)
 
@@ -317,10 +395,10 @@ class UserAuthLoginTest {
         override fun clear() = Unit
     }
 
-    /** A JCA [Signature] that acts as AndroidKeyStore does for a locked key: its init throws. */
-    private class LockedKeySignature : Signature("locked") {
+    /** A JCA [Signature] whose init throws [error], as AndroidKeyStore does for a locked key. */
+    private class FailingSignature(private val error: Exception) : Signature("failing") {
         override fun engineInitSign(privateKey: PrivateKey?) {
-            throw UserNotAuthenticatedException()
+            throw error
         }
 
         override fun engineInitVerify(publicKey: PublicKey?) {
@@ -342,7 +420,11 @@ class UserAuthLoginTest {
         override fun engineGetParameter(param: String?): Any? = null
     }
 
-    private fun biometricKey(): SshAuthMethod.KeystoreKey = server.keyAuthMethod.copy(requireBiometric = true)
+    /** Returns the key of [server] as a key that the app made with `requireBiometric`. */
+    private fun biometricKey(): SshAuthMethod.KeystoreKey {
+        storedKeyAuth = KeyUserAuth.TimeBound
+        return server.keyAuthMethod.copy(requireBiometric = true)
+    }
 
     /** Starts a bastion that knows the key of [server], and accepts its host key. */
     private suspend fun startBastion(): TestSshServer {

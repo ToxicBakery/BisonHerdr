@@ -17,6 +17,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
@@ -191,7 +192,7 @@ class AndroidKeystoreKeyManagerTest {
     }
 
     @Test
-    fun otherSignErrorsAreNotChanged() {
+    fun aCheckedSignErrorBecomesAKeySignExceptionThatJschDoesNotHide() {
         val signError = SignatureException("Keystore operation failed")
         val manager = manager(
             keystore = FailingKeystore(ProviderException("No AndroidKeyStore")),
@@ -200,11 +201,49 @@ class AndroidKeystoreKeyManagerTest {
         )
         manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
 
-        val error = assertFailsWith<SignatureException> {
+        val error = assertFailsWith<KeySignException> {
+            manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE)
+        }
+
+        assertEquals(KEY_ALIAS, error.keyAlias)
+        assertSame(signError, error.cause)
+    }
+
+    @Test
+    fun anUncheckedSignErrorIsNotChanged() {
+        val signError = ProviderException("Keystore operation failed")
+        val manager = manager(
+            keystore = FailingKeystore(ProviderException("No AndroidKeyStore")),
+            allowSoftwareKeys = true,
+            signatureFactory = { FailingSignature(signError) },
+        )
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+
+        val error = assertFailsWith<ProviderException> {
             manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE)
         }
 
         assertSame(signError, error)
+    }
+
+    @Test
+    fun storedKeyUserAuthReadsTheStoredKeyAndMakesNoKey() {
+        val keystore = FailingKeystore(ProviderException("No AndroidKeyStore"))
+        var reply: () -> KeyUserAuth = { KeyUserAuth.TimeBound }
+        val manager = AndroidKeystoreKeyManager(
+            allowSoftwareKeys = true,
+            keystoreKeyGenerator = keystore,
+            keyUserAuthReader = { reply() },
+        )
+
+        assertNull(manager.storedKeyUserAuth(KEY_ALIAS))
+        assertEquals(0, keystore.calls)
+
+        manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+        assertEquals(KeyUserAuth.TimeBound, manager.storedKeyUserAuth(KEY_ALIAS))
+
+        reply = { throw ProviderException("No KeyInfo for this key") }
+        assertEquals(KeyUserAuth.Unknown, manager.storedKeyUserAuth(KEY_ALIAS))
     }
 
     @Test

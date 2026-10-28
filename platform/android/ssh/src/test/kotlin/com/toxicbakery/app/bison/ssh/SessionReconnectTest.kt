@@ -262,7 +262,7 @@ class SessionReconnectTest {
                 backoff.delayAfter(failures).also { delay -> delays.update { it + delay } }
             },
         )
-        val realBackend = RealSshBackend(client = client, sshStateManager = stateManager)
+        val realBackend = RealSshBackend(client = client, sshStateManager = stateManager, keystoreKeyManager = keyManager)
         backend = realBackend
         return SshTransportManager(
             backend = realBackend,

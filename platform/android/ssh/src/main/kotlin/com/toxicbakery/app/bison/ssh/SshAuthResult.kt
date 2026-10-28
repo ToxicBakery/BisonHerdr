@@ -57,16 +57,23 @@ sealed interface SshAuthResult {
      * [NetworkError]. A user connect from the app shows the prompt again.
      *
      * [promptOutcome] is the result of the prompt of this login, or null when the login showed no prompt.
-     * [keyAlias] is null when the error did not name the key.
+     * [keyAlias] is null when the error did not name the key. [keyNeedsUserForEachSign] is true for a key from an
+     * earlier version that needs a user authentication for each sign. No prompt can unlock such a key, so the user
+     * must make a new key.
      */
     data class UserAuthRequired(
         val keyAlias: String?,
         val promptOutcome: UserAuthOutcome? = null,
+        val keyNeedsUserForEachSign: Boolean = false,
     ) : SshAuthResult {
         /** The text that tells the user what occurred and what to do. */
         val message: String
             get() {
                 val key = keyAlias?.let { "The key $it" } ?: "The SSH key"
+                if (keyNeedsUserForEachSign) {
+                    return "$key needs a user authentication for each sign. This version cannot use such a key. " +
+                        "Make a new key in the machine settings, and add the new public key to the host."
+                }
                 return when (promptOutcome) {
                     null -> "$key needs a user authentication. Connect again from the app."
                     UserAuthOutcome.NoUi ->

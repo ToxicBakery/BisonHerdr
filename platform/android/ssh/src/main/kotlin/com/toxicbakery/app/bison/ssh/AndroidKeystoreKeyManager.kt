@@ -54,6 +54,25 @@ data class ExportedSshPublicKey(
     }
 }
 
+/** The user authentication that a stored key needs before it can sign. */
+enum class KeyUserAuth {
+
+    /** The key signs with no user authentication. */
+    NotRequired,
+
+    /** After a user authentication, the key can sign for a short time. A prompt with no `CryptoObject` unlocks it. */
+    TimeBound,
+
+    /**
+     * The key needs a user authentication for each sign. Earlier versions made such keys. Only a `CryptoObject`
+     * unlocks such a key, and JSch signs with no `CryptoObject`. Thus the app cannot use the key.
+     */
+    EachSign,
+
+    /** The key exists, but the key store did not tell its user authentication. */
+    Unknown,
+}
+
 /** Makes a key pair for an alias in AndroidKeyStore. */
 internal fun interface KeystoreKeyGenerator {
     fun generate(keyAlias: String, algorithm: KeyAlgorithm, requireBiometric: Boolean): KeyPair
@@ -79,6 +98,8 @@ class AndroidKeystoreKeyManager internal constructor(
     private val keySupport: KeystoreKeySupport = AndroidKeystoreKeySupport,
     /** Makes the JCA [Signature] for a signature algorithm name. A JVM test can give a signature that fails. */
     private val signatureFactory: (String) -> Signature = jcaSignatureFactory,
+    /** Reads the [KeyUserAuth] of a stored private key. A JVM test can give a different reader. */
+    private val keyUserAuthReader: (PrivateKey) -> KeyUserAuth = androidKeystoreUserAuthReader,
 ) : SshPublicKeyProvider {
 
     /** Makes a manager that uses AndroidKeyStore. Set [allowSoftwareKeys] to true only in JVM tests. */
@@ -87,6 +108,7 @@ class AndroidKeystoreKeyManager internal constructor(
         keystoreKeyGenerator = androidKeystoreGenerator,
         keySupport = AndroidKeystoreKeySupport,
         signatureFactory = jcaSignatureFactory,
+        keyUserAuthReader = androidKeystoreUserAuthReader,
     )
 
     private val fallbackKeyPairs = ConcurrentHashMap<String, KeyPair>()
@@ -208,7 +230,8 @@ class AndroidKeystoreKeyManager internal constructor(
      * when [keyAlias] has no key. Use [getOrCreatePublicKey] to make the key.
      *
      * Throws a [UserAuthRequiredException] when the key needs a user authentication that the user did not
-     * give in the last [USER_AUTH_VALIDITY_SECONDS]. The sign does not try again.
+     * give in the last [USER_AUTH_VALIDITY_SECONDS]. The sign does not try again. Throws a [KeySignException]
+     * for each other checked error, because JSch hides a checked error.
      */
     fun signSshChallenge(
         keyAlias: String,
@@ -226,8 +249,11 @@ class AndroidKeystoreKeyManager internal constructor(
             val needsUser = generateSequence<Throwable>(error) { it.cause }
                 .take(MAX_CAUSE_DEPTH)
                 .any { it is UserNotAuthenticatedException }
-            if (needsUser) throw UserAuthRequiredException(keyAlias, error)
-            throw error
+            when {
+                needsUser -> throw UserAuthRequiredException(keyAlias, error)
+                error is RuntimeException -> throw error
+                else -> throw KeySignException(keyAlias, error)
+            }
         }
         return encodeSshSignatureBlob(resolvedSshAlg, rawSignature)
     }
@@ -282,6 +308,16 @@ class AndroidKeystoreKeyManager internal constructor(
         }.onFailure { error ->
             log.d(error) { "Deleting key $keyAlias from AndroidKeyStore skipped" }
         }
+    }
+
+    /**
+     * Returns the user authentication that the stored key of [keyAlias] needs before it can sign, or null when
+     * [keyAlias] has no key. It does not make a key. A key that the key store does not describe is
+     * [KeyUserAuth.Unknown].
+     */
+    fun storedKeyUserAuth(keyAlias: String): KeyUserAuth? {
+        val privateKey = loadPrivateKey(keyAlias) ?: return null
+        return runCatching { keyUserAuthReader(privateKey) }.getOrDefault(KeyUserAuth.Unknown)
     }
 
     /** Returns true when a key exists for [keyAlias]. It does not make a key. */
@@ -612,6 +648,17 @@ class AndroidKeystoreKeyManager internal constructor(
 
         /** Makes the JCA [Signature] of the platform providers. */
         private val jcaSignatureFactory: (String) -> Signature = { algorithm -> Signature.getInstance(algorithm) }
+
+        /** Reads the [KeyUserAuth] of an AndroidKeyStore private key from its [KeyInfo]. */
+        private val androidKeystoreUserAuthReader: (PrivateKey) -> KeyUserAuth = { privateKey ->
+            val keyInfo = KeyFactory.getInstance(privateKey.algorithm, ANDROID_KEYSTORE_PROVIDER)
+                .getKeySpec(privateKey, KeyInfo::class.java)
+            when {
+                !keyInfo.isUserAuthenticationRequired -> KeyUserAuth.NotRequired
+                keyInfo.userAuthenticationValidityDurationSeconds <= 0 -> KeyUserAuth.EachSign
+                else -> KeyUserAuth.TimeBound
+            }
+        }
 
         /**
          * Sets the user authentication of a key. When [requireBiometric] is true, the key can sign for
