@@ -126,8 +126,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          lfs: 'true'
-          submodules: 'true'
           # The build runs third-party Gradle plugins. Do not keep the token in .git/config.
           persist-credentials: false
 
