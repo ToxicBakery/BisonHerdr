@@ -62,6 +62,42 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: python3 -m unittest discover -s scripts/tests
 
+  # rust/herdr-protocol is a reference crate for the Herdr wire types. Gradle does not build
+  # it, so this job is the only check of its tests and lints. The job needs only Cargo. The
+  # workspace has no native library, thus the job needs no Zig, NDK, or JDK.
+  rust:
+    name: Validate (herdr-protocol)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      # Pin the toolchain. Then a new stable release with new clippy lints cannot make a PR
+      # fail when the crate does not change. Change this value in a separate PR.
+      RUST_TOOLCHAIN: '1.99.0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The runner image has rustup. Install the toolchain with rustup, not with a third-party
+      # action. The minimal profile does not install the documentation. Clippy is the only
+      # added component. The job does not need a newer rustup, so it does not update rustup.
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup override set "$RUST_TOOLCHAIN"
+
+      # --locked stops the job when Cargo.lock does not agree with the manifests. The crate
+      # builds in less than one minute, so the job uses no Cargo cache.
+      - name: Test herdr-protocol
+        run: cargo test --locked -p herdr-protocol
+
+      # clippy also reports the rustc warnings. -D warnings makes each warning stop the job.
+      - name: Lint herdr-protocol
+        run: cargo clippy --locked -p herdr-protocol --all-targets -- -D warnings
+
   validate:
     name: Validate (${{ matrix.target }})
     runs-on: ubuntu-latest
