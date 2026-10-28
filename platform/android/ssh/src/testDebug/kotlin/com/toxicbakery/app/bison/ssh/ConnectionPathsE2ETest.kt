@@ -87,7 +87,7 @@ class ConnectionPathsE2ETest {
     /** Sends [request] to [machineId] and asserts that the response names the lane of the target design. */
     private suspend fun Harness.assertSentOnSshEndpointLane(machineId: String, request: ClientShellEndpointRequest) {
         val response = transport.sendEndpointCommand(machineId, request)
-        assertTrue(response?.contains(expectedLane(request)) == true, "Wrong lane for ${request.method}: $response")
+        assertTrue(response.contains(expectedLane(request)), "Wrong lane for ${request.method}: $response")
     }
 
     @Test

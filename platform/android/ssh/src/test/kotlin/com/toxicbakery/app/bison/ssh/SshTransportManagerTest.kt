@@ -85,26 +85,28 @@ class SshTransportManagerTest {
         val manager = manager(backend)
         connectAll(manager, backend, lanBox)
 
-        val response = assertNotNull(manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.workspaceFocus("w2")))
+        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.workspaceFocus("w2"))
 
         assertEquals(listOf("sendEndpointCommand lan-box"), backend.calls)
         assertTrue(response.contains("\"error\""), response)
         assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
         assertFalse(response.contains("\"ok\""), response)
-        assertTrue(
-            debugLog.entries.value.any { it.isError && it.message == "No response for workspace.focus" },
-            debugLogDump(),
-        )
+        // The backend writes the cause of its error, so the manager writes no second error.
+        assertTrue(debugLog.entries.value.none { it.isError }, debugLogDump())
     }
 
     @Test
     fun anRpcForAMachineWithNoProfileGivesAnErrorResponse() = runTest {
         val backend = RecordingSshBackend()
 
-        val response = assertNotNull(manager(backend).sendEndpointCommand("unknown-box", HerdrRpcBuilder.paneFocus("w1:p1")))
+        val response = manager(backend).sendEndpointCommand("unknown-box", HerdrRpcBuilder.paneFocus("w1:p1"))
 
         assertTrue(backend.calls.isEmpty(), "The backend got ${backend.calls}")
         assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        assertEquals(
+            listOf("No machine profile for unknown-box; did not send pane.focus"),
+            debugLog.entries.value.filter { it.isError }.map { it.message },
+        )
     }
 
     @Test
