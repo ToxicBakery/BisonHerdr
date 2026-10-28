@@ -119,7 +119,10 @@ const val MACHINE_NEEDS_USER_TAG: String = "machine-needs-user"
 /** The badge of a machine that needs a password or a key before a login can work. */
 const val NEEDS_SIGN_IN_LABEL: String = "Needs sign-in"
 
-/** The action of a machine that needs its password again. It opens the machine editor. */
+/**
+ * The action of a machine that needs its password again. It connects, and the connect asks for the password and
+ * offers to save it. The edit button of the card opens the machine editor.
+ */
 const val TYPE_PASSWORD_ACTION: String = "Type Password"
 
 /** The action of a machine that needs a new key. It opens the machine editor, which makes the key. */
@@ -299,8 +302,9 @@ fun MachineFederationScreen(
                         onPrimaryAction = {
                             when {
                                 isConnected -> onOpenWorkspaceTerminal(machine.id)
-                                // The editor takes the password again, or makes the key.
-                                credentialState.needsSignIn -> onConfigureMachine(machine.id)
+                                // The editor makes the key. A missing password needs no editor: the connect
+                                // asks for it, and the edit button still opens the editor.
+                                credentialState is CredentialState.KeyMissing -> onConfigureMachine(machine.id)
                                 machine.authMethod.isSupported -> {
                                     // A tap is a new connect from the user, so the connecting screen connects at
                                     // once. An open host key decision stays, and that screen shows it first.

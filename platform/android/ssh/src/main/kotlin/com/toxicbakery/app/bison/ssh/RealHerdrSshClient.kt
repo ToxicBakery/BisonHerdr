@@ -6,6 +6,7 @@ import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SocketFactory
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.CellData
@@ -32,6 +33,7 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.protocol.deriveSplitsFromLayout
 import com.toxicbakery.app.bison.store.KnownHostsStore
+import com.toxicbakery.app.bison.store.MachineStore
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -57,6 +59,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -94,8 +97,13 @@ import kotlinx.serialization.json.put
  * sends credentials. An unknown or changed key stops the session with a [HostKeyRejectedException].
  *
  * A password machine keeps a [SecretRef] value. The client reads the password from [secretStore] before each
- * connection, and clears its copy after the connection. A missing password stops the session with a
- * [MissingSecretException] before the client opens a connection.
+ * connection, and clears its copy after the connection. When the store has no password, the client asks the user for
+ * it through [userPrompter] before it opens a connection. With no UI, the session stops with a
+ * [MissingSecretException]. When the user wants to save the typed password, the client saves it after the login
+ * passes. See [savePassword].
+ *
+ * Each session has a [KeyboardInteractiveUserInfo]. It answers the `keyboard-interactive` questions of the host with
+ * the password of the machine or through [userPrompter], and it never accepts a host key.
  *
  * A machine with a ProxyJump bastion gets two sessions. The client logs in to the bastion first, with the bastion
  * user and the credentials of the machine. It then logs in to the target over a `direct-tcpip` channel of the
@@ -129,6 +137,14 @@ internal class RealHerdrSshClient(
     private val reconnectScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     /** Gives the delay of a reconnect loop after a number of failed attempts in sequence. */
     private val reconnectDelays: (failures: Int) -> Duration = ReconnectBackoff()::delayAfter,
+    /**
+     * Asks the user the questions of a login and waits for the answers: the `keyboard-interactive` questions of a
+     * host, and the password of a machine with no stored password. The default has no UI.
+     */
+    private val userPrompter: suspend (KeyboardInteractivePrompt) -> KeyboardInteractiveOutcome =
+        { KeyboardInteractiveOutcome.NoUi },
+    /** Gets the new password reference of a machine when the user saves a typed password. See [savePassword]. */
+    private val machineStore: MachineStore? = null,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -244,6 +260,13 @@ internal class RealHerdrSshClient(
      * command opens a session on demand only for these machines.
      */
     private val connectSteps: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * The password reference that [savePassword] gave to each machine with no valid reference, by machine id: the
+     * old value and the new value. A reconnect uses a [HostMachine] from before the save, so [resolvePassword] uses
+     * the new value in place of the old value.
+     */
+    private val savedPasswordRefs = ConcurrentHashMap<String, Pair<String, String>>()
 
     /** The id of each open target session. Each new session gets a new id. See [LivenessResult.Dead]. */
     private val sessionIds = ConcurrentHashMap<Session, Long>()
@@ -1685,6 +1708,9 @@ internal class RealHerdrSshClient(
      * Opens new sessions for [machine] under the session lock of the machine, and returns the target session. The old
      * sessions and workers close first. When [keepLiveSession] is true and the machine has a live session, this
      * function returns that session and opens nothing.
+     *
+     * A password machine with no stored password gets the password from the user first ([loginPassword]). When the
+     * user wants to save it, the function saves it after the login passes ([savePassword]).
      */
     private suspend fun openSessionLocked(
         machine: HostMachine,
@@ -1718,12 +1744,21 @@ internal class RealHerdrSshClient(
                 is SshAuthMethod.HardwareSecurityKey ->
                     throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
             }
-            val password = (machine.authMethod as? SshAuthMethod.Password)?.let { resolvePassword(machine, it) }
+            val passwordAuth = machine.authMethod as? SshAuthMethod.Password
+            val loginPassword = passwordAuth?.let { loginPassword(machine, route, it) }
+            val password = loginPassword?.bytes
             try {
+                val logins = SessionLogins(
+                    jsch = jsch,
+                    machine = machine,
+                    password = password,
+                    preferredAuths = preferredAuths,
+                    callerJob = currentCoroutineContext()[Job],
+                )
                 // The bastion uses the same password or key as the machine.
-                val bastion = if (route.viaBastion) connectBastion(jsch, route, password, preferredAuths) else null
+                val bastion = if (route.viaBastion) connectBastion(logins, route) else null
                 val session = try {
-                    connectTarget(jsch, route, bastion, password, preferredAuths)
+                    connectTarget(logins, route, bastion)
                 } catch (error: Throwable) {
                     bastion?.let { runCatching { it.disconnect() } }
                     throw error
@@ -1731,6 +1766,9 @@ internal class RealHerdrSshClient(
                 bastion?.let { bastionSessions[machine.id] = it }
                 sessionIds[session] = sessionIdCounter.getAndIncrement()
                 sessions[machine.id] = session
+                if (passwordAuth != null && loginPassword?.save == true) {
+                    savePassword(machine, passwordAuth, loginPassword.bytes)
+                }
                 session
             } finally {
                 // JSch keeps its own copy, and clears it after the login.
@@ -1757,19 +1795,41 @@ internal class RealHerdrSshClient(
         bastionSessions.remove(machineId)?.let { runCatching { it.disconnect() } }
     }
 
-    /** Returns a new session with the settings that the bastion session and the target session use. */
+    /**
+     * The values that the bastion session and the target session of one login share. [password] is null for a key
+     * machine. [callerJob] is the job of the login, so that a cancel stops the wait for the answers of the user.
+     */
+    private class SessionLogins(
+        val jsch: JSch,
+        val machine: HostMachine,
+        val password: ByteArray?,
+        val preferredAuths: String,
+        val callerJob: Job?,
+    )
+
+    /**
+     * Returns a new session as [username] to [host] and [port], with the settings that the bastion session and the
+     * target session use. The session gets a [KeyboardInteractiveUserInfo] for the `host:port` of the session.
+     */
     private fun newSession(
-        jsch: JSch,
+        logins: SessionLogins,
         username: String,
         host: String,
         port: Int,
-        password: ByteArray?,
-        preferredAuths: String,
     ): Session {
-        val session = jsch.getSession(username, host, port)
-        password?.let(session::setPassword)
+        val session = logins.jsch.getSession(username, host, port)
+        logins.password?.let(session::setPassword)
+        session.userInfo = KeyboardInteractiveUserInfo(
+            machineId = logins.machine.id,
+            machineName = displayNameOf(logins.machine),
+            hostPort = KnownHost.formatHostPort(host, port),
+            password = logins.password,
+            callerJob = logins.callerJob,
+            sshDebugLog = sshDebugLog,
+            ask = userPrompter,
+        )
         val props = Properties().apply {
-            put("PreferredAuthentications", preferredAuths)
+            put("PreferredAuthentications", logins.preferredAuths)
             put("Compression", "none")
         }
         session.setConfig(props)
@@ -1783,23 +1843,20 @@ internal class RealHerdrSshClient(
 
     /**
      * Logs in to the bastion of [route] as [ResolvedSshRoute.entryUsername]. The host key check uses the `host:port`
-     * of the bastion, so an unknown bastion key gives a [HostKeyRejectedException] for the bastion.
+     * of the bastion, so an unknown bastion key gives a [HostKeyRejectedException] for the bastion. The questions of
+     * the bastion go to the user with the `host:port` of the bastion.
      *
      * Each other JSch error becomes a [BastionConnectException] that names the bastion.
      */
     private fun connectBastion(
-        jsch: JSch,
+        logins: SessionLogins,
         route: ResolvedSshRoute,
-        password: ByteArray?,
-        preferredAuths: String,
     ): Session {
         val bastion = newSession(
-            jsch = jsch,
+            logins = logins,
             username = route.entryUsername,
             host = route.entryHost,
             port = route.entryPort,
-            password = password,
-            preferredAuths = preferredAuths,
         )
         bastion.setSocketFactory(LowLatencySocketFactory)
         try {
@@ -1813,22 +1870,18 @@ internal class RealHerdrSshClient(
     /**
      * Logs in to the target of [route] as [ResolvedSshRoute.targetUsername]. With a [bastion], the session sends its
      * data over a `direct-tcpip` channel of [bastion] ([BastionChannelProxy]). In the two cases the session has the
-     * `host:port` of the target, so the host key check uses the target.
+     * `host:port` of the target, so the host key check and the questions to the user use the target.
      */
     private fun connectTarget(
-        jsch: JSch,
+        logins: SessionLogins,
         route: ResolvedSshRoute,
         bastion: Session?,
-        password: ByteArray?,
-        preferredAuths: String,
     ): Session {
         val session = newSession(
-            jsch = jsch,
+            logins = logins,
             username = route.targetUsername,
             host = route.targetHost,
             port = route.targetPort,
-            password = password,
-            preferredAuths = preferredAuths,
         )
         if (bastion == null) {
             session.setSocketFactory(LowLatencySocketFactory)
@@ -1843,27 +1896,126 @@ internal class RealHerdrSshClient(
         return session
     }
 
+    /** The password of one login. [save] is true when the user typed it and wants to keep it on this device. */
+    private class LoginPassword(val bytes: ByteArray, val save: Boolean)
+
     /**
-     * Returns the password of [machine]. Clear the result with zeros after use.
+     * Returns the password of [machine] for one login over [route]. Clear [LoginPassword.bytes] with zeros after use.
      *
-     * A [SecretRef] value gives the password from [secretStore], or throws a [MissingSecretException]. A value with
-     * no prefix is a plain-text password that the load migration did not move. The client uses it as it is.
+     * When this device has no password for [machine], the function asks the user through [userPrompter], with an
+     * offer to save the password. With no UI, it throws a [MissingSecretException]. When the user cancels or does not
+     * answer in the time limit, it throws a [UserInputException] for the target of [route].
      */
-    private suspend fun resolvePassword(machine: HostMachine, auth: SshAuthMethod.Password): ByteArray {
-        val value = auth.encryptedPasswordRef
+    private suspend fun loginPassword(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        auth: SshAuthMethod.Password,
+    ): LoginPassword {
+        resolvePassword(machine, auth)?.let { return LoginPassword(it, save = false) }
+        val hostPort = route.targetAddress
+        val outcome = userPrompter(
+            KeyboardInteractivePrompt(
+                machineId = machine.id,
+                machineName = displayNameOf(machine),
+                hostPort = hostPort,
+                name = "",
+                instruction = "",
+                questions = listOf(KeyboardInteractiveQuestion(text = PASSWORD_QUESTION, echo = false)),
+                passwordMissing = true,
+            ),
+        )
+        val typed = (outcome as? KeyboardInteractiveOutcome.Answered)?.answers?.singleOrNull()
+        if (outcome is KeyboardInteractiveOutcome.Answered && typed != null) {
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "The user typed the password of ${machine.name} for this connection.",
+            )
+            return LoginPassword(typed.encodeToByteArray(), save = outcome.savePassword)
+        }
+        val error = when (outcome) {
+            KeyboardInteractiveOutcome.NoUi -> MissingSecretException(machine.name)
+            // An answer with a different number of answers is an error of the UI.
+            is KeyboardInteractiveOutcome.Answered -> UserInputException.of(hostPort, KeyboardInteractiveOutcome.Cancelled)
+            else -> UserInputException.of(hostPort, outcome)
+        }
+        sshDebugLog.record(machineId = machine.id, tag = "RealSSH", message = error.message.orEmpty(), isError = true)
+        throw error
+    }
+
+    /**
+     * Returns the stored password of [machine], or null when this device has no password for it. Clear the result
+     * with zeros after use.
+     *
+     * A [SecretRef] value gives the password from [secretStore]. A value with no prefix is a plain-text password that
+     * the load migration did not move. The client uses it as it is. An empty value, a reference that is not valid, and
+     * a reference with no secret give null. [CredentialValidator] gives [CredentialState.PasswordMissing] for the same
+     * values.
+     */
+    private suspend fun resolvePassword(machine: HostMachine, auth: SshAuthMethod.Password): ByteArray? {
+        val saved = savedPasswordRefs[machine.id]?.takeIf { (oldValue, _) -> oldValue == auth.encryptedPasswordRef }
+        val value = saved?.second ?: auth.encryptedPasswordRef
+        if (value.isEmpty()) return null
         if (!SecretRef.hasPrefix(value)) {
-            if (value.isNotEmpty()) {
-                sshDebugLog.record(
-                    machineId = machine.id,
-                    tag = "RealSSH",
-                    message = "The password of ${machine.name} is not in the secret store. The next start moves it.",
-                )
-            }
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "The password of ${machine.name} is not in the secret store. The next start moves it.",
+            )
             return value.encodeToByteArray()
         }
-        val ref = SecretRef.parse(value) ?: throw MissingSecretException(machine.name)
-        return secretStore.get(ref) ?: throw MissingSecretException(machine.name)
+        val ref = SecretRef.parse(value) ?: return null
+        return secretStore.get(ref)
     }
+
+    /**
+     * Keeps the typed [password] of [machine] in [secretStore] after a login that passed. The secret uses the
+     * reference of [auth] when it is valid. Else it gets a new reference, and [machineStore] gets the new reference
+     * for the machine. An error does not stop the session. The debug log tells it, and the next connect asks again.
+     */
+    private suspend fun savePassword(machine: HostMachine, auth: SshAuthMethod.Password, password: ByteArray) {
+        val oldValue = auth.encryptedPasswordRef
+        val existingRef = SecretRef.parse(oldValue)
+        val ref = existingRef ?: SecretRef.newPasswordRef()
+        try {
+            secretStore.put(ref, password)
+            if (existingRef == null) {
+                val newValue = SecretRef.format(ref)
+                savedPasswordRefs[machine.id] = oldValue to newValue
+                updatePasswordRef(machine.id, oldValue, newValue)
+            }
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "Saved the password of ${machine.name} on this device.",
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // The error comes from the device key store or the file system. It does not contain the password.
+            sshDebugLog.record(
+                machineId = machine.id,
+                tag = "RealSSH",
+                message = "Could not save the password of ${machine.name}: ${error.message ?: error::class.simpleName}",
+                isError = true,
+            )
+        }
+    }
+
+    /**
+     * Puts the password reference [newValue] into the machine [machineId] of [machineStore]. It changes the machine
+     * only while the machine still has [oldValue], so that a newer edit of the user stays.
+     */
+    private suspend fun updatePasswordRef(machineId: String, oldValue: String, newValue: String) {
+        val store = machineStore ?: return
+        val current = store.getMachine(machineId) ?: return
+        val auth = current.authMethod as? SshAuthMethod.Password ?: return
+        if (auth.encryptedPasswordRef != oldValue) return
+        store.upsertMachine(current.copy(authMethod = auth.copy(encryptedPasswordRef = newValue)))
+    }
+
+    /** Returns the name of [machine] that the prompts show. */
+    private fun displayNameOf(machine: HostMachine): String = machine.name.ifBlank { machine.displayAddress }
 
     private fun workerMapFor(lane: WorkerLane): ConcurrentHashMap<String, PersistentShellWorker> =
         when (lane) {
@@ -2694,6 +2846,9 @@ internal class RealHerdrSshClient(
 
     companion object {
         private const val SOCKET_CONNECT_TIMEOUT_MS = 6_000
+
+        /** The text of the question for a missing password. The UI shows its own text for this question. */
+        private const val PASSWORD_QUESTION = "Password"
         private const val SERVER_ALIVE_INTERVAL_MS = 10_000
         private const val SERVER_ALIVE_COUNT_MAX = 3
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000

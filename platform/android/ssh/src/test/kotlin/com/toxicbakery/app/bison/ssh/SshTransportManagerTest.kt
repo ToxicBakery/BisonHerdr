@@ -209,6 +209,13 @@ class SshTransportManagerTest {
             SshAuthResult.HostKeyUnknown(presented) to NeedsUserCause.HostKeyUnknown(presented.hostPort),
             SshAuthResult.HostKeyChanged(known = knownHost("SHA256:old"), presented = presented) to
                 NeedsUserCause.HostKeyChanged(presented.hostPort),
+            SshAuthResult.InputRequired("bastion.lan:22", timedOut = false) to
+                NeedsUserCause.InputRequired("bastion.lan:22"),
+            SshAuthResult.InputRequired("lan-box.lan:22", timedOut = true) to
+                NeedsUserCause.InputTimedOut("lan-box.lan:22"),
+            SshAuthResult.InputCancelled("lan-box.lan:22") to NeedsUserCause.InputCancelled("lan-box.lan:22"),
+            SshAuthResult.Failed(UserInputException.of("lan-box.lan:22", KeyboardInteractiveOutcome.Cancelled)) to
+                NeedsUserCause.InputCancelled("lan-box.lan:22"),
         )
 
         expected.forEach { (result, cause) ->

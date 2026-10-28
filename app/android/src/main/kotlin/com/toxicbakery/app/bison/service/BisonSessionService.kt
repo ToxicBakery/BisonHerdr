@@ -397,7 +397,8 @@ class BisonSessionService : Service(), DIAware {
     }
 
     private fun disconnectAllMachines() {
-        // A connect that waits for a user authentication holds the control queue. End the wait first.
+        // A connect that waits for a user authentication or for keyboard-interactive answers holds the control
+        // queue. End the wait first.
         sshStateManager.cancelAllUserAuth()
         val machineIds = sshStateManager.connectedMachines.value
         log.d { "Disconnect All: send Disconnect for ${machineIds.size} machines" }

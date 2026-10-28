@@ -22,6 +22,7 @@ import com.toxicbakery.app.bison.common.navigation.ScreenKeyWorkspaceTerminal
 import com.toxicbakery.app.bison.common.navigation.navConfig
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineScreen
 import com.toxicbakery.app.bison.common.screen.machine.ConnectingMachineScreen
+import com.toxicbakery.app.bison.common.screen.machine.KeyboardInteractivePromptHost
 import com.toxicbakery.app.bison.common.screen.machine.MachineFederationScreen
 import com.toxicbakery.app.bison.common.screen.workspace.WorkspaceTerminalScreen
 import com.toxicbakery.app.bison.common.theme.BisonTheme
@@ -110,6 +111,8 @@ fun App(
                         }
                     },
                 )
+                // The questions of an SSH login show above each screen.
+                KeyboardInteractivePromptHost()
             }
         }
     }

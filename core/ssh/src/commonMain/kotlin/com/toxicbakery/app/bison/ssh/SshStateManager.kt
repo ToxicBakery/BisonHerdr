@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.ssh
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.RoamingStatus
+import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -68,7 +69,19 @@ class SshStateManager {
     /** The open user authentication prompts, the oldest first. See [UserAuthPrompt] and [requestUserAuth]. */
     val userAuthPrompts: StateFlow<List<UserAuthPrompt>> = _userAuthPrompts.asStateFlow()
 
-    /** The number of callers that run [hostUserAuthPrompts] now. */
+    private val _keyboardInteractivePrompts = MutableStateFlow<List<KeyboardInteractivePrompt>>(emptyList())
+
+    /**
+     * The open keyboard-interactive prompts, the oldest first. See [KeyboardInteractivePrompt] and
+     * [requestKeyboardInteractive]. The UI shows them while [hostUserAuthPrompts] runs.
+     */
+    val keyboardInteractivePrompts: StateFlow<List<KeyboardInteractivePrompt>> =
+        _keyboardInteractivePrompts.asStateFlow()
+
+    /**
+     * The number of callers that run [hostUserAuthPrompts] now. [requestUserAuth] and [requestKeyboardInteractive]
+     * ask the user only while it is more than zero.
+     */
     private val userAuthHosts = MutableStateFlow(0)
 
     private val _queuedPrompts = MutableStateFlow<Map<String, List<QueuedPrompt>>>(emptyMap())
@@ -193,7 +206,12 @@ class SshStateManager {
      * A UI calls this function only while it can show a prompt, for example while its activity is started.
      * [requestUserAuth] asks the user only while one or more callers run this function. The function runs until
      * the caller cancels it. When a prompt closes before [show] returns, for example after a time-out, it cancels
-     * [show]. When the last caller stops, the open prompts get [UserAuthOutcome.Cancelled].
+     * [show]. When the last caller stops, the open user authentication prompts get [UserAuthOutcome.Cancelled].
+     *
+     * While one or more callers run this function, [requestKeyboardInteractive] also asks the user. The UI shows
+     * [keyboardInteractivePrompts] and answers them with [answerKeyboardInteractive]. When the last caller stops, the
+     * open keyboard-interactive prompts stay open until their time limit. Thus the user can read a one-time code in a
+     * different app, and then come back and answer.
      */
     suspend fun hostUserAuthPrompts(show: suspend (UserAuthPrompt) -> UserAuthOutcome) {
         userAuthHosts.update { it + 1 }
@@ -205,24 +223,32 @@ class SshStateManager {
                     if (prompt != null) answerUserAuth(prompt, showSafely(prompt, show))
                 }
         } finally {
-            if (userAuthHosts.updateAndGet { it - 1 } == 0) cancelAllUserAuth()
+            // The system closes a biometric prompt in the background. A keyboard-interactive prompt stays open.
+            if (userAuthHosts.updateAndGet { it - 1 } == 0) {
+                _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+            }
         }
     }
 
     /**
-     * Gives [UserAuthOutcome.Cancelled] to the open user authentication prompt of [machineId]. The wait of
-     * [requestUserAuth] then ends at once. A disconnect calls it before its request goes into a queue, because the
-     * connect that waits for the prompt can hold that queue.
+     * Cancels the open prompts of [machineId]: the user authentication prompt gets [UserAuthOutcome.Cancelled], and
+     * each keyboard-interactive prompt gets [KeyboardInteractiveOutcome.Cancelled]. The wait of [requestUserAuth] and
+     * [requestKeyboardInteractive] then ends at once. A disconnect calls it before its request goes into a queue,
+     * because the connect that waits for the prompt can hold that queue.
      */
     fun cancelUserAuth(machineId: String) {
         _userAuthPrompts.value
             .filter { it.machineId == machineId }
             .forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+        _keyboardInteractivePrompts.value
+            .filter { it.machineId == machineId }
+            .forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
     }
 
-    /** Gives [UserAuthOutcome.Cancelled] to all open user authentication prompts. */
+    /** Cancels all open prompts: the user authentication prompts and the keyboard-interactive prompts. */
     fun cancelAllUserAuth() {
         _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
+        _keyboardInteractivePrompts.value.forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
     }
 
     /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */
@@ -242,6 +268,41 @@ class SshStateManager {
     private fun answerUserAuth(prompt: UserAuthPrompt, outcome: UserAuthOutcome) {
         prompt.answer.complete(outcome)
         _userAuthPrompts.update { current -> current.filter { it !== prompt } }
+    }
+
+    /**
+     * Puts [prompt] in [keyboardInteractivePrompts] and waits for the answer of the user.
+     *
+     * - When no UI runs [hostUserAuthPrompts], it returns [KeyboardInteractiveOutcome.NoUi] at once and puts no
+     *   prompt.
+     * - When no answer comes in [timeout], it returns [KeyboardInteractiveOutcome.TimedOut].
+     * - When the last UI stops, the prompt stays open until the time limit. See [hostUserAuthPrompts].
+     * - [cancelUserAuth] and [cancelAllUserAuth] give [KeyboardInteractiveOutcome.Cancelled].
+     * - At the end, the function removes the prompt. A late answer has no effect.
+     */
+    suspend fun requestKeyboardInteractive(
+        prompt: KeyboardInteractivePrompt,
+        timeout: Duration,
+    ): KeyboardInteractiveOutcome {
+        if (userAuthHosts.value == 0) return KeyboardInteractiveOutcome.NoUi
+        _keyboardInteractivePrompts.update { it + prompt }
+        try {
+            // The last UI can stop after the first check. Then no UI saw the prompt.
+            if (userAuthHosts.value == 0) return KeyboardInteractiveOutcome.NoUi
+            return withTimeoutOrNull(timeout) { prompt.answer.await() } ?: KeyboardInteractiveOutcome.TimedOut
+        } finally {
+            // A late answer from the UI has no effect.
+            answerKeyboardInteractive(prompt, KeyboardInteractiveOutcome.TimedOut)
+        }
+    }
+
+    /**
+     * Gives [outcome] as the answer to [prompt] when [prompt] has no answer, and removes [prompt] from
+     * [keyboardInteractivePrompts].
+     */
+    fun answerKeyboardInteractive(prompt: KeyboardInteractivePrompt, outcome: KeyboardInteractiveOutcome) {
+        prompt.answer.complete(outcome)
+        _keyboardInteractivePrompts.update { current -> current.filter { it !== prompt } }
     }
 
     fun enqueuePrompt(prompt: QueuedPrompt) {

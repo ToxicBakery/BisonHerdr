@@ -23,13 +23,19 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -260,6 +266,49 @@ class SessionReconnectTest {
     }
 
     @Test
+    fun questionsAtAReconnectWithNoUiStopTheLoopAtOnce() = runTest {
+        val transport = startTransport()
+        server.interactivePrompts = listOf(
+            TestSshServer.InteractivePrompt("Password: ", TestSshServer.PASSWORD),
+            TestSshServer.InteractivePrompt("One-time code: ", ONE_TIME_CODE, echo = true),
+        )
+        val machine = server.machine(
+            id = "reconnect-questions",
+            username = TestSshServer.INTERACTIVE_USER,
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(PASSWORD_REF)),
+        ).also { machines += it }
+        // The app shows a screen at the connect, and the user answers the questions.
+        val ui = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        ui.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.hostUserAuthPrompts { UserAuthOutcome.Cancelled }
+        }
+        ui.launch(start = CoroutineStart.UNDISPATCHED) {
+            stateManager.keyboardInteractivePrompts.collect { open ->
+                val answer = KeyboardInteractiveOutcome.Answered(listOf(TestSshServer.PASSWORD, ONE_TIME_CODE))
+                open.forEach { stateManager.answerKeyboardInteractive(it, answer) }
+            }
+        }
+        assertTrue(transport.connect(machine), debugLogDump())
+        // The app goes to the background.
+        ui.coroutineContext.job.cancelAndJoin()
+
+        server.closeSessions()
+
+        awaitFailed(machine)
+        assertEquals(
+            NeedsUserCause.InputRequired(server.knownHost().hostPort),
+            stateManager.needsUser.value[machine.id],
+        )
+        assertFalse(stateManager.isMachineConnected(machine.id))
+        assertTrue(delays.value.isEmpty(), "The loop waited for a new attempt: ${delays.value}")
+        assertTrue(stateManager.keyboardInteractivePrompts.value.isEmpty())
+        val checks = server.credentialChecks
+        advanceTimeBy(10.minutes)
+        runCurrent()
+        assertEquals(checks, server.credentialChecks, "The loop tried the login again")
+    }
+
+    @Test
     fun theLivenessCheckPassesOnAWorkingSessionAndFailsWithNoSession() = runTest {
         val transport = startTransport()
         val machine = passwordMachine("liveness")
@@ -290,6 +339,7 @@ class SessionReconnectTest {
             reconnectDelays = { failures ->
                 backoff.delayAfter(failures).also { delay -> delays.update { it + delay } }
             },
+            userPrompter = { prompt -> stateManager.requestKeyboardInteractive(prompt, AWAIT_TIMEOUT) },
         )
         val realBackend = RealSshBackend(client = client, sshStateManager = stateManager, keystoreKeyManager = keyManager)
         backend = realBackend
@@ -357,6 +407,7 @@ class SessionReconnectTest {
         const val TARGET = "target"
         const val BASTION = "bastion"
         const val PASSWORD_REF = "password-reconnect"
+        const val ONE_TIME_CODE = "13579"
         const val SEED = 10
         val AWAIT_TIMEOUT: Duration = 20.seconds
         val AWAIT_STEP: Duration = 20.milliseconds
