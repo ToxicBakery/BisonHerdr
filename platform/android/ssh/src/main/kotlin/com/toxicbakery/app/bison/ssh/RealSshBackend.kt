@@ -168,6 +168,8 @@ class RealSshBackend internal constructor(
         client.resizeViewport(machineId, cols, rows)
     }
 
+    override fun <T> withFrameLock(machineId: String, block: () -> T): T = client.withFrameLock(machineId, block)
+
     override fun disconnect(machineId: String) {
         client.disconnect(machineId)
     }

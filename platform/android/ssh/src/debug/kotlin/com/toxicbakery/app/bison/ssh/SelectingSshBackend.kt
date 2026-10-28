@@ -87,4 +87,7 @@ class SelectingSshBackend(
 
     override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) =
         backendFor(machine.id).refreshSurface(machine, route)
+
+    override fun <T> withFrameLock(machineId: String, block: () -> T): T =
+        backendFor(machineId).withFrameLock(machineId, block)
 }

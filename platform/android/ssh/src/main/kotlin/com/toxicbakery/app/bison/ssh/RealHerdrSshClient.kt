@@ -152,6 +152,11 @@ internal class RealHerdrSshClient(
     private val machineStore: MachineStore? = null,
     /** Measures the poll time. A test gives a source with virtual time. */
     private val timeSource: TimeSource = TimeSource.Monotonic,
+    /**
+     * Puts a frame of a machine on [paneSurfaceBus]. The client calls it in the frame lock of the machine (see
+     * [frameLocks]). A test gives a function that stops a step at this point.
+     */
+    private val framePublisher: (machineId: String, frame: PaneSurfaceFrame) -> Unit = paneSurfaceBus::publish,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -344,25 +349,83 @@ internal class RealHerdrSshClient(
     /** Scroll position of each pane from the Herdr snapshot, by machine and then by pane. */
     private val paneScrolls = ConcurrentHashMap<String, Map<String, PaneSurfaceScroll>>()
 
-    /** The newest `pane.scroll` request of each machine that is not sent yet. Older requests are dropped. */
-    private val pendingPaneScrolls = ConcurrentHashMap<String, PendingPaneScroll>()
+    private val paneScrollSequence = AtomicLong(0L)
+    private val pollSequence = AtomicLong(0L)
     private val paneScrollSignals = ConcurrentHashMap<String, Channel<Unit>>()
     private val paneScrollJobs = ConcurrentHashMap<String, Job>()
 
     /**
-     * This lock makes these scroll steps atomic:
-     * - [requestPaneScroll] sets [pendingPaneScrolls] and [paneScrolls], and publishes the frame of the new position.
-     * - [sendPaneScroll] reads [pendingPaneScrolls], sets [paneScrolls], and publishes the frame of the Herdr answer.
-     * - [refreshSnapshotAndSurface] merges the queued position into [paneScrolls].
+     * The frame data of each machine. Each [MachineFrames] object is also the frame lock of its machine.
      *
-     * Because of the lock, a frame from the scroll worker cannot replace a newer frame from a scroll request.
-     * The worker removes the next request outside the lock, because `remove` is atomic and publishes no frame.
-     * [disconnect] also does not use the lock. The poll and the input flush build and publish their frames outside
-     * the lock.
+     * A step that changes the data of a frame and then publishes a frame does both in this lock. The data is
+     * [cachedInputs], [paneScrolls], [viewportSizes], [selectionState], the optimistic edits, and the fields of
+     * [MachineFrames]. All steps of this client that publish on [paneSurfaceBus] or [endpointSnapshotBus] use the lock.
+     * [SshTransportManager.setSurfaceLease] uses it through [withFrameLock]. A poll also compares its number with
+     * [MachineFrames.minPollSeq], so that an older poll cannot replace the data of a newer poll or a newer selection.
+     * Thus a frame of these steps cannot replace a newer frame of these steps.
+     *
+     * The lock does not cover a frame of [MoshUdpEngine]. This version has no Mosh session (issue #22).
+     *
+     * Each machine has its own lock, so a step does not wait for the frames of a different machine. No step holds the
+     * lock across network I/O. In the app, [sendPaneInput] and [resizeViewport] run on the serial fast-input queue of
+     * the session service, on `Dispatchers.Default`. A Java monitor is not fair, so such a step can wait for more than
+     * one frame build of the same machine. A frame build has no network I/O. [disconnect] clears the data in the lock,
+     * and stops the polls that still run. It keeps the lock, so that a step that still runs and a new step use the
+     * same lock.
      */
-    private val paneScrollLock = Any()
+    private val frameLocks = ConcurrentHashMap<String, MachineFrames>()
 
-    private data class PendingPaneScroll(val paneId: String, val offsetFromBottom: Int)
+    /** A `pane.scroll` request. [seq] increases with each request of all machines. */
+    private data class PaneScrollRequest(val paneId: String, val offsetFromBottom: Int, val seq: Long)
+
+    /** The `pane.scroll` requests of one pane. Only the holder of the frame lock reads or writes the fields. */
+    private class PaneScrollRequests {
+        /** The newest request that the scroll worker did not send yet. Older requests of the pane are dropped. */
+        var queued: PaneScrollRequest? = null
+
+        /** The newest request that did not fail: not sent yet, in flight, or answered. */
+        var newest: PaneScrollRequest? = null
+
+        /** The newest request that Herdr answered, or that failed. */
+        var answered: PaneScrollRequest? = null
+
+        /** True when the answer of [answered] had the pane text, and the client put that text in [cachedInputs]. */
+        var answerHasText: Boolean = false
+    }
+
+    /** The frame lock of one machine and its data. Only the holder of the lock reads or writes the fields. */
+    private class MachineFrames {
+        /** The `pane.scroll` requests of each pane, by pane id. */
+        val scrollRequests = HashMap<String, PaneScrollRequests>()
+
+        /**
+         * A poll with a lower number publishes nothing, because its data is older than the data on the buses. A poll
+         * that publishes sets this value to its own number. A change of the selection and [disconnect] set it to a new
+         * number, because a poll that started before can have read the old selection, or can end after the
+         * disconnect. See [refreshSnapshotAndSurface].
+         */
+        var minPollSeq: Long = 0L
+    }
+
+    /** Runs [block] in the frame lock of [machineId], and gives it the frame data of the machine. */
+    private inline fun <T> withFrames(machineId: String, block: (MachineFrames) -> T): T {
+        val frames = frameLocks.computeIfAbsent(machineId) { MachineFrames() }
+        return synchronized(frames) { block(frames) }
+    }
+
+    /**
+     * Runs [block] in the frame lock of [machineId], and returns its result. A step of a different class uses it to
+     * read the frame of the machine from [paneSurfaceBus] and publish a changed copy. See [frameLocks].
+     */
+    internal fun <T> withFrameLock(machineId: String, block: () -> T): T = withFrames(machineId) { block() }
+
+    /**
+     * Stops the polls of [machineId] that started before this call: they publish nothing. Call it after a change of
+     * the selection, because these polls can have read the old selection.
+     */
+    private fun discardRunningPolls(machineId: String) {
+        withFrames(machineId) { frames -> frames.minPollSeq = pollSequence.incrementAndGet() }
+    }
 
     private fun sessionMutexFor(machineId: String): Mutex =
         sessionOpenLocks.computeIfAbsent(machineId) { Mutex() }
@@ -513,16 +576,20 @@ internal class RealHerdrSshClient(
         pollJobs.remove(machineId)?.cancel()
         paneScrollJobs.remove(machineId)?.cancel()
         paneScrollSignals.remove(machineId)?.close()
-        pendingPaneScrolls.remove(machineId)
-        paneScrolls.remove(machineId)
         inputFlushJobs.remove(machineId)?.cancel()
         inputFlushSignals.remove(machineId)?.close()
         pendingInputQueues.remove(machineId)?.clear()
-        optimisticEdits.remove(machineId)?.let { synchronized(it) { it.clear() } }
+        // A poll that still runs, for example the refresh of an RPC, publishes nothing after this step.
+        withFrames(machineId) { frames ->
+            discardRunningPolls(machineId)
+            frames.scrollRequests.clear()
+            paneScrolls.remove(machineId)
+            optimisticEdits.remove(machineId)?.let { synchronized(it) { it.clear() } }
+            selectionState.remove(machineId)
+            cachedInputs.remove(machineId)
+            viewportSizes.remove(machineId)
+        }
         lastInputConfirmedSeq.remove(machineId)
-        selectionState.remove(machineId)
-        cachedInputs.remove(machineId)
-        viewportSizes.remove(machineId)
         inputWorkers.remove(machineId)?.close()
         pollWorkers.remove(machineId)?.close()
         closeSessions(machineId)
@@ -651,16 +718,18 @@ internal class RealHerdrSshClient(
     ) {
         val targetCols = cols.toInt().coerceIn(20, 300)
         val targetRows = rows.toInt().coerceIn(8, 150)
-        val prev = viewportSizes.put(machineId, targetCols to targetRows)
-        if (prev == (targetCols to targetRows)) return
-        val cached = cachedInputs[machineId] ?: return
-        val frame = buildCompositeSurfaceFrame(
-            machineId = machineId,
-            snapshot = cached.snapshot,
-            layout = cached.layout,
-            ansiByPane = cached.ansiByPane,
-        )
-        paneSurfaceBus.publish(machineId, frame)
+        withFrames(machineId) {
+            val prev = viewportSizes.put(machineId, targetCols to targetRows)
+            if (prev == (targetCols to targetRows)) return
+            val cached = cachedInputs[machineId] ?: return
+            val frame = buildCompositeSurfaceFrame(
+                machineId = machineId,
+                snapshot = cached.snapshot,
+                layout = cached.layout,
+                ansiByPane = cached.ansiByPane,
+            )
+            framePublisher(machineId, frame)
+        }
     }
 
     /**
@@ -672,6 +741,15 @@ internal class RealHerdrSshClient(
      * for each visible pane. Thus it is more than the network round trip time. The client gives the time to
      * [roundTripMeter]. A batch that fails, that runs during a reconnect, or that is the first batch of a new worker
      * gives no time.
+     *
+     * The poll sets [paneScrolls] and [cachedInputs], and publishes its frame, in one step in the frame lock of the
+     * machine. Thus a scroll request or an input answer cannot occur between the build and the publish of the poll
+     * frame. See [frameLocks] and [mergePaneScrolls].
+     *
+     * Each poll gets a number when its first batch gets the lock of the Poll lane. Thus the numbers of two polls have
+     * the order of their snapshots. The poll publishes its snapshot and its frame only while its number is not lower
+     * than [MachineFrames.minPollSeq]. Thus the data of an older poll cannot replace the data of a newer poll, and a
+     * poll that read the selection before a change publishes nothing.
      */
     suspend fun refreshSnapshotAndSurface(
         machine: HostMachine,
@@ -679,6 +757,10 @@ internal class RealHerdrSshClient(
     ): Boolean = withContext(Dispatchers.IO) {
         val pollStartInputSeq = inputSequence.get()
         val pollStartConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
+        // The first batch sets these values in the lock of the Poll lane. For each pane, Herdr answered the scroll
+        // requests up to the number in answeredBeforeSnapshot before the batch. Thus the snapshot shows them.
+        var pollSeq = 0L
+        var answeredBeforeSnapshot = emptyMap<String, Long>()
         val predictedVisiblePanes = cachedInputs[machine.id]?.let { existing ->
             val activeTabId = existing.snapshot.focusedTabId
             existing.layout?.panes?.map { it.paneId }?.takeIf { it.isNotEmpty() }
@@ -701,6 +783,10 @@ internal class RealHerdrSshClient(
             lane = WorkerLane.Poll,
             commands = initialCommands,
             onRoundTrip = { elapsed -> recordRoundTrip(machine.id, elapsed) },
+            onLaneLocked = {
+                pollSeq = pollSequence.incrementAndGet()
+                answeredBeforeSnapshot = answeredScrollSeqs(machine.id)
+            },
         )
 
         var snapshotObj: JsonObject? = null
@@ -730,17 +816,18 @@ internal class RealHerdrSshClient(
 
         val resolvedSnapshotObj = snapshotObj ?: return@withContext false
         val serverScrolls = parsePaneScrolls(resolvedSnapshotObj)
-        // A queued scroll position is newer than the snapshot, so a poll must not move the pane back.
-        synchronized(paneScrollLock) {
-            paneScrolls[machine.id] = pendingPaneScrolls[machine.id]?.let { pending ->
-                val scroll = serverScrolls[pending.paneId] ?: PaneSurfaceScroll()
-                serverScrolls + (pending.paneId to scroll.copy(offsetFromBottom = pending.offsetFromBottom.toUInt()))
-            } ?: serverScrolls
-        }
 
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
-        val parsed = parseSnapshotObject(machine.id, resolvedSnapshotObj, sel)
-        endpointSnapshotBus.publish(machine.id, parsed.snapshot)
+        // The parse reads and writes the selection. In the lock, a change of the selection cannot occur during the
+        // parse.
+        val parsed = withFrames(machine.id) { frames ->
+            // A newer poll or a change of the selection occurred. This poll has older data, so it publishes nothing.
+            if (pollSeq < frames.minPollSeq) return@withFrames null
+            frames.minPollSeq = pollSeq
+            parseSnapshotObject(machine.id, resolvedSnapshotObj, sel).also { parsed ->
+                endpointSnapshotBus.publish(machine.id, parsed.snapshot)
+            }
+        } ?: return@withContext true
 
         val activeTabId = parsed.snapshot.focusedTabId
         val activeLayout = parsed.layoutsByTab[activeTabId]
@@ -752,9 +839,21 @@ internal class RealHerdrSshClient(
                 .map { it.paneId }
                 .ifEmpty { listOfNotNull(parsed.snapshot.focusedPaneId) }
 
-        if (visiblePaneIds.isEmpty()) return@withContext true
+        val snapshotPaneIds = parsed.snapshot.panes.mapTo(HashSet()) { it.paneId }
+        if (visiblePaneIds.isEmpty()) {
+            withFrames(machine.id) { frames ->
+                if (pollSeq >= frames.minPollSeq) {
+                    pruneScrollRequests(frames, snapshotPaneIds)
+                    mergePaneScrolls(machine.id, frames, serverScrolls, snapshotPaneIds, answeredBeforeSnapshot)
+                }
+            }
+            return@withContext true
+        }
 
-        val missingPaneIds = visiblePaneIds.filter { it !in ansiByPane }
+        val missingPaneIds = visiblePaneIds.filter { it !in ansiByPane }.toSet()
+        // The second batch reads the missing panes after the snapshot. For each of these panes, Herdr answered the
+        // scroll requests up to this number before that read.
+        var answeredBeforeMissingReads = answeredBeforeSnapshot
         if (missingPaneIds.isNotEmpty()) {
             val missingCommands = missingPaneIds.map { paneId ->
                 RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId))
@@ -764,21 +863,56 @@ internal class RealHerdrSshClient(
                 route = route,
                 lane = WorkerLane.Poll,
                 commands = missingCommands,
+                onLaneLocked = { answeredBeforeMissingReads = answeredScrollSeqs(machine.id) },
             )
             parsePaneReadLinesInto(missingResponse, ansiByPane)
         }
 
-        // If the fast input lane updated the focused pane while this background poll was in flight,
-        // keep the newer focused-pane ANSI buffer so polling never clobbers recent keystrokes.
-        val currentConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
-        val currentInputSeq = inputSequence.get()
-        if (currentConfirmedSeq > pollStartConfirmedSeq || currentInputSeq > pollStartInputSeq) {
-            val focusedId = parsed.snapshot.focusedPaneId
-            val newerCachedAnsi = focusedId?.let { cachedInputs[machine.id]?.ansiByPane?.get(it) }
-            if (focusedId != null && newerCachedAnsi != null) {
-                ansiByPane[focusedId] = newerCachedAnsi
+        val framePublished = withFrames(machine.id) { frames ->
+            // A newer poll or a change of the selection occurred while this poll read the missing panes.
+            if (pollSeq < frames.minPollSeq) return@withFrames false
+            frames.minPollSeq = pollSeq
+            pruneScrollRequests(frames, snapshotPaneIds)
+            mergePaneScrolls(machine.id, frames, serverScrolls, snapshotPaneIds, answeredBeforeSnapshot)
+
+            // The input lane can update the focused pane while this poll is in flight. Then the cache has newer text
+            // of that pane. Keep that text, so that the poll does not remove recent keystrokes.
+            val currentConfirmedSeq = lastInputConfirmedSeq[machine.id] ?: 0L
+            val currentInputSeq = inputSequence.get()
+            if (currentConfirmedSeq > pollStartConfirmedSeq || currentInputSeq > pollStartInputSeq) {
+                val focusedId = parsed.snapshot.focusedPaneId
+                val newerCachedAnsi = focusedId?.let { cachedInputs[machine.id]?.ansiByPane?.get(it) }
+                if (focusedId != null && newerCachedAnsi != null) {
+                    ansiByPane[focusedId] = newerCachedAnsi
+                }
             }
+
+            keepScrollAnswerText(
+                machineId = machine.id,
+                frames = frames,
+                serverScrolls = serverScrolls,
+                answeredBeforeSnapshot = answeredBeforeSnapshot,
+                missingPaneIds = missingPaneIds,
+                answeredBeforeMissingReads = answeredBeforeMissingReads,
+                ansiByPane = ansiByPane,
+            )
+
+            cachedInputs[machine.id] = CachedSurfaceInputs(
+                snapshot = parsed.snapshot,
+                layout = activeLayout,
+                ansiByPane = ansiByPane,
+            )
+
+            val frame = buildCompositeSurfaceFrame(
+                machineId = machine.id,
+                snapshot = parsed.snapshot,
+                layout = activeLayout,
+                ansiByPane = ansiByPane,
+            )
+            framePublisher(machine.id, frame)
+            true
         }
+        if (!framePublished) return@withContext true
 
         // Update agent snippets from the read pane buffers
         parsed.snapshot.agents.forEach { agent ->
@@ -800,21 +934,87 @@ internal class RealHerdrSshClient(
                 }
             }
         }
-
-        cachedInputs[machine.id] = CachedSurfaceInputs(
-            snapshot = parsed.snapshot,
-            layout = activeLayout,
-            ansiByPane = ansiByPane,
-        )
-
-        val frame = buildCompositeSurfaceFrame(
-            machineId = machine.id,
-            snapshot = parsed.snapshot,
-            layout = activeLayout,
-            ansiByPane = ansiByPane,
-        )
-        paneSurfaceBus.publish(machine.id, frame)
         true
+    }
+
+    /** Returns the number of the newest answered scroll request of each pane of [machineId]. */
+    private fun answeredScrollSeqs(machineId: String): Map<String, Long> = withFrames(machineId) { frames ->
+        frames.scrollRequests.mapValues { (_, requests) -> requests.answered?.seq ?: 0L }
+    }
+
+    /**
+     * Removes the scroll requests of each pane that is not in [snapshotPaneIds] and has no request in the queue or in
+     * flight. Thus the requests of closed panes do not stay until [disconnect]. The caller holds the frame lock.
+     */
+    private fun pruneScrollRequests(frames: MachineFrames, snapshotPaneIds: Set<String>) {
+        frames.scrollRequests.entries.removeAll { (paneId, requests) ->
+            val unanswered = requests.newest?.let { it.seq > (requests.answered?.seq ?: 0L) } == true
+            paneId !in snapshotPaneIds && requests.queued == null && !unanswered
+        }
+    }
+
+    /**
+     * Sets [paneScrolls] of [machineId] from the positions in a poll snapshot, [serverScrolls]. The caller holds the
+     * frame lock of the machine, and gives its [frames].
+     *
+     * For each pane, Herdr answered the scroll requests up to the number in [answeredBeforeSnapshot] before the
+     * snapshot, so the snapshot shows their positions. A newer request can be newer than the snapshot: it is not sent
+     * yet, it is in flight, or Herdr answered it during the poll. Thus each pane of the snapshot with such a request
+     * keeps the position of its newest request. A pane that is not in [snapshotPaneIds] gets no position.
+     */
+    private fun mergePaneScrolls(
+        machineId: String,
+        frames: MachineFrames,
+        serverScrolls: Map<String, PaneSurfaceScroll>,
+        snapshotPaneIds: Set<String>,
+        answeredBeforeSnapshot: Map<String, Long>,
+    ) {
+        val merged = serverScrolls.toMutableMap()
+        frames.scrollRequests.forEach { (paneId, requests) ->
+            if (paneId !in snapshotPaneIds) return@forEach
+            val newest = requests.newest?.takeIf { it.seq > (answeredBeforeSnapshot[paneId] ?: 0L) } ?: return@forEach
+            val scroll = serverScrolls[paneId] ?: PaneSurfaceScroll()
+            merged[paneId] = scroll.copy(offsetFromBottom = newest.offsetFromBottom.toUInt())
+        }
+        paneScrolls[machineId] = merged
+    }
+
+    /**
+     * Puts the cached text of a pane in [ansiByPane] of a poll when the poll read the pane before Herdr moved it. The
+     * caller holds the frame lock of the machine, and gives its [frames].
+     *
+     * The first batch reads the snapshot and the predicted panes. The second batch reads the [missingPaneIds] later.
+     * For each pane, Herdr answered the scroll requests up to the number in [answeredBeforeSnapshot] or in
+     * [answeredBeforeMissingReads] before the batch that read the pane. The client uses the cached text of a pane only
+     * when all of these conditions are true:
+     * - Herdr answered a scroll request of the pane during the batch that read the pane.
+     * - The answer had the pane text, so the cache has text that is newer than the scroll.
+     * - The poll read the pane before the scroll. For a pane of the first batch, the snapshot does not show the
+     *   position of the answer. A pane of the second batch has no position at the time of its read, so the client
+     *   cannot tell the order. Then it keeps the cached text.
+     *
+     * Otherwise the poll keeps the text that it read. A failed request gives no text.
+     */
+    private fun keepScrollAnswerText(
+        machineId: String,
+        frames: MachineFrames,
+        serverScrolls: Map<String, PaneSurfaceScroll>,
+        answeredBeforeSnapshot: Map<String, Long>,
+        missingPaneIds: Set<String>,
+        answeredBeforeMissingReads: Map<String, Long>,
+        ansiByPane: MutableMap<String, String>,
+    ) {
+        frames.scrollRequests.forEach { (paneId, requests) ->
+            val answered = requests.answered ?: return@forEach
+            val secondBatch = paneId in missingPaneIds
+            val answeredBeforeRead = (if (secondBatch) answeredBeforeMissingReads else answeredBeforeSnapshot)[paneId]
+            val answeredDuringRead = answered.seq > (answeredBeforeRead ?: 0L)
+            val readBeforeScroll = secondBatch ||
+                serverScrolls[paneId]?.offsetFromBottom != answered.offsetFromBottom.toUInt()
+            if (answeredDuringRead && requests.answerHasText && readBeforeScroll && paneId in ansiByPane) {
+                cachedInputs[machineId]?.ansiByPane?.get(paneId)?.let { ansiByPane[paneId] = it }
+            }
+        }
     }
 
     /** Adds the poll time [elapsed] of [machineId] to [roundTripMeter], which gives it to [roundTripListener]. */
@@ -833,60 +1033,9 @@ internal class RealHerdrSshClient(
     ): String? = withContext(Dispatchers.IO) {
         val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
 
-        // Track client selection overrides immediately so switching workspaces/tabs/panes is instant
-        when (request.method) {
-            "workspace.focus" -> {
-                val paramsObj = parseParamsObject(request.paramsJson)
-                val wsId = paramsObj["workspace_id"]?.jsonPrimitive?.content
-                if (!wsId.isNullOrBlank()) {
-                    sel.focusedWorkspaceId = wsId
-                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
-                    val ws = currentSnap?.workspaces?.firstOrNull { it.workspaceId == wsId }
-                    val targetTabId = ws?.activeTabId
-                        ?: currentSnap?.tabs?.firstOrNull { it.workspaceId == wsId }?.tabId
-                    if (!targetTabId.isNullOrBlank()) {
-                        sel.focusedTabId = targetTabId
-                        val targetPaneId = currentSnap?.panes
-                            ?.firstOrNull { it.tabId == targetTabId }?.paneId
-                        if (!targetPaneId.isNullOrBlank()) {
-                            sel.focusedPaneId = targetPaneId
-                        }
-                    }
-                }
-            }
-
-            "tab.focus" -> {
-                val paramsObj = parseParamsObject(request.paramsJson)
-                val tabId = paramsObj["tab_id"]?.jsonPrimitive?.content
-                if (!tabId.isNullOrBlank()) {
-                    sel.focusedTabId = tabId
-                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
-                    val tab = currentSnap?.tabs?.firstOrNull { it.tabId == tabId }
-                    if (tab != null) {
-                        sel.focusedWorkspaceId = tab.workspaceId
-                    }
-                    val targetPaneId = currentSnap?.panes?.firstOrNull { it.tabId == tabId }?.paneId
-                    if (!targetPaneId.isNullOrBlank()) {
-                        sel.focusedPaneId = targetPaneId
-                    }
-                }
-            }
-
-            "pane.focus", "agent.focus" -> {
-                val paramsObj = parseParamsObject(request.paramsJson)
-                val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
-                if (!paneId.isNullOrBlank()) {
-                    sel.focusedPaneId = paneId
-                    val currentSnap = endpointSnapshotBus.snapshotFor(machine.id)
-                    val pane = currentSnap?.panes?.firstOrNull { it.paneId == paneId }
-                    if (pane != null) {
-                        sel.focusedWorkspaceId = pane.workspaceId
-                        sel.focusedTabId = pane.tabId
-                    }
-                    applyOptimisticPaneFocus(machine.id, paneId)
-                }
-            }
-        }
+        // A focus request changes the selection at once. In the frame lock, a poll cannot parse the snapshot during
+        // the change.
+        withFrames(machine.id) { applySelection(machine.id, sel, request) }
 
         // Scroll gestures send one request per line. Keep only the newest request, so that the pane
         // follows the finger, and do not refresh the full snapshot for each line.
@@ -967,12 +1116,79 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Dispatches a pane input event with:
-     * 1. Immediate (`<1ms`) optimistic local echo published onto [paneSurfaceBus].
-     * 2. Non-blocking enqueue into the per-machine coalescing input queue so rapid typing never stalls
-     *    behind sequential round-trips.
-     * 3. Single-pass execution on the persistent [WorkerLane.Input] channel (`pane.send_text` / `pane.send_keys` /
-     *    `pane.send_input` + focused `pane.read`), completely decoupled from background polling.
+     * Sets the selection of [machineId] from a focus [request] at once, so that a switch of workspace, tab, or pane
+     * shows at once. The caller holds the frame lock of the machine, so that a poll cannot parse the snapshot during
+     * the change. After a change, the polls that started before the change publish nothing.
+     */
+    private fun applySelection(machineId: String, sel: ClientSelectionState, request: ClientShellEndpointRequest) {
+        when (request.method) {
+            "workspace.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
+                val wsId = paramsObj["workspace_id"]?.jsonPrimitive?.content
+                if (!wsId.isNullOrBlank()) {
+                    sel.focusedWorkspaceId = wsId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machineId)
+                    val ws = currentSnap?.workspaces?.firstOrNull { it.workspaceId == wsId }
+                    val targetTabId = ws?.activeTabId
+                        ?: currentSnap?.tabs?.firstOrNull { it.workspaceId == wsId }?.tabId
+                    if (!targetTabId.isNullOrBlank()) {
+                        sel.focusedTabId = targetTabId
+                        val targetPaneId = currentSnap?.panes
+                            ?.firstOrNull { it.tabId == targetTabId }?.paneId
+                        if (!targetPaneId.isNullOrBlank()) {
+                            sel.focusedPaneId = targetPaneId
+                        }
+                    }
+                    discardRunningPolls(machineId)
+                }
+            }
+
+            "tab.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
+                val tabId = paramsObj["tab_id"]?.jsonPrimitive?.content
+                if (!tabId.isNullOrBlank()) {
+                    sel.focusedTabId = tabId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machineId)
+                    val tab = currentSnap?.tabs?.firstOrNull { it.tabId == tabId }
+                    if (tab != null) {
+                        sel.focusedWorkspaceId = tab.workspaceId
+                    }
+                    val targetPaneId = currentSnap?.panes?.firstOrNull { it.tabId == tabId }?.paneId
+                    if (!targetPaneId.isNullOrBlank()) {
+                        sel.focusedPaneId = targetPaneId
+                    }
+                    discardRunningPolls(machineId)
+                }
+            }
+
+            "pane.focus", "agent.focus" -> {
+                val paramsObj = parseParamsObject(request.paramsJson)
+                val paneId = paramsObj["pane_id"]?.jsonPrimitive?.content
+                if (!paneId.isNullOrBlank()) {
+                    sel.focusedPaneId = paneId
+                    val currentSnap = endpointSnapshotBus.snapshotFor(machineId)
+                    val pane = currentSnap?.panes?.firstOrNull { it.paneId == paneId }
+                    if (pane != null) {
+                        sel.focusedWorkspaceId = pane.workspaceId
+                        sel.focusedTabId = pane.tabId
+                    }
+                    discardRunningPolls(machineId)
+                    applyOptimisticPaneFocus(machineId, paneId)
+                }
+            }
+        }
+    }
+
+    /**
+     * Sends a pane input event in these steps:
+     * 1. When the pane is not at the bottom, it requests the bottom ([requestPaneScroll]).
+     * 2. It publishes an optimistic local echo on [paneSurfaceBus], with no network I/O. The echo uses the frame lock
+     *    of the machine, so it can wait for the frame builds of the same machine. See [frameLocks].
+     * 3. It adds the event to the input queue of the machine, and does not wait. Thus fast typing does not wait for
+     *    a round trip.
+     * 4. The input flush sends the queued events in one batch on the persistent [WorkerLane.Input] channel
+     *    (`pane.send_text`, `pane.send_keys`, or `pane.send_input`, and a `pane.read` of the pane). The poll uses the
+     *    other channel, [WorkerLane.Poll].
      */
     suspend fun sendPaneInput(
         machine: HostMachine,
@@ -1002,16 +1218,20 @@ internal class RealHerdrSshClient(
         val optimisticEdit = toOptimisticEdit(seq, targetPaneId, event)
         if (optimisticEdit != null) {
             val edits = optimisticEditsFor(machine.id)
-            synchronized(edits) {
-                while (edits.size >= MAX_OPTIMISTIC_EDITS) {
-                    edits.removeFirst()
+            // In the frame lock, a frame of a different step shows the edit, or the edit goes on top of that frame.
+            // The edit cannot show two times.
+            withFrames(machine.id) {
+                synchronized(edits) {
+                    while (edits.size >= MAX_OPTIMISTIC_EDITS) {
+                        edits.removeFirst()
+                    }
+                    edits.addLast(optimisticEdit)
                 }
-                edits.addLast(optimisticEdit)
-            }
-            val currentFrame = paneSurfaceBus.surfaceFor(machine.id)
-            if (currentFrame != null) {
-                val updatedFrame = applyOptimisticEditToFrame(currentFrame, optimisticEdit)
-                paneSurfaceBus.publish(machine.id, updatedFrame)
+                val currentFrame = paneSurfaceBus.surfaceFor(machine.id)
+                if (currentFrame != null) {
+                    val updatedFrame = applyOptimisticEditToFrame(currentFrame, optimisticEdit)
+                    framePublisher(machine.id, updatedFrame)
+                }
             }
         } else if (isControlInterruptEvent(event)) {
             val edits = optimisticEditsFor(machine.id)
@@ -1344,7 +1564,7 @@ internal class RealHerdrSshClient(
 
     /**
      * Queues `pane.scroll` for [paneId] to [offsetFromBottom] and shows the new position at once.
-     * One worker for each machine sends only the newest position, then reads that pane.
+     * One worker for each machine sends only the newest position of each pane, then reads that pane.
      */
     private fun requestPaneScroll(
         machine: HostMachine,
@@ -1354,8 +1574,11 @@ internal class RealHerdrSshClient(
     ) {
         val maxOffset = paneScrolls[machine.id]?.get(paneId)?.maxScrollback?.toInt() ?: 0
         val target = if (maxOffset > 0) offsetFromBottom.coerceIn(0, maxOffset) else offsetFromBottom.coerceAtLeast(0)
-        synchronized(paneScrollLock) {
-            pendingPaneScrolls[machine.id] = PendingPaneScroll(paneId, target)
+        withFrames(machine.id) { frames ->
+            val request = PaneScrollRequest(paneId, target, paneScrollSequence.incrementAndGet())
+            val requests = frames.scrollRequests.getOrPut(paneId) { PaneScrollRequests() }
+            requests.queued = request
+            requests.newest = request
             setLocalPaneScrollOffset(machine.id, paneId, target)
             republishCachedSurface(machine.id)
         }
@@ -1365,7 +1588,7 @@ internal class RealHerdrSshClient(
             job?.takeIf { it.isActive } ?: scope.launch {
                 for (trigger in signal) {
                     while (isActive) {
-                        val next = pendingPaneScrolls.remove(machine.id) ?: break
+                        val next = takeQueuedPaneScroll(machine.id) ?: break
                         sendPaneScroll(machine, route, next)
                     }
                 }
@@ -1374,10 +1597,17 @@ internal class RealHerdrSshClient(
         signal.trySend(Unit)
     }
 
+    /** Removes and returns the oldest request of [machineId] that the scroll worker did not send, or null. */
+    private fun takeQueuedPaneScroll(machineId: String): PaneScrollRequest? = withFrames(machineId) { frames ->
+        val next = frames.scrollRequests.values.mapNotNull { it.queued }.minByOrNull { it.seq }
+        next?.let { frames.scrollRequests[it.paneId]?.queued = null }
+        next
+    }
+
     private suspend fun sendPaneScroll(
         machine: HostMachine,
         route: ResolvedSshRoute,
-        scroll: PendingPaneScroll,
+        scroll: PaneScrollRequest,
     ) {
         val scrollLine = HerdrRpcBuilder.toNdjsonLine(
             HerdrRpcBuilder.paneScroll(paneId = scroll.paneId, offsetFromBottom = scroll.offsetFromBottom),
@@ -1393,10 +1623,17 @@ internal class RealHerdrSshClient(
                 ),
             )
             val paneAnsi = extractPaneAnsiFromResponse(out, scroll.paneId)
-            // In the lock, a new request cannot occur after the check or before the frame goes to the bus.
-            synchronized(paneScrollLock) {
-                // A newer request replaces this one. Keep the newer position on the screen.
-                if (pendingPaneScrolls[machine.id] == null) {
+            // In the lock, a new request or a poll cannot occur between these steps.
+            withFrames(machine.id) { frames ->
+                // [disconnect] removed the requests of the machine, so the answer has no use.
+                val requests = frames.scrollRequests[scroll.paneId] ?: return@withFrames
+                // A late answer of an older worker must not replace a newer answer.
+                if (scroll.seq > (requests.answered?.seq ?: 0L)) {
+                    requests.answered = scroll
+                    requests.answerHasText = paneAnsi != null
+                }
+                // A newer request of this pane replaces this one. Keep the newer position on the screen.
+                if (requests.queued == null) {
                     setLocalPaneScrollOffset(machine.id, scroll.paneId, scroll.offsetFromBottom)
                 }
                 if (paneAnsi != null) {
@@ -1409,6 +1646,17 @@ internal class RealHerdrSshClient(
                 }
             }
         }.onFailure { err ->
+            // [disconnect] cancels the worker. That is not a failure of the request.
+            if (err is CancellationException) throw err
+            withFrames(machine.id) { frames ->
+                val requests = frames.scrollRequests[scroll.paneId] ?: return@withFrames
+                if (scroll.seq > (requests.answered?.seq ?: 0L)) {
+                    requests.answered = scroll
+                    requests.answerHasText = false
+                }
+                // Herdr can have a different position, so a poll shows the position of Herdr for this pane.
+                if (requests.newest == scroll) requests.newest = null
+            }
             sshDebugLog.record(
                 machineId = machine.id,
                 tag = "RealSSH",
@@ -1426,9 +1674,10 @@ internal class RealHerdrSshClient(
         }
     }
 
+    /** Publishes a new frame of [machineId] from [cachedInputs]. The caller holds the frame lock of the machine. */
     private fun republishCachedSurface(machineId: String) {
         val cached = cachedInputs[machineId] ?: return
-        paneSurfaceBus.publish(
+        framePublisher(
             machineId,
             buildCompositeSurfaceFrame(
                 machineId = machineId,
@@ -1456,58 +1705,72 @@ internal class RealHerdrSshClient(
         }.toMap()
     }
 
+    /**
+     * Puts the pane text [paneAnsi] of [paneId] in [cachedInputs], and publishes the new frame of [machineId]. A
+     * [confirmedSeq] above zero also confirms the input events up to that number. The input flush, the input RPCs,
+     * and the scroll worker use it. It does all steps in the frame lock of the machine, so that a poll or a scroll
+     * request cannot occur between the build and the publish of the frame.
+     */
     private fun updateFocusedPaneSurfaceFromInput(
         machineId: String,
         paneId: String,
         paneAnsi: String,
         confirmedSeq: Long,
     ) {
-        if (confirmedSeq > 0L) {
-            lastInputConfirmedSeq.compute(machineId) { _, prev ->
-                if (prev == null || confirmedSeq > prev) confirmedSeq else prev
+        withFrames(machineId) {
+            if (confirmedSeq > 0L) {
+                lastInputConfirmedSeq.compute(machineId) { _, prev ->
+                    if (prev == null || confirmedSeq > prev) confirmedSeq else prev
+                }
+                retireOptimisticEditsUpTo(machineId, confirmedSeq)
             }
-            retireOptimisticEditsUpTo(machineId, confirmedSeq)
+
+            val updatedCache = cachedInputs.compute(machineId) { _, existing ->
+                if (existing == null) {
+                    null
+                } else {
+                    existing.copy(ansiByPane = existing.ansiByPane + (paneId to paneAnsi))
+                }
+            } ?: return
+
+            val frame = buildCompositeSurfaceFrame(
+                machineId = machineId,
+                snapshot = updatedCache.snapshot,
+                layout = updatedCache.layout,
+                ansiByPane = updatedCache.ansiByPane,
+            )
+            framePublisher(machineId, frame)
         }
-
-        val updatedCache = cachedInputs.compute(machineId) { _, existing ->
-            if (existing == null) {
-                null
-            } else {
-                existing.copy(ansiByPane = existing.ansiByPane + (paneId to paneAnsi))
-            }
-        } ?: return
-
-        val frame = buildCompositeSurfaceFrame(
-            machineId = machineId,
-            snapshot = updatedCache.snapshot,
-            layout = updatedCache.layout,
-            ansiByPane = updatedCache.ansiByPane,
-        )
-        paneSurfaceBus.publish(machineId, frame)
     }
 
+    /**
+     * Shows [paneId] as the focused pane at once, on [endpointSnapshotBus] and on [paneSurfaceBus]. It reads and
+     * publishes the two buses in the frame lock of the machine, so that a poll cannot publish between these steps.
+     */
     private fun applyOptimisticPaneFocus(machineId: String, paneId: String) {
-        val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId)
-        if (currentSnapshot != null && currentSnapshot.focusedPaneId != paneId) {
-            endpointSnapshotBus.publish(
-                machineId,
-                currentSnapshot.copy(
-                    revision = revisionCounter.incrementAndGet().toULong(),
-                    focusedPaneId = paneId,
-                    panes = currentSnapshot.panes.map { it.copy(focused = it.paneId == paneId) },
-                    agents = currentSnapshot.agents.map { it.copy(focused = it.paneId == paneId) },
-                ),
-            )
-        }
-        val currentSurface = paneSurfaceBus.surfaceFor(machineId)
-        if (currentSurface != null) {
-            paneSurfaceBus.publish(
-                machineId,
-                currentSurface.copy(
-                    revision = revisionCounter.incrementAndGet().toULong(),
-                    panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
-                ),
-            )
+        withFrames(machineId) {
+            val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId)
+            if (currentSnapshot != null && currentSnapshot.focusedPaneId != paneId) {
+                endpointSnapshotBus.publish(
+                    machineId,
+                    currentSnapshot.copy(
+                        revision = revisionCounter.incrementAndGet().toULong(),
+                        focusedPaneId = paneId,
+                        panes = currentSnapshot.panes.map { it.copy(focused = it.paneId == paneId) },
+                        agents = currentSnapshot.agents.map { it.copy(focused = it.paneId == paneId) },
+                    ),
+                )
+            }
+            val currentSurface = paneSurfaceBus.surfaceFor(machineId)
+            if (currentSurface != null) {
+                framePublisher(
+                    machineId,
+                    currentSurface.copy(
+                        revision = revisionCounter.incrementAndGet().toULong(),
+                        panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
+                    ),
+                )
+            }
         }
     }
 
@@ -2153,6 +2416,10 @@ internal class RealHerdrSshClient(
      * wait for the lane lock, for a reconnect, or for a new worker. The first batch of a new worker gives no time,
      * because it can include the start of the remote shell. A batch that needs a new worker after a failure gives no
      * time. See [timeRoundTrip].
+     *
+     * [onLaneLocked] runs when the batch has the lane lock, before the batch goes to the worker. The lane runs one batch
+     * at a time, so the order of these calls is the order of the batches on the lane. [remoteBatchExecutor] has no lane
+     * lock, so with it [onLaneLocked] runs just before the call.
      */
     private suspend fun executeBatchOnLane(
         machine: HostMachine,
@@ -2160,16 +2427,19 @@ internal class RealHerdrSshClient(
         lane: WorkerLane,
         commands: List<RemoteShellCommand>,
         onRoundTrip: ((Duration) -> Unit)? = null,
+        onLaneLocked: (() -> Unit)? = null,
     ): String {
         if (commands.isEmpty()) return ""
         val customExecutor = remoteBatchExecutor
         if (customExecutor != null) {
+            onLaneLocked?.invoke()
             return timeRoundTrip(machine.id, onRoundTrip) { customExecutor(machine, route, lane, commands) }
         }
         // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
         // the lane.
         awaitSession(machine)
         return laneMutexFor(machine.id, lane).withLock {
+            onLaneLocked?.invoke()
             val session = getOrOpenSession(machine, route)
             runCatching {
                 val worker = getOrOpenWorkerLocked(machine.id, lane, session)

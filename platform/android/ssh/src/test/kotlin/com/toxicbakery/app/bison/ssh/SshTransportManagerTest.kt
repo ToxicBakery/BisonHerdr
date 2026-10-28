@@ -4,6 +4,8 @@ import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.RoamingStatus
+import com.toxicbakery.app.bison.protocol.FrameData
+import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import java.io.IOException
 import java.net.ConnectException
 import kotlin.test.Test
@@ -41,8 +43,8 @@ class SshTransportManagerTest {
     private fun TestScope.manager(
         backend: SshBackend,
         timeSource: TimeSource = TimeSource.Monotonic,
+        surfaceBus: PaneSurfaceBus = PaneSurfaceBus(),
     ): SshTransportManager {
-        val surfaceBus = PaneSurfaceBus()
         return SshTransportManager(
             backend = backend,
             moshUdpEngine = MoshUdpEngine(sshDebugLog = debugLog, paneSurfaceBus = surfaceBus),
@@ -417,6 +419,22 @@ class SshTransportManagerTest {
             debugLog.entries.value.any { it.message == "Dispatched client_shell.surface.set { active: true }" },
             debugLogDump(),
         )
+    }
+
+    @Test
+    fun aSurfaceLeasePublishesTheFrameInTheFrameLockOfTheBackend() = runTest {
+        val backend = RecordingSshBackend()
+        val surfaceBus = PaneSurfaceBus()
+        val manager = manager(backend, surfaceBus = surfaceBus)
+        connectAll(manager, backend, lanBox)
+        surfaceBus.publish(lanBox.id, PaneSurfaceFrame(frame = FrameData(width = 80u, height = 24u)))
+        val epochsAtLockEnd = mutableListOf<ULong?>()
+        backend.onFrameLockEnd = { machineId -> epochsAtLockEnd += surfaceBus.surfaceFor(machineId)?.presentationEpoch }
+
+        manager.setSurfaceLease(lanBox.id, active = true)
+
+        val epoch = assertNotNull(assertNotNull(surfaceBus.surfaceFor(lanBox.id)).presentationEpoch)
+        assertEquals(listOf<ULong?>(epoch), epochsAtLockEnd, "The manager must publish the frame in the frame lock")
     }
 
     @Test
