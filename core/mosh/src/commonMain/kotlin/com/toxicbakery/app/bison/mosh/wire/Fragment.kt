@@ -63,9 +63,12 @@ class Fragment(
 
         private const val FINAL_FLAG = 0x8000
 
-        /** Reads a fragment from [length] bytes of [bytes] at [offset]. Returns null when it has no full header. */
+        /**
+         * Reads a fragment from [length] bytes of [bytes] at [offset]. Returns null when the range is not in [bytes],
+         * or when the range has no full header.
+         */
         fun decode(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Fragment? {
-            if (length < HEADER_SIZE) return null
+            if (offset < 0 || length < HEADER_SIZE || length > bytes.size - offset) return null
             val word = bytes.readShortAt(offset + Long.SIZE_BYTES)
             return Fragment(
                 instructionId = bytes.readLongAt(offset).toULong(),
