@@ -360,7 +360,8 @@ class SshTransportManager(
      *
      * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
      * - While the lease is off, the poll of the backend reads no snapshot and no panes. Thus the SSH session stays
-     *   open with no terminal traffic. This version does not send `client_shell.surface.set` to the Herdr server.
+     *   open with no terminal traffic. Only a reconnect causes one read of the snapshot and the panes
+     *   ([restoreAfterReconnect]). This version does not send `client_shell.surface.set` to the Herdr server.
      * - When the lease comes on (`active == true`), the manager publishes the last [PaneSurfaceFrame] again with a
      *   new presentation epoch, and the next poll reads the new state. The app does not send
      *   `endpoint.presentation.ready.v1` in this version.

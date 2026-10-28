@@ -521,10 +521,19 @@ class SshTransportManagerTest {
         manager.setSurfaceLease(lanBox.id, active = false)
         val events = assertNotNull(backend.sessionEvents)
 
+        assertTrue(
+            debugLog.entries.value.any {
+                it.message.startsWith("Surface lease off: the poll reads no snapshot and no panes.")
+            },
+            debugLogDump(),
+        )
+
         events.onReconnecting(lanBox.id, null)
         events.onReconnected(lanBox.id)
 
         assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value[lanBox.id])
+        // The reconnect reads the surface one time, also while the lease is off.
+        assertEquals(listOf("refreshSurface lan-box"), backend.calls)
     }
 
     @Test
