@@ -120,7 +120,7 @@ class MainActivity : FragmentActivity(), DIAware {
         // The service is the only collector of the request queue, so start it before the requests.
         // The service can stop itself while this activity is stopped.
         startSessionService()
-        // Resume active terminal surface leases (<50ms Endpoint resync / <20ms Mosh UDP SSP wakeup)
+        // Resume active terminal surface leases (<50ms Endpoint resync)
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(
@@ -136,7 +136,7 @@ class MainActivity : FragmentActivity(), DIAware {
     override fun onStop() {
         super.onStop()
         startedActivityCounter.onActivityStopped()
-        // Park active terminal surfaces at 0 bytes/sec while keeping control stream & Mosh session alive
+        // Park active terminal surfaces at 0 bytes/sec while keeping the control stream alive
         lifecycleScope.launch {
             for (machineId in sshStateManager.connectedMachines.value) {
                 sshRequestManager.emit(

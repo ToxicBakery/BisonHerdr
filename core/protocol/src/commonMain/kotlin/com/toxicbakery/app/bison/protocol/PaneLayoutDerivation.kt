@@ -6,7 +6,7 @@ import kotlinx.serialization.Serializable
 
 /**
  * Response payload from `pane.layout` used to synthesize `PaneSurfaceSplit` hit rects
- * and BSP paths when running on the Mosh UDP SSP backbone.
+ * and BSP paths.
  */
 @Serializable
 data class PaneLayoutSnapshot(

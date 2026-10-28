@@ -43,6 +43,10 @@ import kotlinx.coroutines.withContext
  * of the machine, because machines can share a key alias. [authenticate] waits for the answer for
  * [USER_AUTH_TIMEOUT_MS] at most. The bastion of a ProxyJump machine logs in with the same key, so the one
  * prompt also unlocks the bastion login.
+ *
+ * The backbone is always [ActiveBackbone.SshEndpoint], because this version has no Mosh transport (issue #22). The
+ * client measures the poll time, and the backend puts its average in the backbone with
+ * [SshStateManager.setRoundTripTime]. See [RealHerdrSshClient.refreshSnapshotAndSurface].
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -76,6 +80,10 @@ class RealSshBackend internal constructor(
         sshStateManager = sshStateManager,
         keystoreKeyManager = keystoreKeyManager,
     )
+
+    init {
+        client.roundTripListener = sshStateManager::setRoundTripTime
+    }
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
         val keyAuth = machine.authMethod as? SshAuthMethod.KeystoreKey
@@ -116,26 +124,20 @@ class RealSshBackend internal constructor(
         )
     }
 
-    override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone {
+    /**
+     * Returns the SSH endpoint bridge for each [TransportMode], because this version has no Mosh transport
+     * (issue #22). When the mode permits Mosh, the backend checks for `mosh-server` on the host. The fallback reason
+     * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
+     *
+     * The poll time is [ActiveBackbone.UNMEASURED_RTT_MS] until the poll measures the first batch.
+     */
+    override suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone.SshEndpoint {
         sshStateManager.setConnectionProgress(machine.id, ConnectionProgress.VerifyingUdpOrHello)
-        val hasMosh = if (machine.transportMode != TransportMode.SshEndpointOnly) {
+        val hasMoshServer = machine.transportMode != TransportMode.SshEndpointOnly &&
             client.checkMoshServerAvailable(machine, route)
-        } else {
-            false
-        }
-        return if (hasMosh) {
-            ActiveBackbone.MoshUdp(
-                udpPort = machine.parsedMoshPortRange().first,
-                rttMs = 9,
-                localEchoEnabled = true,
-                roamedCount = 0,
-            )
-        } else {
-            ActiveBackbone.SshEndpoint(
-                rttMs = 12,
-                fallbackReason = null,
-            )
-        }
+        val reason = MoshSessionEngine.fallbackReasonFor(machine.transportMode, hasMoshServer)
+        reason?.let { client.recordTransport(machine.id, it) }
+        return ActiveBackbone.SshEndpoint(rttMs = ActiveBackbone.UNMEASURED_RTT_MS, fallbackReason = reason)
     }
 
     override suspend fun openSurface(

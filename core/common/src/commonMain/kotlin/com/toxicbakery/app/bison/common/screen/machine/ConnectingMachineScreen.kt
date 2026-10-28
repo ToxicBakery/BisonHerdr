@@ -53,6 +53,10 @@ import com.toxicbakery.app.bison.common.navigation.NavigationController
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_connecting_log_empty
+import com.toxicbakery.app.bison.resources.machine_connecting_progress_title
+import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.viewmodel.rememberViewModel
 
 /** Test tag of the text that tells why the connection stopped. */
@@ -187,14 +191,14 @@ fun ConnectingMachineScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             Text(
-                                text = "Dual-Transport Bootstrap Progress",
+                                text = stringResource(Res.string.machine_connecting_progress_title),
                                 style = MaterialTheme.typography.titleSmall,
                                 color = palette.accentPrimary,
                                 fontWeight = FontWeight.SemiBold,
                             )
                             val backboneBadge = when (val bb = activeBackbone) {
-                                is ActiveBackbone.MoshUdp -> "MOSH UDP :${bb.udpPort} (${bb.rttMs}ms)"
-                                is ActiveBackbone.SshEndpoint -> "SSH ENDPOINT (${bb.rttMs}ms)"
+                                is ActiveBackbone.MoshUdp -> "MOSH UDP :${bb.udpPort} (${pollTimeText(bb)})"
+                                is ActiveBackbone.SshEndpoint -> "SSH ENDPOINT (${pollTimeText(bb)})"
                                 null -> progress.name
                             }
                             Text(
@@ -262,7 +266,7 @@ fun ConnectingMachineScreen(
                     }
                 }
 
-                // Live SSH / Mosh Transport Diagnostic Log
+                // Live SSH Transport Diagnostic Log
                 Surface(
                     color = palette.bgSurface,
                     shape = RoundedCornerShape(14.dp),
@@ -297,7 +301,7 @@ fun ConnectingMachineScreen(
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     Text(
-                                        text = "Waiting for SSH2 / Mosh UDP SSP diagnostic events...",
+                                        text = stringResource(Res.string.machine_connecting_log_empty),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = palette.fgMuted,
                                         fontFamily = FontFamily.Monospace,

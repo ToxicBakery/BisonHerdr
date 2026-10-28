@@ -7,7 +7,6 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.CellData
-import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellAgent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
@@ -21,25 +20,16 @@ import com.toxicbakery.app.bison.protocol.CursorState
 import com.toxicbakery.app.bison.protocol.EndpointClientHello
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
-import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
-import com.toxicbakery.app.bison.protocol.MoshConnectInfo
-import com.toxicbakery.app.bison.protocol.PaneLayoutPane
-import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
-import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
-import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_COLS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.DEFAULT_ROWS
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.HARDWARE_KEY_NOT_SUPPORTED
-import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.MOSH_UDP_HANDSHAKE_TIMEOUT_MS
-import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildMoshServerBootstrapCommand
 import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.buildSshEndpointBridgeCommand
 import java.io.IOException
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -51,11 +41,12 @@ import kotlinx.serialization.json.jsonPrimitive
  * The debug bindings use this backend only for the machines that the fake server made. This class is in
  * the `src/debug` source set, so the release variant does not compile it and release builds do not contain it.
  *
- * The test hooks [moshBootstrapBannerProvider], [moshUdpReachabilityProbe], [sshRouteProbe], and
- * [passwordAuthenticator] change the simulated results.
+ * The backend gives the same backbone as [RealSshBackend]: the SSH endpoint bridge, because this version has no Mosh
+ * transport (issue #22). The round trip time is [SIMULATED_RTT_MS].
+ *
+ * The test hooks [moshServerProbe], [sshRouteProbe], and [passwordAuthenticator] change the simulated results.
  */
 class SimulatedSshBackend(
-    private val moshUdpEngine: MoshUdpEngine,
     private val sshStateManager: SshStateManager,
     private val sshDebugLog: SshDebugLog,
     private val endpointSnapshotBus: EndpointSnapshotBus,
@@ -63,8 +54,8 @@ class SimulatedSshBackend(
     private val semanticNotificationBus: SemanticNotificationBus,
     private val keystoreKeyManager: AndroidKeystoreKeyManager,
 ) : SshBackend {
-    internal var moshBootstrapBannerProvider: ((HostMachine) -> String?)? = null
-    internal var moshUdpReachabilityProbe: (suspend (HostMachine, MoshConnectInfo) -> Boolean)? = null
+    /** Returns true when the simulated host has `mosh-server`. With no hook, each simulated host has it. */
+    internal var moshServerProbe: ((HostMachine) -> Boolean)? = null
     internal var sshRouteProbe: (suspend (HostMachine, ResolvedSshRoute) -> Boolean)? = null
     internal var passwordAuthenticator: (suspend (HostMachine, SshAuthMethod.Password) -> Boolean)? = null
 
@@ -143,78 +134,23 @@ class SimulatedSshBackend(
         }
     }
 
+    /**
+     * Returns the SSH endpoint bridge with [SIMULATED_RTT_MS], as [RealSshBackend] does. This version has no Mosh
+     * transport (issue #22). [moshServerProbe] tells if the simulated host has `mosh-server`. The fallback reason
+     * comes from [MoshSessionEngine.fallbackReasonFor], and the backend writes it to the debug log.
+     */
     override suspend fun negotiateBackbone(
         machine: HostMachine,
         route: ResolvedSshRoute,
-    ): ActiveBackbone? {
+    ): ActiveBackbone.SshEndpoint {
         val machineId = machine.id
-        var moshFallbackReason: String? = null
-        if (machine.transportMode != TransportMode.SshEndpointOnly) {
-            val bootstrapCmd = buildMoshServerBootstrapCommand(machine)
-            val configToml = MoshBootstrapConfig.buildTabletHerdrConfigToml()
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "MoshBootstrap",
-                message = "Executing: $bootstrapCmd (configBytes=${configToml.length})",
-            )
-
-            val defaultPort = machine.parsedMoshPortRange().first
-            val banner = moshBootstrapBannerProvider?.invoke(machine)
-                ?: "MOSH CONNECT $defaultPort 4k9X2vL8pQ1mN7rT3wY6zA"
-            val connectInfo = MoshBootstrapConfig.parseMoshConnectLine(banner)
-
-            if (connectInfo != null) {
-                sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
-                val udpVerified = withTimeoutOrNull(MOSH_UDP_HANDSHAKE_TIMEOUT_MS) {
-                    val probeAllowed = moshUdpReachabilityProbe?.invoke(machine, connectInfo) ?: true
-                    if (!probeAllowed) {
-                        false
-                    } else {
-                        moshUdpEngine.startSession(
-                            machineId = machineId,
-                            host = route.targetHost,
-                            udpPort = connectInfo.udpPort,
-                            sessionKey = connectInfo.sessionKey,
-                            cols = DEFAULT_COLS,
-                            rows = DEFAULT_ROWS,
-                            localEcho = true,
-                        )
-                    }
-                } == true
-
-                if (udpVerified) {
-                    return ActiveBackbone.MoshUdp(
-                        udpPort = connectInfo.udpPort,
-                        rttMs = 11,
-                        localEchoEnabled = true,
-                        roamedCount = 0,
-                    )
-                }
-                moshUdpEngine.stopSession(machineId)
-                moshFallbackReason = "Mosh UDP unreachable or blocked by firewall (${MOSH_UDP_HANDSHAKE_TIMEOUT_MS}ms timeout)"
-            } else {
-                moshFallbackReason = "mosh-server unavailable on remote host"
-            }
-
-            if (machine.transportMode == TransportMode.MoshOnly) {
-                sshDebugLog.record(
-                    machineId = machineId,
-                    tag = "MoshBootstrap",
-                    message = "MoshOnly mode requested, but mosh-server or UDP handshake failed ($moshFallbackReason)",
-                    isError = true,
-                )
-                return null
-            }
-
-            sshDebugLog.record(
-                machineId = machineId,
-                tag = "Fallback",
-                message = "$moshFallbackReason; falling back to ${buildSshEndpointBridgeCommand()}",
-            )
-        }
-
-        // SSH Endpoint Generation 1 fallback (`herdr remote-client-bridge --idle-timeout-v1`)
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.VerifyingUdpOrHello)
+        val hasMoshServer = machine.transportMode != TransportMode.SshEndpointOnly &&
+            (moshServerProbe?.invoke(machine) ?: true)
+        val reason = MoshSessionEngine.fallbackReasonFor(machine.transportMode, hasMoshServer)
+        reason?.let { sshDebugLog.record(machineId = machineId, tag = "Transport", message = it) }
+
+        // SSH Endpoint Generation 1 (`herdr remote-client-bridge --idle-timeout-v1`)
         val hello = EndpointClientHello(
             surfaceSize = ClientSurfaceSize(cols = DEFAULT_COLS, rows = DEFAULT_ROWS),
             surfaceActive = true,
@@ -225,12 +161,8 @@ class SimulatedSshBackend(
             message = "Negotiated ${buildSshEndpointBridgeCommand()} (hello.generation=${hello.generation}, surfaceActive=${hello.surfaceActive})",
         )
         return ActiveBackbone.SshEndpoint(
-            rttMs = 24,
-            fallbackReason = if (machine.transportMode == TransportMode.AutoPreferMosh) {
-                moshFallbackReason ?: "Mosh UDP unavailable"
-            } else {
-                null
-            },
+            rttMs = SIMULATED_RTT_MS,
+            fallbackReason = reason,
         )
     }
 
@@ -241,7 +173,6 @@ class SimulatedSshBackend(
         isSurfaceActive: () -> Boolean,
     ) {
         val machineId = machine.id
-        val isMosh = backbone is ActiveBackbone.MoshUdp
 
         // Fetch initial pane.layout and agent.read(source = "visible") over herdr remote-api-bridge
         recordApiBridgeRpc(machineId, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
@@ -343,13 +274,7 @@ class SimulatedSshBackend(
             endpointSnapshotBus.publish(machineId, snapshot)
         }
 
-        if (isMosh) {
-            moshUdpEngine.updateLayoutSnapshot(
-                machineId = machineId,
-                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = "w1:p1"),
-                tabCount = 1,
-            )
-        } else if (paneSurfaceBus.surfaceFor(machineId) == null) {
+        if (paneSurfaceBus.surfaceFor(machineId) == null) {
             val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
             val initialFrame = PaneSurfaceFrame(
                 bootId = "boot-$machineId",
@@ -384,7 +309,7 @@ class SimulatedSshBackend(
         semanticNotificationBus.updateAgentSnippet(
             machineId = machineId,
             paneId = "w1:p1",
-            snippet = "Connected to ${machine.displayAddress} via ${if (isMosh) "Mosh UDP SSP" else "SSH Endpoint Gen 1"}",
+            snippet = "Connected to ${machine.displayAddress} via SSH Endpoint Gen 1",
         )
         semanticNotificationBus.tryPublishNotification(
             machineId = machineId,
@@ -392,7 +317,7 @@ class SimulatedSshBackend(
                 bootId = "boot-$machineId",
                 sequence = 1u,
                 title = "Connected to ${machine.name}",
-                body = if (isMosh) "Mosh UDP SSP zero-drop roaming active" else "SSH Endpoint Gen 1 active",
+                body = "SSH Endpoint Gen 1 active",
                 paneId = "w1:p1",
                 agentName = "claude",
                 agentStatus = AgentStatus.Working,
@@ -409,30 +334,22 @@ class SimulatedSshBackend(
         request: ClientShellEndpointRequest,
         isMoshActive: Boolean,
     ): String? {
-        applyFocusRpcMutation(machine.id, request, isMoshActive)
+        applyFocusRpcMutation(machine.id, request)
         return null
     }
 
+    /** The simulated host has no terminal, so the input has no effect. */
     override suspend fun sendInput(
         machine: HostMachine,
         route: ResolvedSshRoute,
         paneId: String,
         event: ClientPaneInputEvent,
-    ): Boolean {
-        val backbone = sshStateManager.activeTransportBackbone.value[machine.id]
-        if (backbone is ActiveBackbone.MoshUdp) {
-            val bytes = encodeInputEventToBytes(event)
-            if (bytes.isNotEmpty()) {
-                moshUdpEngine.sendInput(machine.id, bytes)
-            }
-        }
-        return true
-    }
+    ): Boolean = true
 
-    /** The simulated host has no viewport. [SshTransportManager] resizes the Mosh engine. */
+    /** The simulated host has no viewport. */
     override fun resize(machineId: String, cols: UShort, rows: UShort) = Unit
 
-    /** The simulated host has no session. [SshTransportManager] stops the Mosh engine. */
+    /** The simulated host has no session. */
     override fun disconnect(machineId: String) = Unit
 
     /**
@@ -447,36 +364,6 @@ class SimulatedSshBackend(
         )
     }
 
-    private fun buildTwoPaneLayoutSnapshot(focusedPaneId: String): PaneLayoutSnapshot {
-        val halfCols = (DEFAULT_COLS.toInt() / 2).toUShort()
-        val rightCols = (DEFAULT_COLS - halfCols).toUShort()
-        return PaneLayoutSnapshot(
-            workspaceId = "w1",
-            tabId = "w1:t1",
-            zoomed = false,
-            panes = listOf(
-                PaneLayoutPane(
-                    paneId = "w1:p1",
-                    rect = SurfaceRect(0u, 0u, halfCols, DEFAULT_ROWS),
-                    focused = focusedPaneId == "w1:p1",
-                ),
-                PaneLayoutPane(
-                    paneId = "w1:p2",
-                    rect = SurfaceRect(halfCols, 0u, rightCols, DEFAULT_ROWS),
-                    focused = focusedPaneId == "w1:p2",
-                ),
-            ),
-            splits = listOf(
-                PaneLayoutSplit(
-                    id = "s0:root",
-                    direction = PaneSurfaceSplitDirection.Vertical,
-                    ratio = 0.5f,
-                    rect = SurfaceRect(0u, 0u, DEFAULT_COLS, DEFAULT_ROWS),
-                ),
-            ),
-        )
-    }
-
     private fun parseParamsObject(paramsJson: String): JsonObject =
         runCatching { json.parseToJsonElement(paramsJson).jsonObject }
             .getOrElse { JsonObject(emptyMap()) }
@@ -484,7 +371,6 @@ class SimulatedSshBackend(
     private fun applyFocusRpcMutation(
         machineId: String,
         request: ClientShellEndpointRequest,
-        isMoshActive: Boolean,
     ) {
         val currentSnapshot = endpointSnapshotBus.snapshotFor(machineId) ?: return
 
@@ -514,7 +400,7 @@ class SimulatedSshBackend(
             "pane.focus" -> {
                 val params = parseParamsObject(request.paramsJson)
                 val paneId = params["pane_id"]?.jsonPrimitive?.content ?: return
-                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, paneId, isMoshActive)
+                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, paneId)
             }
 
             "agent.focus" -> {
@@ -524,7 +410,7 @@ class SimulatedSshBackend(
                 val resolvedPaneId = requestedPaneId
                     ?: currentSnapshot.agents.firstOrNull { it.name == requestedName }?.paneId
                     ?: return
-                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, resolvedPaneId, isMoshActive)
+                focusPaneInSnapshotAndSurface(machineId, currentSnapshot, resolvedPaneId)
             }
         }
     }
@@ -533,7 +419,6 @@ class SimulatedSshBackend(
         machineId: String,
         currentSnapshot: ClientShellSnapshot,
         paneId: String,
-        isMoshActive: Boolean,
     ) {
         val updatedSnapshot = currentSnapshot.copy(
             revision = currentSnapshot.revision + 1u,
@@ -543,85 +428,22 @@ class SimulatedSshBackend(
         )
         endpointSnapshotBus.publish(machineId, updatedSnapshot)
 
-        if (isMoshActive) {
-            moshUdpEngine.updateLayoutSnapshot(
+        val currentSurface = paneSurfaceBus.surfaceFor(machineId)
+        if (currentSurface != null) {
+            paneSurfaceBus.publish(
                 machineId = machineId,
-                layout = buildTwoPaneLayoutSnapshot(focusedPaneId = paneId),
-                tabCount = updatedSnapshot.tabs.size.coerceAtLeast(1),
+                frame = currentSurface.copy(
+                    revision = currentSurface.revision + 1u,
+                    panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
+                ),
             )
-        } else {
-            val currentSurface = paneSurfaceBus.surfaceFor(machineId)
-            if (currentSurface != null) {
-                paneSurfaceBus.publish(
-                    machineId = machineId,
-                    frame = currentSurface.copy(
-                        revision = currentSurface.revision + 1u,
-                        panes = currentSurface.panes.map { it.copy(focused = it.paneId == paneId) },
-                    ),
-                )
-            }
         }
     }
 
-    private fun encodeInputEventToBytes(event: ClientPaneInputEvent): ByteArray =
-        when (event) {
-            is ClientPaneInputEvent.TextCommit -> event.text.encodeToByteArray()
-            is ClientPaneInputEvent.Paste -> event.text.encodeToByteArray()
-            is ClientPaneInputEvent.Key -> encodeKeyEventToBytes(event)
-            is ClientPaneInputEvent.Mouse -> EMPTY_BYTES
-        }
+    internal companion object {
+        /** The round trip time of the backbone of a simulated host. */
+        const val SIMULATED_RTT_MS: Int = 24
 
-    private fun encodeKeyEventToBytes(keyEvent: ClientPaneInputEvent.Key): ByteArray {
-        val ev = keyEvent.event
-        return when (ev.code) {
-            ClientKeyCode.Enter -> ENTER_BYTES
-            ClientKeyCode.Escape -> ESCAPE_BYTES
-            ClientKeyCode.Tab -> TAB_BYTES
-            ClientKeyCode.Backspace -> BACKSPACE_BYTES
-            ClientKeyCode.Up -> UP_BYTES
-            ClientKeyCode.Down -> DOWN_BYTES
-            ClientKeyCode.Right -> RIGHT_BYTES
-            ClientKeyCode.Left -> LEFT_BYTES
-            ClientKeyCode.Home -> HOME_BYTES
-            ClientKeyCode.End -> END_BYTES
-            ClientKeyCode.PageUp -> PAGE_UP_BYTES
-            ClientKeyCode.PageDown -> PAGE_DOWN_BYTES
-            ClientKeyCode.Delete -> DELETE_BYTES
-            ClientKeyCode.CharC -> if (ev.ctrl) CTRL_C_BYTES else CHAR_C_BYTES
-            ClientKeyCode.CharB -> if (ev.ctrl) CTRL_B_BYTES else CHAR_B_BYTES
-            ClientKeyCode.CharD -> if (ev.ctrl) CTRL_D_BYTES else CHAR_D_BYTES
-            ClientKeyCode.CharZ -> if (ev.ctrl) CTRL_Z_BYTES else CHAR_Z_BYTES
-            ClientKeyCode.CharY -> CHAR_Y_BYTES
-            ClientKeyCode.CharN -> CHAR_N_BYTES
-        }
-    }
-
-    private companion object {
-        val BLANK_CELL = CellData()
-
-        val EMPTY_BYTES = ByteArray(0)
-        val ENTER_BYTES = "\r".encodeToByteArray()
-        val ESCAPE_BYTES = "\u001b".encodeToByteArray()
-        val TAB_BYTES = "\t".encodeToByteArray()
-        val BACKSPACE_BYTES = "\u007f".encodeToByteArray()
-        val UP_BYTES = "\u001b[A".encodeToByteArray()
-        val DOWN_BYTES = "\u001b[B".encodeToByteArray()
-        val RIGHT_BYTES = "\u001b[C".encodeToByteArray()
-        val LEFT_BYTES = "\u001b[D".encodeToByteArray()
-        val HOME_BYTES = "\u001b[H".encodeToByteArray()
-        val END_BYTES = "\u001b[F".encodeToByteArray()
-        val PAGE_UP_BYTES = "\u001b[5~".encodeToByteArray()
-        val PAGE_DOWN_BYTES = "\u001b[6~".encodeToByteArray()
-        val DELETE_BYTES = "\u001b[3~".encodeToByteArray()
-        val CTRL_C_BYTES = byteArrayOf(0x03)
-        val CTRL_B_BYTES = byteArrayOf(0x02)
-        val CTRL_D_BYTES = byteArrayOf(0x04)
-        val CTRL_Z_BYTES = byteArrayOf(0x1a)
-        val CHAR_C_BYTES = "c".encodeToByteArray()
-        val CHAR_B_BYTES = "b".encodeToByteArray()
-        val CHAR_D_BYTES = "d".encodeToByteArray()
-        val CHAR_Z_BYTES = "z".encodeToByteArray()
-        val CHAR_Y_BYTES = "y".encodeToByteArray()
-        val CHAR_N_BYTES = "n".encodeToByteArray()
+        private val BLANK_CELL = CellData()
     }
 }

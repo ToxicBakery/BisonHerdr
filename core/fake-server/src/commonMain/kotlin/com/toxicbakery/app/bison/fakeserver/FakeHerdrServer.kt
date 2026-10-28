@@ -28,6 +28,7 @@ import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.MoshSessionEngine
 import com.toxicbakery.app.bison.ssh.PaneSurfaceBus
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshDebugLog
@@ -48,7 +49,7 @@ import kotlinx.serialization.json.jsonPrimitive
 /**
  * Simulated multi-machine Herdr server for debug / demo builds (`DemoActivity`).
  *
- * Seeds two realistic machines (`workbox` over Mosh UDP `:60004` at `11ms` RTT with local predictive echo,
+ * Seeds two realistic machines (`workbox` over SSH Endpoint Gen 1 at `11ms` RTT with local predictive echo,
  * and `gpu-rig` over SSH Endpoint Gen 1 at `28ms` RTT), multiple workspaces & Git worktrees, tabs,
  * a 3-pane BSP split terminal layout with TrueColor cells matching the Zen Canvas specification,
  * and federated coding agents (`Claude Code` in `Blocked` state, `Codex CLI` in `Working` state,
@@ -240,7 +241,7 @@ class FakeHerdrServer(
                     paneId = "w1:p2",
                     workspaceId = "w1",
                     tabId = "w1:t1",
-                    label = "Mosh UDP · Pane #2",
+                    label = "SSH Endpoint · Pane #2",
                     cwd = "/home/ian/workspace/herdr-tablet/rust/herdr-mobile-core",
                     foregroundCwd = "/home/ian/workspace/herdr-tablet/rust/herdr-mobile-core",
                     focused = false,
@@ -375,11 +376,10 @@ class FakeHerdrServer(
             ),
         )
 
-        val workboxBackbone = ActiveBackbone.MoshUdp(
-            udpPort = 60004,
+        // This version has no Mosh transport (issue #22), so each machine uses the SSH endpoint bridge.
+        val workboxBackbone = ActiveBackbone.SshEndpoint(
             rttMs = 11,
-            localEchoEnabled = true,
-            roamedCount = 0,
+            fallbackReason = MoshSessionEngine.MOSH_SERVER_FOUND,
         )
         val gpuRigBackbone = ActiveBackbone.SshEndpoint(
             rttMs = 28,
@@ -429,8 +429,8 @@ class FakeHerdrServer(
         )
         sshDebugLog.record(
             machineId = WORKBOX_ID,
-            tag = "MOSH",
-            message = "MOSH CONNECT 60004 · AES-128-OCB UDP SSP active (11ms RTT, local echo ON)",
+            tag = "ENDPOINT",
+            message = "Endpoint Generation 1 connected (shell.snapshot.v1 + surface_delta, 11ms RTT, local echo ON)",
         )
         sshDebugLog.record(
             machineId = GPU_RIG_ID,
@@ -1017,7 +1017,7 @@ class FakeHerdrServer(
             hostname = "$machineId.tailnet.ts.net",
             username = "ian",
         ).also { fakeMachineIds = fakeMachineIds + machineId }
-        val backbone = ActiveBackbone.MoshUdp(udpPort = 60008, rttMs = 14, localEchoEnabled = true)
+        val backbone = ActiveBackbone.SshEndpoint(rttMs = 14)
         val snapshot = machineStates[WORKBOX_ID]?.snapshot?.copy(bootId = "boot-$machineId")
             ?: ClientShellSnapshot(bootId = "boot-$machineId", revision = 1u)
         return SimulatedMachineState(
@@ -1101,7 +1101,7 @@ class FakeHerdrServer(
                     scroll = PaneSurfaceScroll(offsetFromBottom = 0u, maxScrollback = 80u, viewportRows = topRightHeight.toUShort()),
                     focused = focusedPaneId == "w1:p2",
                     zoomed = false,
-                    title = "Mosh UDP · Pane #2",
+                    title = "SSH Endpoint · Pane #2",
                     agentStatus = AgentStatus.Idle,
                 ),
                 PaneSurfacePane(
@@ -1154,7 +1154,7 @@ class FakeHerdrServer(
         // Render Left Pane (or Zoomed Pane)
         val leftLines = buildList {
             add(StyledLine("╭─ Claude Code · Pane #1 (${if (focusedPaneId == "w1:p1") "Focused" else "Ready"}) ─ [$wsTitle:$wsBranch] ─╮", accentGold, bold = true))
-            add(StyledLine("│ Host: ${state.machine.name} (Mosh UDP SSP :60004) · Local Echo: ON · 11ms RTT │", dimText))
+            add(StyledLine("│ Host: ${state.machine.name} (SSH Endpoint Gen 1) · Local Echo: ON · 11ms RTT │", dimText))
             add(StyledLine("╰────────────────────────────────────────────────────────────────────╯", accentGold))
             add(StyledLine("", warmText))
             add(StyledLine("● Inspecting platform/android/di/SshModule.kt", greenOk))
@@ -1178,12 +1178,12 @@ class FakeHerdrServer(
         writeLinesIntoRect(cells, totalCols, totalRows, leftRect, leftLines)
 
         if (!isZoomed) {
-            // Render Top-Right Pane (Pane #2: Mosh UDP SSP Diagnostics)
+            // Render Top-Right Pane (Pane #2: SSH Endpoint Diagnostics)
             val topRightLines = listOf(
-                StyledLine("╭─ Mosh UDP SSP · Pane #2 ─────────────────────────╮", mauvePurple, bold = true),
-                StyledLine("$ mosh-server new -s -c 256 -- env HERDR_CONFIG_PATH=... herdr", warmText),
-                StyledLine("MOSH CONNECT 60004 4k9X2vL8pQ1mN7zR3wT6yA", accentGold, bold = true),
-                StyledLine("✓ Zero-drop UDP roaming armed (AES-128-OCB · 11ms)", greenOk),
+                StyledLine("╭─ SSH Endpoint · Pane #2 ─────────────────────────╮", mauvePurple, bold = true),
+                StyledLine("$ herdr remote-client-bridge --idle-timeout-v1", warmText),
+                StyledLine("Endpoint Gen 1 hello (surface_active: true)", accentGold, bold = true),
+                StyledLine("✓ Reconnect after a network change: ready (11ms)", greenOk),
                 StyledLine("✓ Sideband: shell.snapshot.v1 + surface_delta Ready", greenOk),
                 StyledLine("✓ Background Lease: client_shell.surface.set Ready", dimText),
             )

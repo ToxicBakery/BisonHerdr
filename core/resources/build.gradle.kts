@@ -43,8 +43,6 @@ val localizationCheck = tasks.register<LocalizationCheckTask>("localizationCheck
         "app_name",
         "app_demo_name",
         "app_version_label",
-        "transport_badge_mosh_udp",
-        "transport_badge_mosh_roamed",
         "transport_badge_ssh_tcp",
     )
     reportFile = layout.buildDirectory.file("reports/localization/strings.txt")

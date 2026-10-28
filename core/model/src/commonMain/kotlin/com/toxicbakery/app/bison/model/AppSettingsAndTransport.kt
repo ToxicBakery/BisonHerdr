@@ -48,10 +48,16 @@ data class AppSettings(
  */
 @Serializable
 sealed interface ActiveBackbone {
+    /**
+     * The average poll time of the session in milliseconds: the time of one poll command batch on the SSH session.
+     * It includes the run time of the Herdr commands on the host, so it is more than the network round trip time.
+     * It is [UNMEASURED_RTT_MS] until the app measures the first poll.
+     */
     val rttMs: Int
 
     /**
-     * Primary Mosh UDP SSP (`AES-128-OCB`) backbone paired with Herdr's Endpoint/API control sideband.
+     * Mosh UDP SSP (`AES-128-OCB`) backbone paired with Herdr's Endpoint/API control sideband. This version never
+     * selects it, because the Mosh transport is planned (issue #22).
      */
     @Serializable
     @SerialName("mosh_udp")
@@ -63,7 +69,8 @@ sealed interface ActiveBackbone {
     ) : ActiveBackbone
 
     /**
-     * Fallback SSH TCP Endpoint Generation 1 stream (`herdr remote-client-bridge`).
+     * SSH TCP Endpoint Generation 1 stream (`herdr remote-client-bridge`). This version uses it for each machine.
+     * [fallbackReason] tells why the app does not use Mosh, or is null.
      */
     @Serializable
     @SerialName("ssh_endpoint")
@@ -71,6 +78,11 @@ sealed interface ActiveBackbone {
         override val rttMs: Int,
         val fallbackReason: String? = null,
     ) : ActiveBackbone
+
+    companion object {
+        /** The [rttMs] of a backbone before the app measures the first poll. */
+        const val UNMEASURED_RTT_MS: Int = 0
+    }
 }
 
 /**

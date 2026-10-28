@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.toxicbakery.app.bison.common.screen.delegate.FederatedAgentItem
 import com.toxicbakery.app.bison.common.screen.machine.UPDATE_AVAILABLE_TAG
+import com.toxicbakery.app.bison.common.screen.machine.pollTimeText
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
@@ -208,7 +209,7 @@ fun ZenCanvasTopHud(
                     )
                     if (activeBackbone != null) {
                         Text(
-                            text = " · ${activeBackbone.rttMs}ms",
+                            text = " · ${pollTimeText(activeBackbone)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = palette.text.copy(alpha = 0.65f),
                             maxLines = 1,

@@ -8,8 +8,6 @@ import com.toxicbakery.app.bison.protocol.ClientKeyEvent
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.PaneLayoutPane
 import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
-import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
-import com.toxicbakery.app.bison.protocol.PaneSurfaceSplitDirection
 import com.toxicbakery.app.bison.protocol.SurfaceRect
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
@@ -18,6 +16,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotSame
+import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
@@ -147,7 +146,7 @@ class SshPlatformTest {
     }
 
     @Test
-    fun moshUdpEngineSynthesizesFrameWithPredictiveEchoAndDerivedSplits() = runTest {
+    fun moshUdpEngineStartsNoSessionBecauseMoshIsNotAvailable() = runTest {
         val debugLog = SshDebugLog()
         val surfaceBus = PaneSurfaceBus()
         val engine = MoshUdpEngine(
@@ -164,48 +163,29 @@ class SshPlatformTest {
             rows = 24u,
             localEcho = true,
         )
-        assertTrue(started)
-        assertTrue(engine.isSessionActive("workbox"))
+        assertFalse(started)
+        assertFalse(engine.isSessionActive("workbox"))
+        val entry = debugLog.entries.value.single()
+        assertEquals(MoshUdpEngine.LOG_TAG, entry.tag)
+        assertEquals(MoshSessionEngine.NOT_AVAILABLE, entry.message)
 
-        // Send printable input and verify predictive echo cell is underlined
-        engine.sendInput("workbox", "ls".encodeToByteArray())
-        val afterType = assertNotNull(surfaceBus.surfaceFor("workbox"))
-        val cell0 = assertNotNull(afterType.frame.cellAt(0, 0))
-        assertEquals("l", cell0.symbol)
-        assertTrue(cell0.isPredictedEcho)
-
-        // Apply layout snapshot with vertical split and verify derived split hitRect
+        // With no session, the other functions do nothing.
+        assertFalse(engine.sendInput("workbox", "ls".encodeToByteArray()))
+        assertFalse(engine.resize("workbox", 100u, 30u))
         engine.updateLayoutSnapshot(
             machineId = "workbox",
             layout = PaneLayoutSnapshot(
                 workspaceId = "w1",
                 tabId = "w1:t1",
                 zoomed = false,
-                panes = listOf(
-                    PaneLayoutPane("w1:p1", SurfaceRect(0u, 0u, 40u, 24u), focused = true),
-                    PaneLayoutPane("w1:p2", SurfaceRect(40u, 0u, 40u, 24u), focused = false),
-                ),
-                splits = listOf(
-                    PaneLayoutSplit(
-                        id = "s0:root",
-                        direction = PaneSurfaceSplitDirection.Vertical,
-                        ratio = 0.5f,
-                        rect = SurfaceRect(0u, 0u, 80u, 24u),
-                    )
-                ),
+                panes = listOf(PaneLayoutPane("w1:p1", SurfaceRect(0u, 0u, 80u, 24u), focused = true)),
+                splits = emptyList(),
             ),
-            tabCount = 2,
         )
-        val withSplits = assertNotNull(surfaceBus.surfaceFor("workbox"))
-        assertEquals(1, withSplits.splits.size)
-        assertEquals(40u.toUShort(), withSplits.splits.single().hitRect.x)
-
-        // Park and wake via roam datagram
-        engine.setParked("workbox", true)
-        assertTrue(engine.isParked("workbox"))
-        val roamCount = engine.sendWakeupDatagram("workbox")
-        assertEquals(1, roamCount)
+        assertEquals(0, engine.sendWakeupDatagram("workbox"))
         assertFalse(engine.isParked("workbox"))
+        assertNull(surfaceBus.surfaceFor("workbox"))
+        assertEquals(1, debugLog.entries.value.size)
     }
 
     @Test
