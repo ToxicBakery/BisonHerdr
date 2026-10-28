@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.jcraft.jsch.Identity
+import com.jcraft.jsch.IdentityRepository
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SignatureEdDSA
@@ -14,6 +15,7 @@ import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.NoSuchAlgorithmException
 import java.security.spec.X509EncodedKeySpec
+import java.util.Vector
 import javax.crypto.KeyAgreement
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CancellationException
@@ -258,18 +260,20 @@ internal class AndroidKeystoreJschIdentity(
  * A [HardwareKeyException] from [signer] goes through `Session.connect`, because it is a [RuntimeException]. The wait
  * is a child of [callerJob], so a cancel of the login stops it with a [kotlinx.coroutines.CancellationException].
  *
- * The client makes the identity at the start of the login, before the TCP connection. The identity takes the cancel
- * mark of the machine then ([HardwareKeySigner.cancelMark]). When the user disconnects the machine before JSch asks for
- * the signature, [getSignature] thus stops with [HardwareKeyException.Reason.Cancelled] and shows no prompt.
+ * [cancelMark] is the cancel mark of the login ([HardwareKeySigner.cancelMark]). The client takes it one time at the
+ * start of the login, before the TCP connection, and gives it to the identity of each session. When the user
+ * disconnects the machine after the mark, [getSignature] thus stops with [HardwareKeyException.Reason.Cancelled] and
+ * shows no prompt. [bastionHostPort] is the `host:port` of the ProxyJump bastion for the identity of the bastion
+ * session, or null for the session of the machine. The touch sheet tells it to the user.
  */
 internal class HardwareKeyJschIdentity(
     private val machineId: String,
     private val key: SshAuthMethod.HardwareSecurityKey,
     private val signer: HardwareKeySigner,
+    private val cancelMark: Long,
+    private val bastionHostPort: String?,
     private val callerJob: Job?,
 ) : Identity {
-
-    private val cancelMark: Long = signer.cancelMark(machineId)
 
     override fun setPassphrase(passphrase: ByteArray?): Boolean = true
 
@@ -283,7 +287,7 @@ internal class HardwareKeyJschIdentity(
         // An error of the child must not fail the caller job, so the child returns it as a value.
         val result = runBlocking(callerJob ?: EmptyCoroutineContext) {
             try {
-                Result.success(signer.sign(machineId, key, data, cancelMark))
+                Result.success(signer.sign(machineId, key, data, cancelMark, bastionHostPort))
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -304,5 +308,27 @@ internal class HardwareKeyJschIdentity(
 
     override fun clear() {
         // The private key stays on the security key.
+    }
+}
+
+/**
+ * A JSch [IdentityRepository] with only [identity]. The client gives one to each session of a security key login, so
+ * that the bastion session and the session of the machine each have their own [HardwareKeyJschIdentity].
+ */
+internal class SingleIdentityRepository(private val identity: Identity) : IdentityRepository {
+    override fun getName(): String = "bison-security-key"
+
+    override fun getStatus(): Int = IdentityRepository.RUNNING
+
+    override fun getIdentities(): Vector<Identity> = Vector(listOf(identity))
+
+    /** Returns false. The repository has a fixed identity. */
+    override fun add(identity: ByteArray?): Boolean = false
+
+    /** Returns false. The repository has a fixed identity. */
+    override fun remove(blob: ByteArray?): Boolean = false
+
+    override fun removeAll() {
+        // The repository has a fixed identity.
     }
 }

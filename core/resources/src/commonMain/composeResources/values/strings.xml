@@ -121,6 +121,8 @@
     <string name="hardware_key_sheet_touch_usb">Touch the flashing contact on your USB-C YubiKey to sign the SSH challenge.</string>
     <string name="hardware_key_sheet_tap_nfc">Hold your NFC YubiKey against the back of the tablet to sign the SSH challenge.</string>
     <string name="hardware_key_key_type_label">Key Type: %1$s</string>
+    <string name="hardware_key_machine_label">Machine: %1$s</string>
+    <string name="hardware_key_bastion_label">This touch logs in to the ProxyJump bastion %1$s of this machine.</string>
 
     <!-- SSH Host Key Check -->
     <string name="host_key_unknown_title">Unknown Host Key</string>
