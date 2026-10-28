@@ -1274,6 +1274,10 @@ internal class RealHerdrSshClient(
 
     /**
      * Suspends until all currently queued input events for [machineId] have been flushed over [WorkerLane.Input].
+     *
+     * [updateFocusedPaneSurfaceFromInput] confirms the input and publishes the frame of the answer in one step in the
+     * frame lock. The confirmation comes first in that step. Thus after the confirmation, this function takes and
+     * releases the frame lock one time. Then the frame of the answer is on [paneSurfaceBus] when the function returns.
      */
     internal suspend fun awaitInputFlush(machineId: String) = withContext(Dispatchers.IO) {
         val targetSeq = inputSequence.get()
@@ -1283,6 +1287,8 @@ internal class RealHerdrSshClient(
             val queueEmpty = inputQueueFor(machineId).isEmpty()
             val mutexUnlocked = !laneMutexFor(machineId, WorkerLane.Input).isLocked
             if (confirmed >= targetSeq && queueEmpty && mutexUnlocked) {
+                // Wait for the end of the step that confirmed the input, so that its frame is on the bus.
+                withFrames(machineId) {}
                 return@withContext
             }
             delay(5L)
