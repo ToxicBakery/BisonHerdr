@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.fakeserver
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
+import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.AgentStatus
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
@@ -9,11 +10,16 @@ import com.toxicbakery.app.bison.ssh.PaneSurfaceBus
 import com.toxicbakery.app.bison.ssh.SemanticNotificationBus
 import com.toxicbakery.app.bison.ssh.SshDebugLog
 import com.toxicbakery.app.bison.ssh.SshStateManager
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.MachineStore
+import com.toxicbakery.app.bison.store.appJson
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 
 class FakeHerdrServerTest {
@@ -83,5 +89,46 @@ class FakeHerdrServerTest {
             AgentStatus.Working,
             afterApprove.agents.first { it.name == "claude" }.agentStatus,
         )
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun isFakeMachineAcceptsOnlyTheMachinesThatTheServerMade() = runTest {
+        val userMachine = HostMachine(
+            id = "host-gpu-box-tailnet-ts-net-ian",
+            name = "gpu-box",
+            hostname = "gpu-box.tailnet.ts.net",
+            username = "ian",
+        )
+        val store = MachineStore(
+            storeIOProvider = InMemoryStoreIOProvider(
+                mapOf(MachineStore.MACHINES_FILE_NAME to appJson.encodeToString(listOf(userMachine))),
+            ),
+            dispatcher = UnconfinedTestDispatcher(testScheduler),
+        )
+        store.awaitLoaded()
+        val fakeServer = FakeHerdrServer(
+            machineStore = store,
+            sshStateManager = SshStateManager(),
+            sshDebugLog = SshDebugLog(),
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = PaneSurfaceBus(),
+            semanticNotificationBus = SemanticNotificationBus(),
+        )
+
+        // The seeded demo machines are fake also before enable(). A .ts.net host name does not make a machine fake.
+        assertTrue(fakeServer.isFakeMachine(FakeHerdrServer.WORKBOX_ID))
+        assertTrue(fakeServer.isFakeMachine(FakeHerdrServer.GPU_RIG_ID))
+        assertFalse(fakeServer.isFakeMachine(userMachine.id))
+
+        fakeServer.enable()
+
+        // The server simulates a stored user machine, but the server did not make that machine.
+        assertTrue(fakeServer.handleConnect(userMachine.id))
+        assertFalse(fakeServer.isFakeMachine(userMachine.id))
+
+        // An id with no store entry gets an ad hoc machine that the server made.
+        assertTrue(fakeServer.handleConnect("demo-adhoc"))
+        assertTrue(fakeServer.isFakeMachine("demo-adhoc"))
     }
 }

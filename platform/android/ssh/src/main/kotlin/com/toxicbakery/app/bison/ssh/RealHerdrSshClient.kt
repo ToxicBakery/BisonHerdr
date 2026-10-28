@@ -215,16 +215,6 @@ internal class RealHerdrSshClient(
 
     private data class PendingPaneScroll(val paneId: String, val offsetFromBottom: Int)
 
-    fun isSimulatedHost(machine: HostMachine): Boolean {
-        val host = machine.hostname.trim().lowercase()
-        val bastion = machine.proxyJump?.bastionHost?.trim()?.lowercase().orEmpty()
-        if (host.isEmpty()) return true
-        if (host.endsWith(".local") || host.endsWith(".example.com") || host.endsWith(".invalid")) return true
-        if (host.endsWith(".ts.net") || host.startsWith("100.64.")) return true
-        if (bastion.endsWith(".example.com") || bastion.endsWith(".invalid") || bastion.startsWith("100.64.")) return true
-        return false
-    }
-
     private fun sessionMutexFor(machineId: String): Mutex =
         sessionOpenLocks.computeIfAbsent(machineId) { Mutex() }
 
@@ -240,10 +230,14 @@ internal class RealHerdrSshClient(
     private fun optimisticEditsFor(machineId: String): ArrayDeque<OptimisticEdit> =
         optimisticEdits.computeIfAbsent(machineId) { ArrayDeque() }
 
+    /**
+     * Opens the session to [machine] and runs one check command. Returns the error when the session does
+     * not open, so that the caller can tell the kind of the failure.
+     */
     suspend fun connectAndVerify(
         machine: HostMachine,
         route: ResolvedSshRoute,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val out = executeBatchOnLane(
                 machine = machine,
@@ -256,8 +250,7 @@ internal class RealHerdrSshClient(
                 tag = "RealSSH",
                 message = "Connected to ${route.entryHost}:${route.entryPort} (${out.trim().ifBlank { "SSH ok" }})",
             )
-            true
-        }.getOrElse { err ->
+        }.onFailure { err ->
             val errDetail = err.message?.takeIf { it.isNotBlank() }
                 ?: err::class.simpleName
                 ?: "Unknown SSH error"
@@ -267,8 +260,24 @@ internal class RealHerdrSshClient(
                 message = "SSH connection failed to ${route.entryHost}:${route.entryPort}: $errDetail",
                 isError = true,
             )
-            false
         }
+    }
+
+    /**
+     * Runs the shell [command] on [machine] and returns its standard output. The call opens the session when
+     * necessary. It throws the SSH error when the session does not open, for example a failed login.
+     */
+    internal suspend fun runCommand(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        command: String,
+    ): String = withContext(Dispatchers.IO) {
+        executeBatchOnLane(
+            machine = machine,
+            route = route,
+            lane = WorkerLane.Poll,
+            commands = listOf(RemoteShellCommand.Exec(command)),
+        )
     }
 
     suspend fun checkMoshServerAvailable(

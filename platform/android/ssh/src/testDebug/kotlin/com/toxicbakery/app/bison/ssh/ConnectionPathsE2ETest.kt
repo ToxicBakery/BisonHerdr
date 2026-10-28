@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
+import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -27,9 +28,11 @@ import kotlinx.coroutines.test.runTest
 /**
  * End-to-End connection lifecycle and transport path tests for `:platform:android:ssh`.
  *
- * Covers Paths 1A..6C across [SshTransportManager], [MoshUdpEngine], [ProxyJumpTunnel],
+ * Covers Paths 1A..6C across [SshTransportManager], [SimulatedSshBackend], [MoshUdpEngine], [ProxyJumpTunnel],
  * [AndroidKeystoreKeyManager], [YubiKeyFido2Manager], [SshStateManager], [EndpointSnapshotBus],
  * [PaneSurfaceBus], and [SemanticNotificationBus].
+ *
+ * [SimulatedSshBackend] is in the `src/debug` source set, so these tests are in `src/testDebug`.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConnectionPathsE2ETest {
@@ -44,14 +47,26 @@ class ConnectionPathsE2ETest {
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
         )
-        val transport = SshTransportManager(
-            context = null,
+        val yubiKey = YubiKeyFido2Manager(
+            sshStateManager = stateManager,
+            sshDebugLog = debugLog,
+        )
+        val backend = SimulatedSshBackend(
             moshUdpEngine = moshEngine,
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
+            keystoreKeyManager = AndroidKeystoreKeyManager(),
+            yubiKeyFido2Manager = yubiKey,
+        )
+        val transport = SshTransportManager(
+            backend = backend,
+            moshUdpEngine = moshEngine,
+            sshStateManager = stateManager,
+            sshDebugLog = debugLog,
+            paneSurfaceBus = surfaceBus,
         )
     }
 
@@ -135,7 +150,7 @@ class ConnectionPathsE2ETest {
     @Test
     fun path1B_autoPreferMosh_moshServerMissing_fallsBackToSshEndpoint() = runTest {
         val h = Harness()
-        h.transport.moshBootstrapBannerProvider = { "sh: 1: mosh-server: not found" }
+        h.backend.moshBootstrapBannerProvider = { "sh: 1: mosh-server: not found" }
 
         val machine = HostMachine(
             id = "host-1b",
@@ -167,8 +182,8 @@ class ConnectionPathsE2ETest {
     @Test
     fun path1C_autoPreferMosh_udpFirewallBlockedAndHandshakeTimeout_fallsBackToSshEndpoint() = runTest {
         val h = Harness()
-        h.transport.moshBootstrapBannerProvider = { "MOSH CONNECT 60042 4k9X2vL8pQ1mN7rT3wY6zA" }
-        h.transport.moshUdpReachabilityProbe = { _, _ ->
+        h.backend.moshBootstrapBannerProvider = { "MOSH CONNECT 60042 4k9X2vL8pQ1mN7rT3wY6zA" }
+        h.backend.moshUdpReachabilityProbe = { _, _ ->
             // Simulate UDP packets dropped by firewall exceeding the 1,500ms handshake timeout
             delay(SshTransportManager.MOSH_UDP_HANDSHAKE_TIMEOUT_MS + 500L)
             true
@@ -215,7 +230,7 @@ class ConnectionPathsE2ETest {
 
         // Path 2B (part 1): MoshOnly fails when mosh-server is missing (no SSH TCP fallback)
         val hMissing = Harness()
-        hMissing.transport.moshBootstrapBannerProvider = { "command not found: mosh-server" }
+        hMissing.backend.moshBootstrapBannerProvider = { "command not found: mosh-server" }
         val moshMissingHost = moshSuccessHost.copy(id = "mosh-2b-missing")
         assertFalse(hMissing.transport.connect(moshMissingHost))
         assertEquals(ConnectionProgress.Failed, hMissing.stateManager.connectionProgress.value["mosh-2b-missing"])
@@ -224,8 +239,8 @@ class ConnectionPathsE2ETest {
 
         // Path 2B (part 2): MoshOnly fails when UDP handshake is blocked/times out (no SSH TCP fallback)
         val hBlocked = Harness()
-        hBlocked.transport.moshBootstrapBannerProvider = { "MOSH CONNECT 60055 4k9X2vL8pQ1mN7rT3wY6zA" }
-        hBlocked.transport.moshUdpReachabilityProbe = { _, _ -> false }
+        hBlocked.backend.moshBootstrapBannerProvider = { "MOSH CONNECT 60055 4k9X2vL8pQ1mN7rT3wY6zA" }
+        hBlocked.backend.moshUdpReachabilityProbe = { _, _ -> false }
         val moshBlockedHost = moshSuccessHost.copy(id = "mosh-2b-blocked")
         assertFalse(hBlocked.transport.connect(moshBlockedHost))
         assertEquals(ConnectionProgress.Failed, hBlocked.stateManager.connectionProgress.value["mosh-2b-blocked"])
@@ -237,7 +252,7 @@ class ConnectionPathsE2ETest {
     fun path3_sshEndpointOnly_skipsMoshProbeAndConnectsDirectlyViaRemoteClientBridge() = runTest {
         val h = Harness()
         var moshBannerProbed = false
-        h.transport.moshBootstrapBannerProvider = {
+        h.backend.moshBootstrapBannerProvider = {
             moshBannerProbed = true
             "MOSH CONNECT 60000 4k9X2vL8pQ1mN7rT3wY6zA"
         }
@@ -318,6 +333,11 @@ class ConnectionPathsE2ETest {
         )
         assertFalse(hPwInvalid.transport.connect(invalidPwHost))
         assertEquals(ConnectionProgress.Failed, hPwInvalid.stateManager.connectionProgress.value["auth-pw-invalid"])
+        assertTrue(
+            hPwInvalid.debugLog.entries.value.any {
+                it.isError && it.tag == "SSHAuth" && it.message.contains("failed: AuthFailed")
+            },
+        )
 
         // Path 4C: HardwareSecurityKey across SkSshEd25519, SkEcdsaSha2Nistp256, PivSmartCard and all transports
         val keyTypes = listOf(
@@ -336,7 +356,7 @@ class ConnectionPathsE2ETest {
                 val h = Harness()
                 val machineId = "auth-hw-${keyType.name}-${hwTransport.name}"
                 var capturedPromptDuringSign: SshRequest.PromptHardwareKeyTouch? = null
-                h.transport.yubiKeyFido2Manager.onTouchPromptActive = { prompt ->
+                h.yubiKey.onTouchPromptActive = { prompt ->
                     // Verify prompt is actively published on SshStateManager while waiting for touch
                     capturedPromptDuringSign = h.stateManager.hardwareKeyTouchPrompt.value
                     assertEquals(prompt, capturedPromptDuringSign)
@@ -538,5 +558,58 @@ class ConnectionPathsE2ETest {
         assertEquals(2, rpcLogsAfterRoam.size)
         assertTrue(rpcLogsAfterRoam[0].message.contains("First prompt while switching Wi-Fi to 5G"))
         assertTrue(rpcLogsAfterRoam[1].message.contains("Second prompt while switching Wi-Fi to 5G"))
+    }
+
+    @Test
+    fun sshTransportManagerNegotiatesMoshAndFallsBackToSshEndpoint() = runTest {
+        val h = Harness()
+        val stateManager = h.stateManager
+        val transport = h.transport
+
+        val workbox = HostMachine(
+            id = "workbox",
+            name = "workbox",
+            hostname = "100.64.0.12",
+            username = "ian",
+            transportMode = TransportMode.AutoPreferMosh,
+        )
+        assertTrue(transport.connect(workbox))
+        val moshBackbone = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
+        assertEquals(60000, moshBackbone.udpPort)
+
+        // Verify Mosh focus RPC routes over herdr remote-api-bridge (herdr.sock)
+        val focusResp = transport.sendEndpointCommand("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
+        assertTrue(focusResp?.contains("herdr.sock") == true)
+
+        // Verify background surface parking and wakeup presentation fence
+        transport.setSurfaceLease("workbox", active = false)
+        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value["workbox"])
+        transport.setSurfaceLease("workbox", active = true)
+        assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value["workbox"])
+
+        // Verify fallback when mosh-server banner is absent
+        h.backend.moshBootstrapBannerProvider = { "mosh-server: not found" }
+        val fallbackHost = HostMachine(
+            id = "gpu-rig",
+            name = "gpu-rig",
+            hostname = "100.64.0.25",
+            username = "ian",
+            transportMode = TransportMode.AutoPreferMosh,
+            authMethod = SshAuthMethod.HardwareSecurityKey(),
+        )
+        assertTrue(transport.connect(fallbackHost))
+        assertIs<ActiveBackbone.SshEndpoint>(stateManager.activeTransportBackbone.value["gpu-rig"])
+
+        // Verify pane input and network roam wakeup
+        assertTrue(
+            transport.sendPaneInput(
+                machineId = "workbox",
+                paneId = "w1:p1",
+                event = ClientPaneInputEvent.TextCommit("echo ok"),
+            )
+        )
+        transport.onNetworkAvailable("workbox")
+        val afterRoam = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
+        assertEquals(1, afterRoam.roamedCount)
     }
 }

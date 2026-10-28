@@ -86,6 +86,16 @@ class FakeHerdrServer(
 
     private val machineStates = mutableMapOf<String, SimulatedMachineState>()
 
+    /** The ids of the machines that this server made. The seeded demo machines are always in the set. */
+    @Volatile
+    private var fakeMachineIds: Set<String> = setOf(WORKBOX_ID, GPU_RIG_ID)
+
+    /**
+     * Returns true when this server made the machine with [machineId]: a seeded demo machine, or an
+     * ad hoc machine that has no entry in the machine store. The host name has no effect.
+     */
+    fun isFakeMachine(machineId: String): Boolean = machineId in fakeMachineIds
+
     override fun enable() {
         if (enabled && machineStates.isNotEmpty()) return
         enabled = true
@@ -1006,7 +1016,7 @@ class FakeHerdrServer(
             name = machineId,
             hostname = "$machineId.tailnet.ts.net",
             username = "ian",
-        )
+        ).also { fakeMachineIds = fakeMachineIds + machineId }
         val backbone = ActiveBackbone.MoshUdp(udpPort = 60008, rttMs = 14, localEchoEnabled = true)
         val snapshot = machineStates[WORKBOX_ID]?.snapshot?.copy(bootId = "boot-$machineId")
             ?: ClientShellSnapshot(bootId = "boot-$machineId", revision = 1u)

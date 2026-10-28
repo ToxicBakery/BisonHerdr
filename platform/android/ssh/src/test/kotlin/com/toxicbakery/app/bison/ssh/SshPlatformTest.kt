@@ -1,17 +1,12 @@
 package com.toxicbakery.app.bison.ssh
 
-import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
-import com.toxicbakery.app.bison.model.RoamingStatus
-import com.toxicbakery.app.bison.model.SshAuthMethod
-import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientKeyEvent
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
-import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneLayoutPane
 import com.toxicbakery.app.bison.protocol.PaneLayoutSnapshot
 import com.toxicbakery.app.bison.protocol.PaneLayoutSplit
@@ -20,7 +15,6 @@ import com.toxicbakery.app.bison.protocol.SurfaceRect
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotSame
 import kotlin.test.assertNull
@@ -223,71 +217,6 @@ class SshPlatformTest {
         val roamCount = engine.sendWakeupDatagram("workbox")
         assertEquals(1, roamCount)
         assertFalse(engine.isParked("workbox"))
-    }
-
-    @Test
-    fun sshTransportManagerNegotiatesMoshAndFallsBackToSshEndpoint() = runTest {
-        val debugLog = SshDebugLog()
-        val stateManager = SshStateManager()
-        val snapshotBus = EndpointSnapshotBus()
-        val surfaceBus = PaneSurfaceBus()
-        val notificationBus = SemanticNotificationBus()
-        val moshEngine = MoshUdpEngine(debugLog, surfaceBus)
-        val transport = SshTransportManager(
-            context = null,
-            moshUdpEngine = moshEngine,
-            sshStateManager = stateManager,
-            sshDebugLog = debugLog,
-            endpointSnapshotBus = snapshotBus,
-            paneSurfaceBus = surfaceBus,
-            semanticNotificationBus = notificationBus,
-        )
-
-        val workbox = HostMachine(
-            id = "workbox",
-            name = "workbox",
-            hostname = "100.64.0.12",
-            username = "ian",
-            transportMode = TransportMode.AutoPreferMosh,
-        )
-        assertTrue(transport.connect(workbox))
-        val moshBackbone = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
-        assertEquals(60000, moshBackbone.udpPort)
-
-        // Verify Mosh focus RPC routes over herdr remote-api-bridge (herdr.sock)
-        val focusResp = transport.sendEndpointCommand("workbox", HerdrRpcBuilder.workspaceFocus("w2"))
-        assertTrue(focusResp?.contains("herdr.sock") == true)
-
-        // Verify background surface parking and wakeup presentation fence
-        transport.setSurfaceLease("workbox", active = false)
-        assertEquals(RoamingStatus.SurfaceParked, stateManager.roamingState.value["workbox"])
-        transport.setSurfaceLease("workbox", active = true)
-        assertEquals(RoamingStatus.Healthy, stateManager.roamingState.value["workbox"])
-
-        // Verify fallback when mosh-server banner is absent
-        transport.moshBootstrapBannerProvider = { "mosh-server: not found" }
-        val fallbackHost = HostMachine(
-            id = "gpu-rig",
-            name = "gpu-rig",
-            hostname = "100.64.0.25",
-            username = "ian",
-            transportMode = TransportMode.AutoPreferMosh,
-            authMethod = SshAuthMethod.HardwareSecurityKey(),
-        )
-        assertTrue(transport.connect(fallbackHost))
-        assertIs<ActiveBackbone.SshEndpoint>(stateManager.activeTransportBackbone.value["gpu-rig"])
-
-        // Verify pane input and network roam wakeup
-        assertTrue(
-            transport.sendPaneInput(
-                machineId = "workbox",
-                paneId = "w1:p1",
-                event = ClientPaneInputEvent.TextCommit("echo ok"),
-            )
-        )
-        transport.onNetworkAvailable("workbox")
-        val afterRoam = assertIs<ActiveBackbone.MoshUdp>(stateManager.activeTransportBackbone.value["workbox"])
-        assertEquals(1, afterRoam.roamedCount)
     }
 
     @Test
