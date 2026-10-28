@@ -64,6 +64,7 @@ include(
     ":core:di",
     ":core:fake-server",
     ":core:model",
+    ":core:mosh",
     ":core:protocol",
     ":core:resources",
     ":core:ssh",

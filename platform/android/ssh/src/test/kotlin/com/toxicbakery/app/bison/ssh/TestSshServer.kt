@@ -18,13 +18,17 @@ import org.apache.sshd.common.config.keys.KeyUtils
 import org.apache.sshd.common.config.keys.PublicKeyEntry
 import org.apache.sshd.common.config.keys.PublicKeyEntryResolver
 import org.apache.sshd.common.keyprovider.KeyPairProvider
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.util.net.SshdSocketAddress
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.password.PasswordAuthenticator
 import org.apache.sshd.server.auth.keyboard.InteractiveChallenge
 import org.apache.sshd.server.auth.keyboard.KeyboardInteractiveAuthenticator
 import org.apache.sshd.server.command.CommandFactory
 import org.apache.sshd.server.forward.AcceptAllForwardingFilter
+import org.apache.sshd.server.forward.ForwardingFilter
 import org.apache.sshd.server.forward.RejectAllForwardingFilter
+import org.apache.sshd.server.forward.TcpForwardingFilter
 import org.apache.sshd.server.session.ServerSession
 import org.apache.sshd.server.shell.InvertedShellWrapper
 import org.apache.sshd.server.shell.ProcessShell
@@ -44,8 +48,9 @@ import org.apache.sshd.server.shell.ProcessShell
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
  * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
- * in [binDirectory] before the programs of the test machine. When [allowTcpForwarding] is
- * true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump bastion.
+ * in [binDirectory] before the programs of the test machine. A test can also give each command a [homeDirectory].
+ * When [allowTcpForwarding] is true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump
+ * bastion. [directTcpipTargets] records the `host:port` of each channel that a client asked for.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
  * client sent no credentials, for example after a host key check stopped the connection.
@@ -82,6 +87,14 @@ internal class TestSshServer(
     @Volatile
     var binDirectory: File? = null
 
+    /**
+     * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The workers of the client put
+     * `$HOME/.local/bin` first on the `PATH`. Thus a test that sets this directory finds a program in its own
+     * `.local/bin` before a program of the same name on the test machine, for example `herdr`.
+     */
+    @Volatile
+    var homeDirectory: File? = null
+
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
 
@@ -97,6 +110,15 @@ internal class TestSshServer(
     var offerPasswordMethod: Boolean = true
 
     private val credentialCheckCount = AtomicInteger()
+
+    private val directTcpipRequests = CopyOnWriteArrayList<String>()
+
+    /**
+     * The `host:port` of each `direct-tcpip` channel that a client asked for, in sequence, with the host name that the
+     * client sent. The server records a request only when [allowTcpForwarding] is true.
+     */
+    val directTcpipTargets: List<String>
+        get() = directTcpipRequests.toList()
 
     /** The number of login requests that got to an authenticator of the server, for all users and methods. */
     val credentialChecks: Int
@@ -164,7 +186,7 @@ internal class TestSshServer(
             keyboardInteractiveAuthenticator = InteractiveAuthenticator()
             commandFactory = CommandFactory { _, command -> InvertedShellWrapper(ProcessShell(shellCommand(command))) }
             forwardingFilter = if (allowTcpForwarding) {
-                AcceptAllForwardingFilter.INSTANCE
+                RecordingForwardingFilter()
             } else {
                 RejectAllForwardingFilter.INSTANCE
             }
@@ -204,12 +226,24 @@ internal class TestSshServer(
         transportMode = transportMode,
     )
 
-    /** Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], and [binDirectory] on the `PATH`. */
+    /**
+     * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [binDirectory] on the `PATH`, and
+     * [homeDirectory] as `HOME`.
+     */
     private fun shellCommand(command: String): List<String> = buildList {
         add("env")
         add("$NAME_VARIABLE=$name")
+        homeDirectory?.let { add("HOME=${it.absolutePath}") }
         binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
         addAll(listOf("sh", "-c", command))
+    }
+
+    /** Accepts each forwarding request, and records each `direct-tcpip` request in [directTcpipTargets]. */
+    private inner class RecordingForwardingFilter : ForwardingFilter by AcceptAllForwardingFilter.INSTANCE {
+        override fun canConnect(type: TcpForwardingFilter.Type, address: SshdSocketAddress, session: Session): Boolean {
+            if (type == TcpForwardingFilter.Type.Direct) directTcpipRequests += "${address.hostName}:${address.port}"
+            return true
+        }
     }
 
     private inner class InteractiveAuthenticator : KeyboardInteractiveAuthenticator {

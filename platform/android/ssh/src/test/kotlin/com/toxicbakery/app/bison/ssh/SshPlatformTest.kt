@@ -125,7 +125,6 @@ class SshPlatformTest {
                 bastionHost = "bastion.tailnet.ts.net",
                 bastionPort = 22,
                 bastionUser = "jump",
-                tailscaleMagicDns = true,
             ),
         )
         val route = tunnel.resolveRoute(machine)
@@ -202,6 +201,7 @@ class SshPlatformTest {
         val inputLaneGate = CompletableDeferred<Unit>()
 
         val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,

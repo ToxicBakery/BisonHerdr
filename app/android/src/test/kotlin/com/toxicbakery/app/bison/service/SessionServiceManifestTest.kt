@@ -46,6 +46,14 @@ class SessionServiceManifestTest {
         assertFalse("android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" in permissions)
     }
 
+    /** Android 17 stops each connection to the local network when an app that targets API 37 does not have it. */
+    @Test
+    fun manifestDeclaresTheLocalNetworkPermission() {
+        val permissions = elements("uses-permission").map { element -> element.androidAttribute("name") }
+
+        assertTrue("android.permission.ACCESS_LOCAL_NETWORK" in permissions)
+    }
+
     /**
      * This version does not support hardware security keys, so the app does not ask for NFC or USB host
      * access. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds them again with FIDO2 keys.

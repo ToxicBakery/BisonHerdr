@@ -5,7 +5,10 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.FrameData
+import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
+import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
+import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
 import java.net.ConnectException
 import kotlin.test.Test
@@ -76,6 +79,63 @@ class SshTransportManagerTest {
         )
 
     private fun debugLogDump(): String = debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
+
+    @Test
+    fun anRpcWithNoResponseFromTheBackendGivesAnErrorResponse() = runTest {
+        // The recording backend gives no response and writes no log entry.
+        val backend = RecordingSshBackend()
+        val manager = manager(backend)
+        connectAll(manager, backend, lanBox)
+
+        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.workspaceFocus("w2"))
+
+        assertEquals(listOf("sendEndpointCommand lan-box"), backend.calls)
+        assertTrue(response.contains("\"error\""), response)
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        assertFalse(response.contains("\"ok\""), response)
+        // The manager writes no error of its own for a backend with no response.
+        assertTrue(debugLog.entries.value.none { it.isError }, debugLogDump())
+    }
+
+    @Test
+    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLine() = runTest {
+        // Each command batch fails, as on a broken SSH channel.
+        val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = PaneSurfaceBus(),
+            semanticNotificationBus = SemanticNotificationBus(),
+            knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+            secretStore = InMemorySecretStore(),
+            remoteBatchExecutor = { _, _, _, _ -> throw IOException("Broken pipe") },
+        )
+        val backend = RealSshBackend(client, stateManager, AndroidKeystoreKeyManager(allowSoftwareKeys = true))
+        val manager = manager(backend)
+        // A resize gives the profile of the machine to the manager, with no command on the host.
+        manager.handleRequest(SshRequest.ResizeShell(lanBox.id, cols = 80u, rows = 24u), lanBox)
+
+        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
+
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        val errors = debugLog.entries.value.filter { it.isError }
+        assertEquals(1, errors.size, debugLogDump())
+        assertTrue(errors.single().message.startsWith("RPC pane.layout error: Broken pipe"), debugLogDump())
+    }
+
+    @Test
+    fun anRpcForAMachineWithNoProfileGivesAnErrorResponse() = runTest {
+        val backend = RecordingSshBackend()
+
+        val response = manager(backend).sendEndpointCommand("unknown-box", HerdrRpcBuilder.paneFocus("w1:p1"))
+
+        assertTrue(backend.calls.isEmpty(), "The backend got ${backend.calls}")
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        assertEquals(
+            listOf("No machine profile for unknown-box; did not send pane.focus"),
+            debugLog.entries.value.filter { it.isError }.map { it.message },
+        )
+    }
 
     @Test
     fun connectWithoutAProfileFailsAndDoesNotCallTheBackend() = runTest {
@@ -218,6 +278,10 @@ class SshTransportManagerTest {
             SshAuthResult.InputCancelled("lan-box.lan:22") to NeedsUserCause.InputCancelled("lan-box.lan:22"),
             SshAuthResult.Failed(UserInputException.of("lan-box.lan:22", KeyboardInteractiveOutcome.Cancelled)) to
                 NeedsUserCause.InputCancelled("lan-box.lan:22"),
+            SshAuthResult.LocalNetworkBlocked("lan-box.lan:22") to
+                NeedsUserCause.LocalNetworkPermission("lan-box.lan:22"),
+            SshAuthResult.LocalNetworkBlocked("lan-box.lan:22", timedOut = true) to
+                NeedsUserCause.LocalNetworkPermission("lan-box.lan:22", timedOut = true),
         )
 
         expected.forEach { (result, cause) ->
@@ -416,7 +480,9 @@ class SshTransportManagerTest {
         assertEquals(listOf("refreshSurface lan-box", "sendEndpointCommand lan-box"), backend.calls)
         assertTrue(stateManager.queuedPromptsForMachine(lanBox.id).isEmpty())
         assertTrue(
-            debugLog.entries.value.any { it.message == "Dispatched client_shell.surface.set { active: true }" },
+            debugLog.entries.value.any {
+                it.message.startsWith("Surface lease on: the poll reads the snapshot and the panes.")
+            },
             debugLogDump(),
         )
     }
@@ -476,6 +542,31 @@ class SshTransportManagerTest {
         // Cancel in the UI disconnects the machine and removes the cause.
         manager.disconnect(lanBox.id)
         assertNull(stateManager.needsUser.value[lanBox.id])
+    }
+
+    @Test
+    fun aLoopThatTheLocalNetworkStopsPutsTheCauseAndAConnectAfterTheGrantRemovesIt() = runTest {
+        val backend = RecordingSshBackend()
+        val manager = manager(backend)
+        connectAll(manager, backend, lanBox)
+
+        val blocked = SshAuthResult.LocalNetworkBlocked("192.168.1.42:22")
+        assertNotNull(backend.sessionEvents).onNeedsUser(lanBox.id, blocked)
+
+        assertFalse(stateManager.isMachineConnected(lanBox.id))
+        assertEquals(ConnectionProgress.Failed, stateManager.connectionProgress.value[lanBox.id])
+        assertEquals(NeedsUserCause.LocalNetworkPermission("192.168.1.42:22"), stateManager.needsUser.value[lanBox.id])
+        assertNull(stateManager.hostKeyPrompts.value[lanBox.id])
+        assertEquals(listOf("disconnect lan-box"), backend.calls)
+
+        // A network change does not connect the machine again.
+        manager.onNetworkAvailable()
+        assertEquals(listOf("disconnect lan-box"), backend.calls)
+
+        // After the grant, the app connects again with the last profile of the machine.
+        assertTrue(manager.connect(lanBox.id))
+        assertNull(stateManager.needsUser.value[lanBox.id])
+        assertTrue(stateManager.isMachineConnected(lanBox.id))
     }
 
     private fun knownHost(fingerprint: String): KnownHost = KnownHost(

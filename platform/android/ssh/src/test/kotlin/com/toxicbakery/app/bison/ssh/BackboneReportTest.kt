@@ -28,7 +28,7 @@ import kotlinx.coroutines.withTimeout
 
 /**
  * Tests the backbone that [RealSshBackend] reports. This version has no Mosh transport (issue #22), so the backbone
- * is always the SSH endpoint bridge. Its round trip time comes from the poll of [RealHerdrSshClient].
+ * is always the SSH session backbone. Its round trip time comes from the poll of [RealHerdrSshClient].
  */
 class BackboneReportTest {
 
@@ -60,6 +60,7 @@ class BackboneReportTest {
     private val route = ProxyJumpTunnel().resolveRoute(machine)
 
     private fun client() = RealHerdrSshClient(
+        localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = SshDebugLog(),
         endpointSnapshotBus = EndpointSnapshotBus(),
         paneSurfaceBus = PaneSurfaceBus(),
@@ -361,6 +362,7 @@ class BackboneReportTest {
         debugLog: SshDebugLog,
         states: SshStateManager = SshStateManager(),
     ) = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = states,
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

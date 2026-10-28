@@ -9,6 +9,7 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialState
+import com.toxicbakery.app.bison.ssh.LocalNetworkGuard
 import com.toxicbakery.app.bison.ssh.ProxyJumpTunnel
 import com.toxicbakery.app.bison.ssh.RealSshBackend
 import com.toxicbakery.app.bison.ssh.SelectingSshBackend
@@ -42,6 +43,10 @@ class DebugModuleTest {
         import(debugModule)
         // The Application binds this directory with its Context.
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) { InMemoryStoreIOProvider() }
+        // The Application also binds the local network guard with its Context.
+        bindSingleton<LocalNetworkGuard> {
+            LocalNetworkGuard(hasPermission = { true }, localPrefixes = { emptyList() })
+        }
     }
     private val backend = assertIs<SelectingSshBackend>(di.direct.instance<SshBackend>())
     private val debugLog = di.direct.instance<SshDebugLog>()
@@ -104,9 +109,9 @@ class DebugModuleTest {
     }
 
     /**
-     * Returns true when the debug log has the `EndpointGen1` entry that only [SimulatedSshBackend] writes.
+     * Returns true when the debug log has the `SimulatedHost` entry that only [SimulatedSshBackend] writes.
      * For an endpoint-only machine, [RealSshBackend] selects the backbone with no network call and no log entry.
      */
     private fun hasSimulatedEndpointLog(machineId: String): Boolean =
-        debugLog.entries.value.any { it.machineId == machineId && it.tag == "EndpointGen1" }
+        debugLog.entries.value.any { it.machineId == machineId && it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG }
 }

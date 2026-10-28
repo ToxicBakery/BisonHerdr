@@ -39,6 +39,7 @@ class RealSshClientTest {
         runBlocking { put(PASSWORD_REF, TestSshServer.PASSWORD.encodeToByteArray()) }
     }
     private val backend = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = SshStateManager(),
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),

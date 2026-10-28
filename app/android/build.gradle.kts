@@ -1,3 +1,9 @@
+import com.android.build.api.artifact.ScopedArtifact
+import com.android.build.api.artifact.SingleArtifact
+import com.android.build.api.variant.HostTestBuilder
+import com.android.build.api.variant.ScopedArtifacts
+import com.toxicbakery.app.bison.composite.task.CheckReleaseClassesTask
+import com.toxicbakery.app.bison.composite.task.ListClassesTask
 import com.toxicbakery.app.bison.composite.util.configureOptIns
 import com.toxicbakery.app.bison.composite.util.projectVersionCode
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -149,4 +155,56 @@ dependencies {
     androidTestImplementation(libs.androidx.test.uiautomator)
 
     baselineProfile(projects.app.android.baseline)
+}
+
+// The release class check. CheckReleaseClassesTask and ReleaseClasses in the composite build give the rules. The
+// android CI target runs checkReleaseClasses after assembleRelease.
+val listDebugClasses = tasks.register<ListClassesTask>("listDebugClasses") {
+    classList = layout.buildDirectory.file("intermediates/release_class_check/debug-classes.txt")
+}
+val listReleaseClasses = tasks.register<ListClassesTask>("listReleaseClasses") {
+    classList = layout.buildDirectory.file("intermediates/release_class_check/release-classes.txt")
+}
+val checkReleaseClasses = tasks.register<CheckReleaseClassesTask>("checkReleaseClasses") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Checks that the release build has no debug-only class and has RealSshBackend and NoDebugServer."
+    debugClassList = listDebugClasses.flatMap { task -> task.classList }
+    releaseClassList = listReleaseClasses.flatMap { task -> task.classList }
+    // Each class that only the debug build has must match one of these names. Move a class to a main source set,
+    // and the check fails when R8 keeps the class.
+    debugOnlyClasses = setOf(
+        "com.toxicbakery.app.bison.activity.DemoActivity",
+        "com.toxicbakery.app.bison.debug.FakeServerModuleAliasKt",
+        "com.toxicbakery.app.bison.fakeserver",
+        "com.toxicbakery.app.bison.ssh.SelectingSshBackend",
+        "com.toxicbakery.app.bison.ssh.SimulatedSshBackend",
+    )
+    checkedPackage = "com.toxicbakery.app.bison"
+    // ReleaseDebugModuleTest checks the release bindings. This check only finds the classes in the release build.
+    requiredClasses = setOf(
+        "com.toxicbakery.app.bison.debug.NoDebugServer",
+        "com.toxicbakery.app.bison.ssh.RealSshBackend",
+    )
+    reportFile = layout.buildDirectory.file("reports/checkReleaseClasses/result.txt")
+}
+
+androidComponents {
+    // AGP makes unit tests only for the debug build type. ReleaseDebugModuleTest in src/testRelease checks the
+    // bindings of the release DebugModule.
+    beforeVariants(selector().withBuildType("release")) { variant ->
+        variant.hostTests[HostTestBuilder.UNIT_TEST_TYPE]?.enable = true
+    }
+    // The class lists include the classes of all modules and libraries of the variant, before R8.
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.artifacts.forScope(ScopedArtifacts.Scope.ALL)
+            .use(listDebugClasses)
+            .toGet(ScopedArtifact.CLASSES, ListClassesTask::jars, ListClassesTask::directories)
+    }
+    onVariants(selector().withBuildType("release")) { variant ->
+        variant.artifacts.forScope(ScopedArtifacts.Scope.ALL)
+            .use(listReleaseClasses)
+            .toGet(ScopedArtifact.CLASSES, ListClassesTask::jars, ListClassesTask::directories)
+        val mapping = variant.artifacts.get(SingleArtifact.OBFUSCATION_MAPPING_FILE)
+        checkReleaseClasses.configure { mappingFile = mapping }
+    }
 }

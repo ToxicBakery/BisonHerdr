@@ -26,7 +26,7 @@ interface SshBackend {
 
     /**
      * Selects the backbone for [machine]. This version has no Mosh transport (issue #22), so a backend returns the
-     * SSH endpoint bridge ([ActiveBackbone.SshEndpoint]). A backend can return null when no backbone that
+     * SSH session ([ActiveBackbone.SshEndpoint]). A backend can return null when no backbone that
      * [HostMachine.transportMode] permits is available.
      */
     suspend fun negotiateBackbone(machine: HostMachine, route: ResolvedSshRoute): ActiveBackbone?
@@ -44,7 +44,8 @@ interface SshBackend {
 
     /**
      * Sends the Herdr RPC [request] to [machine]. [isMoshActive] is true when the backbone is Mosh UDP.
-     * Returns the response from the machine, or null when the backend has no response.
+     * Returns the response from the machine, or null when the backend has no response. A backend that returns null
+     * after an error writes the cause to the debug log.
      */
     suspend fun sendEndpointCommand(
         machine: HostMachine,

@@ -68,7 +68,10 @@ import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.machine_auth_keystore
+import com.toxicbakery.app.bison.resources.machine_auth_password
 import com.toxicbakery.app.bison.resources.machine_bastion_credentials_hint
+import com.toxicbakery.app.bison.resources.machine_bastion_host_name_hint
 import com.toxicbakery.app.bison.resources.machine_field_mosh_ports_label
 import com.toxicbakery.app.bison.resources.machine_field_transport_mode_label
 import com.toxicbakery.app.bison.resources.machine_key_error_algorithm_not_supported
@@ -308,8 +311,8 @@ fun ConfigureMachineScreen(
                     ) {
                         state.authChoices.forEach { type ->
                             val label = when (type) {
-                                ConfigureMachineViewModel.AuthType.KeystoreKey -> "Android Keystore Key"
-                                ConfigureMachineViewModel.AuthType.Password -> "Password / Passphrase"
+                                ConfigureMachineViewModel.AuthType.KeystoreKey -> stringResource(Res.string.machine_auth_keystore)
+                                ConfigureMachineViewModel.AuthType.Password -> stringResource(Res.string.machine_auth_password)
                                 // The choices do not contain this method (issue #23), so it has no chip.
                                 ConfigureMachineViewModel.AuthType.HardwareSecurityKey -> return@forEach
                             }
@@ -465,8 +468,8 @@ fun ConfigureMachineScreen(
                     }
                 }
 
-                // 4. ProxyJump / Bastion & Tailscale MagicDNS
-                SectionCard(title = "ProxyJump Bastion & Tailscale MagicDNS") {
+                // 4. ProxyJump / Bastion
+                SectionCard(title = "ProxyJump Bastion") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -521,22 +524,11 @@ fun ConfigureMachineScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = "Resolve hostnames via Tailscale MagicDNS",
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                            Switch(
-                                checked = state.tailscaleMagicDns,
-                                onCheckedChange = {
-                                    viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateTailscaleMagicDns(it))
-                                },
-                            )
-                        }
+                        Text(
+                            text = stringResource(Res.string.machine_bastion_host_name_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
 

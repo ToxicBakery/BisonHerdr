@@ -69,8 +69,10 @@ sealed interface ActiveBackbone {
     ) : ActiveBackbone
 
     /**
-     * SSH TCP Endpoint Generation 1 stream (`herdr remote-client-bridge`). This version uses it for each machine.
-     * [fallbackReason] tells why the app does not use Mosh, or is null.
+     * The SSH session of the machine. This version uses it for each machine. The real path runs `herdr api snapshot`
+     * and `herdr remote-api-bridge` requests on persistent `sh` channels of the session. It does not run the
+     * `herdr remote-client-bridge` Endpoint Generation 1 stream. [fallbackReason] tells why the app does not use
+     * Mosh, or is null.
      */
     @Serializable
     @SerialName("ssh_endpoint")

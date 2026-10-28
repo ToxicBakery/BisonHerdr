@@ -22,7 +22,7 @@ data class SshLogEntry(
 )
 
 /**
- * Bounded ring buffer of structured SSH and Endpoint Gen 1 diagnostic log entries.
+ * Bounded ring buffer of structured SSH and Herdr diagnostic log entries.
  */
 class SshDebugLog(
     private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
@@ -82,8 +82,8 @@ class SshDebugLog(
  * Platform-agnostic contract for an engine of Mosh UDP sessions.
  *
  * This version has no Mosh transport. Issue #22 (https://github.com/ToxicBakery/BisonHerdr/issues/22) adds it.
- * Until then, [startSession] starts no session and returns false, and the app connects each machine over the SSH
- * endpoint bridge.
+ * Until then, [startSession] starts no session and returns false, and the app connects each machine over its SSH
+ * session.
  */
 interface MoshSessionEngine {
     suspend fun startSession(

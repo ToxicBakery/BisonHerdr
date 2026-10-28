@@ -492,7 +492,7 @@ private fun HostMachineCard(
             ) {
                 val transportLabel = when (backbone) {
                     is ActiveBackbone.MoshUdp -> "MOSH UDP • ${pollTimeText(backbone)}"
-                    is ActiveBackbone.SshEndpoint -> "SSH BRIDGE • ${pollTimeText(backbone)}"
+                    is ActiveBackbone.SshEndpoint -> "SSH • ${pollTimeText(backbone)}"
                     null -> machine.transportMode.name
                 }
                 TelemetryBadge(

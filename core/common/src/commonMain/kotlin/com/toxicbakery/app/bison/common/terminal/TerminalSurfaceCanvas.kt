@@ -104,9 +104,10 @@ data class TerminalSelectionRange(
 )
 
 /**
- * 120Hz Hardware-Accelerated Compose Terminal Renderer ("Zen Canvas").
+ * Hardware-Accelerated Compose Terminal Renderer ("Zen Canvas"). The app sets no frame rate: Compose draws a new frame
+ * when the cells change.
  *
- * Renders [PaneSurfaceFrame] edge-to-edge across 96%+ of the tablet display with:
+ * Renders [PaneSurfaceFrame] edge-to-edge in the canvas area with:
  * - TrueColor (`0x02_RR_GG_BB`), 256-color (`0x01_00_00_XX`), and 16-ANSI color resolution
  * - Bold, italic, dim, reverse, underline, curly underline, strikethrough, and predictive echo
  * - Block, Underline, and Bar cursors

@@ -40,6 +40,7 @@ class ProxyJumpTest {
     }
     private val stateManager = SshStateManager()
     private val backend = RealSshBackend(
+        localNetworkGuard = permittedLocalNetwork(),
         sshStateManager = stateManager,
         sshDebugLog = debugLog,
         endpointSnapshotBus = EndpointSnapshotBus(),
@@ -85,6 +86,24 @@ class ProxyJumpTest {
         assertEquals(SshAuthResult.Success, authenticate(machine), debugLogDump())
 
         assertEquals(TARGET, serverNameOf(machine))
+    }
+
+    @Test
+    fun theBastionGetsTheTypedShortNameOfTheTargetAndTheKnownHostsEntryUsesIt() = runTest {
+        // A short name with no dot, as a Tailscale MagicDNS short name. An earlier version added `.ts.net` to it.
+        knownHostsStore.put(bastion.knownHost())
+        val machine = passwordMachine("bastion-short-name").copy(hostname = SHORT_TARGET_NAME)
+
+        val unknown = assertIs<SshAuthResult.HostKeyUnknown>(authenticate(machine), debugLogDump())
+
+        assertEquals(listOf("$SHORT_TARGET_NAME:${target.port}"), bastion.directTcpipTargets)
+        assertEquals(target.knownHost().copy(host = SHORT_TARGET_NAME), unknown.presented)
+
+        // The user accepts the key. The next login finds the entry with the typed name.
+        knownHostsStore.put(unknown.presented)
+        assertEquals(SshAuthResult.Success, authenticate(machine), debugLogDump())
+        assertEquals(TARGET, serverNameOf(machine))
+        assertEquals(listOf(bastion.knownHost(), unknown.presented), knownHostsStore.knownHosts.value)
     }
 
     @Test
@@ -316,6 +335,9 @@ class ProxyJumpTest {
         const val BASTION = "bastion"
         const val TARGET = "target"
         const val PASSWORD_REF = "password-proxy-jump"
+
+        /** A host name with no dot that the bastion resolves to [TestSshServer.HOST] with no DNS server. */
+        const val SHORT_TARGET_NAME = "localhost"
         const val AWAIT_TIMEOUT_MS = 10_000L
         const val AWAIT_STEP_MS = 20L
     }

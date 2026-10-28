@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.service
 
 import com.toxicbakery.app.bison.model.ConnectionProgress
 import com.toxicbakery.app.bison.service.ServiceStopPolicy.Companion.isConnectStep
+import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import kotlinx.coroutines.CancellationException
@@ -37,6 +38,15 @@ internal suspend fun SshStateManager.runControlRequest(
  */
 internal fun SshStateManager.cancelUserAuthBeforeQueue(request: SshRequest) {
     if (request is SshRequest.Disconnect) cancelUserAuth(request.machineId)
+}
+
+/**
+ * Ends the wait for the local network permission of the machine of [request] at once when [request] is a disconnect.
+ * Call it when the request arrives, before the control queue. A connect that waits for the answer of the user can
+ * hold that queue for up to 60 s.
+ */
+internal fun LocalNetworkAccess.cancelRequestBeforeQueue(request: SshRequest) {
+    if (request is SshRequest.Disconnect) cancel(request.machineId)
 }
 
 /** Sets [ConnectionProgress.Failed] when [request] is a connect and its machine is at a connect step. */

@@ -41,7 +41,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.ArrayDeque
 import java.util.Properties
@@ -94,6 +93,8 @@ import kotlinx.serialization.json.put
  * over `TCP_NODELAY` sockets with client-side optimistic local echo (`<1ms`), keystroke coalescing, and
  * focused-pane-only reads so interactive typing never spawns per-key SSH channels or blocks behind background polls.
  *
+ * Each `herdr` command has `--session <name>` when the machine has a Herdr session name. See [HerdrCommand].
+ *
  * Each session checks the server host key against [knownHostsStore] through [KnownHostsRepository] before it
  * sends credentials. An unknown or changed key stops the session with a [HostKeyRejectedException].
  *
@@ -116,6 +117,11 @@ import kotlinx.serialization.json.put
  * [disconnect], no command opens a session. When a session closes, the supervisor reconnects in
  * [reconnectScope] with the delays from [reconnectDelays]. It sends its events to [sessionEvents]. A command that
  * finds a closed session waits only for the attempt that runs now, and then fails.
+ *
+ * Each socket gets its address from [localNetworkGuard]. When Android 17 stops the connection to the host because the
+ * app does not have the local network permission, the guard throws a [LocalNetworkPermissionException]. It throws it
+ * before the socket opens, or after a connect timeout to a private address. The reconnect loop then stops for the
+ * user.
  *
  * [refreshSnapshotAndSurface] measures the poll time with [timeSource]: the time of its first command batch. A
  * [RoundTripMeter] keeps the average for each machine, and gives it to [roundTripListener] at most one time each
@@ -163,6 +169,8 @@ internal class RealHerdrSshClient(
      */
     private val snapshotPublisher: (machineId: String, snapshot: ClientShellSnapshot) -> Unit =
         endpointSnapshotBus::publish,
+    /** Gives the address of each socket, and finds the connections that the local network protection stops. */
+    internal val localNetworkGuard: LocalNetworkGuard,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -257,14 +265,25 @@ internal class RealHerdrSshClient(
         }
     }
 
-    private object LowLatencySocketFactory : SocketFactory {
-        override fun createSocket(host: String, port: Int): Socket =
-            Socket().apply {
-                tcpNoDelay = true
-                keepAlive = true
-                runCatching { trafficClass = IPTOS_LOWDELAY }
-                connect(InetSocketAddress(host, port), SOCKET_CONNECT_TIMEOUT_MS)
+    /**
+     * Opens the sockets of the sessions. [localNetworkGuard] gives the address before the socket opens, and the error
+     * of a failed connect.
+     */
+    private class LowLatencySocketFactory(private val localNetworkGuard: LocalNetworkGuard) : SocketFactory {
+        override fun createSocket(host: String, port: Int): Socket {
+            val address = localNetworkGuard.socketAddressFor(host, port)
+            val socket = Socket()
+            try {
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                runCatching { socket.trafficClass = IPTOS_LOWDELAY }
+                socket.connect(address, SOCKET_CONNECT_TIMEOUT_MS)
+            } catch (error: IOException) {
+                runCatching { socket.close() }
+                throw localNetworkGuard.connectFailure(address, KnownHost.formatHostPort(host, port), error)
             }
+            return socket
+        }
 
         override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
 
@@ -272,6 +291,7 @@ internal class RealHerdrSshClient(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
+    private val socketFactory = LowLatencySocketFactory(localNetworkGuard)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val knownHostsRepository = KnownHostsRepository(knownHostsStore)
 
@@ -496,7 +516,7 @@ internal class RealHerdrSshClient(
                 machine = machine,
                 route = route,
                 lane = WorkerLane.Poll,
-                commands = listOf(RemoteShellCommand.Exec("herdr --version || true")),
+                commands = listOf(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} --version || true")),
             )
             sshDebugLog.record(
                 machineId = machine.id,
@@ -808,7 +828,7 @@ internal class RealHerdrSshClient(
         }.orEmpty()
 
         val initialCommands = buildList {
-            add(RemoteShellCommand.Exec("herdr api snapshot"))
+            add(RemoteShellCommand.Exec("${HerdrCommand.of(machine)} api snapshot"))
             predictedVisiblePanes.forEach { paneId ->
                 add(RemoteShellCommand.ApiBridgeLine(buildPaneReadJsonLine(paneId)))
             }
@@ -2247,7 +2267,7 @@ internal class RealHerdrSshClient(
             host = route.entryHost,
             port = route.entryPort,
         )
-        bastion.setSocketFactory(LowLatencySocketFactory)
+        bastion.setSocketFactory(socketFactory)
         try {
             knownHostsRepository.connect(bastion, SOCKET_CONNECT_TIMEOUT_MS)
         } catch (error: JSchException) {
@@ -2273,7 +2293,7 @@ internal class RealHerdrSshClient(
             port = route.targetPort,
         )
         if (bastion == null) {
-            session.setSocketFactory(LowLatencySocketFactory)
+            session.setSocketFactory(socketFactory)
             knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
         } else {
             val proxy = BastionChannelProxy(bastion, route.bastionAddress)
@@ -2494,7 +2514,7 @@ internal class RealHerdrSshClient(
             runCatching {
                 val worker = getOrOpenWorkerLocked(machine.id, lane, session)
                 val timing = onRoundTrip.takeIf { worker.ranBatch }
-                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands) }
+                timeRoundTrip(machine.id, timing) { runCommandsOnWorker(worker, commands, machine.herdrSessionName) }
                     .also { worker.ranBatch = true }
             }.recoverCatching {
                 // If the persistent shell channel dropped, discard it and fall back / reopen cleanly
@@ -2502,9 +2522,10 @@ internal class RealHerdrSshClient(
                 val freshSession = getOrOpenSession(machine, route)
                 runCatching {
                     val freshWorker = getOrOpenWorkerLocked(machine.id, lane, freshSession)
-                    runCommandsOnWorker(freshWorker, commands).also { freshWorker.ranBatch = true }
+                    runCommandsOnWorker(freshWorker, commands, machine.herdrSessionName)
+                        .also { freshWorker.ranBatch = true }
                 }.getOrElse {
-                    execBatchOneShot(freshSession, commands)
+                    execBatchOneShot(freshSession, commands, machine.herdrSessionName)
                 }
             }.getOrThrow()
         }
@@ -2545,9 +2566,10 @@ internal class RealHerdrSshClient(
     private fun runCommandsOnWorker(
         worker: PersistentShellWorker,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): String {
         val batchId = shellBatchCounter.incrementAndGet()
-        val (script, sentinel) = buildShellBatchScript(batchId, commands)
+        val (script, sentinel) = buildShellBatchScript(batchId, commands, herdrSessionName)
         worker.stdin.write(script.toByteArray(Charsets.UTF_8))
         worker.stdin.flush()
 
@@ -2574,28 +2596,9 @@ internal class RealHerdrSshClient(
     private fun execBatchOneShot(
         session: Session,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): String {
-        val batchId = shellBatchCounter.incrementAndGet()
-        val body = buildString(commands.size * 160 + 96) {
-            append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
-            commands.forEachIndexed { index, cmd ->
-                when (cmd) {
-                    is RemoteShellCommand.Exec -> {
-                        append(cmd.command.trim()).append('\n')
-                    }
-                    is RemoteShellCommand.ApiBridgeLine -> {
-                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
-                        append("herdr remote-api-bridge <<'")
-                            .append(eofMarker)
-                            .append("'\n")
-                            .append(cmd.ndjsonLine.trim())
-                            .append('\n')
-                            .append(eofMarker)
-                            .append('\n')
-                    }
-                }
-            }
-        }
+        val body = buildOneShotBatchScript(shellBatchCounter.incrementAndGet(), commands, herdrSessionName)
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(body)
         val stdout = channel.inputStream
@@ -2608,11 +2611,49 @@ internal class RealHerdrSshClient(
         }
     }
 
+    /**
+     * Builds the script of [execBatchOneShot]. Each `herdr` call of a [RemoteShellCommand.ApiBridgeLine] uses the Herdr
+     * session [herdrSessionName]. See [HerdrCommand].
+     */
+    internal fun buildOneShotBatchScript(
+        batchId: Long,
+        commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
+    ): String {
+        val herdr = HerdrCommand.forSession(herdrSessionName)
+        return buildString(commands.size * 160 + 96) {
+            append("export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH\"\n")
+            commands.forEachIndexed { index, cmd ->
+                when (cmd) {
+                    is RemoteShellCommand.Exec -> {
+                        append(cmd.command.trim()).append('\n')
+                    }
+                    is RemoteShellCommand.ApiBridgeLine -> {
+                        val eofMarker = "__BISON_EOF_${batchId}_${index}__"
+                        append(herdr).append(" remote-api-bridge <<'")
+                            .append(eofMarker)
+                            .append("'\n")
+                            .append(cmd.ndjsonLine.trim())
+                            .append('\n')
+                            .append(eofMarker)
+                            .append('\n')
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds the script of one batch on a persistent worker, and the sentinel line at its end. Each `herdr` call of a
+     * [RemoteShellCommand.ApiBridgeLine] uses the Herdr session [herdrSessionName]. See [HerdrCommand].
+     */
     internal fun buildShellBatchScript(
         batchId: Long,
         commands: List<RemoteShellCommand>,
+        herdrSessionName: String?,
     ): Pair<String, String> {
         val sentinel = "__BISON_DONE_${batchId}__"
+        val herdr = HerdrCommand.forSession(herdrSessionName)
         val script = buildString(commands.size * 160 + 64) {
             commands.forEachIndexed { index, cmd ->
                 when (cmd) {
@@ -2623,7 +2664,8 @@ internal class RealHerdrSshClient(
 
                     is RemoteShellCommand.ApiBridgeLine -> {
                         val eofMarker = "__BISON_EOF_${batchId}_${index}__"
-                        append("herdr remote-api-bridge <<'")
+                        append(herdr)
+                        append(" remote-api-bridge <<'")
                         append(eofMarker)
                         append("'\n")
                         append(cmd.ndjsonLine.trim())

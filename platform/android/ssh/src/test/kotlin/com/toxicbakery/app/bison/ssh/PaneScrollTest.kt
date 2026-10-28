@@ -296,6 +296,7 @@ class PaneScrollTest {
         snapshotBus: EndpointSnapshotBus = EndpointSnapshotBus(),
         snapshotGate: PublishGate<ClientShellSnapshot> = PublishGate(snapshotBus::publish),
     ) = RealHerdrSshClient(
+        localNetworkGuard = permittedLocalNetwork(),
         sshDebugLog = debugLog,
         endpointSnapshotBus = snapshotBus,
         paneSurfaceBus = surfaceBus,
@@ -698,6 +699,7 @@ class PaneScrollTest {
         val scrollThread = AtomicReference<Thread>()
         val readEnded = AtomicBoolean(false)
         val client = RealHerdrSshClient(
+            localNetworkGuard = permittedLocalNetwork(),
             sshDebugLog = debugLog,
             endpointSnapshotBus = EndpointSnapshotBus(),
             paneSurfaceBus = surfaceBus,

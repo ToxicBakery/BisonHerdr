@@ -1,6 +1,8 @@
 package com.toxicbakery.app.bison
 
 import android.content.Context
+import com.toxicbakery.app.bison.ssh.LocalNetworkGuard
+import com.toxicbakery.app.bison.ssh.androidLocalNetworkGuard
 import com.toxicbakery.app.bison.store.StoreIOProvider
 import com.toxicbakery.app.bison.store.StoreIOProviderAndroid
 import com.toxicbakery.app.bison.store.StoreIOProviderTags
@@ -35,6 +37,10 @@ class Application : android.app.Application(), DIAware {
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) {
             val application = instance<Application>()
             StoreIOProviderAndroid(directory = { File(application.noBackupFilesDir, SECRETS_DIRECTORY) })
+        }
+        // The guard reads the local network permission and the default network of the device.
+        bindSingleton<LocalNetworkGuard> {
+            androidLocalNetworkGuard(instance<Application>())
         }
     }
 

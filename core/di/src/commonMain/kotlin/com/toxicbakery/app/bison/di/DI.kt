@@ -11,6 +11,6 @@ val coreDiModule = DI.Module("coreDiModule") {
     import(viewModelModule)
 
     // App-wide Json singleton configured with ignoreUnknownKeys = true and coerceInputValues = true
-    // so new optional server fields or unknown enum values in Endpoint Gen 1 never fail deserialization.
+    // so new optional server fields or unknown enum values in Herdr JSON payloads never fail deserialization.
     bindSingleton { appJson }
 }
