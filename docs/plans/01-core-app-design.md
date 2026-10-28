@@ -12,14 +12,14 @@ This document consolidates the complete reference for **Herdr's Server API & Pro
 
 ## Part I: Executive Summary & Problem Statement
 
-Mobile and tablet terminal clients typically fail coding-agent workflows because they treat a tablet like a shrunken desktop terminal over a fragile TCP socket. **BisonHerdr** (`com.toxicbakery.app.bison`) is designed from the ground up as a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**, built on Herdr's API over SSH. This version runs `herdr api snapshot` and `herdr remote-api-bridge` requests, and the target design adds Herdr's **Endpoint Generation 1** protocol.
+Mobile and tablet terminal clients often fail coding-agent workflows, because they treat a tablet like a small desktop terminal over a fragile TCP socket. **BisonHerdr** (`com.toxicbakery.app.bison`) is a **native Kotlin + Jetpack Compose touch-first terminal multiplexer and multi-machine agent control center**. It uses Herdr's API over SSH. This version runs `herdr api snapshot` and `herdr remote-api-bridge` requests, and the target design adds Herdr's **Endpoint Generation 1** protocol.
 
 | Pain Point in Existing Mobile/Android Apps | Root Cause | BisonHerdr Architecture Solution |
 | :--- | :--- | :--- |
 | **Reconnects every time the app is backgrounded** | Tying SSH socket lifecycle to the Android `Activity`; streaming full terminal frames in the background drains battery or gets killed by the OS. | **Android `ForegroundService` + Herdr `surface_interest` Lease:** On `onStop()`, the app sends `client_shell.surface.set { active: false }`. The server stops streaming terminal cell diffs while keeping the control channel open at near-zero bandwidth. On `onStart()`, sending `active: true` paints the fresh screen **with no SSH reconnect**. In this version, the lease only pauses the pane reads of the client, and the app does not send `client_shell.surface.set`. |
 | **No Mosh / poor roaming across Wi-Fi, 5G & Tailscale** | Raw TCP/SSH drops blank out the terminal screen and wait 30–120s for kernel TCP timeouts. | **Retained Surface State + `NetworkCallback` Session Check:** The last committed `PaneSurfaceFrame` and `ClientShellSnapshot` stay on screen with a non-intrusive `"Reconnecting..."` pill. On a new default network, `ConnectivityManager.NetworkCallback` starts a check of each SSH session: a keepalive and `exec true`, with a limit of 3 s. When the check fails, the app connects again at once and reads the surface again. On `onLost`, the app closes the SSH sockets, so that no attempt waits for a TCP timeout. |
 | **Painful typing, modifiers (`Ctrl`/`Alt`/`Esc`), & prompt input** | Soft keyboards (`setComposingText`) fight raw PTY input mode; voice dictation and autocorrect mangle terminal TUI prompts. | **Two-Tier Input Bar:** (1) Pro Touch Accessory Bar with sticky/chorded modifiers and trackpad cursor scrubbing, plus (2) an expandable **Native Compose Prompt Composer** supporting full Android voice dictation, autocorrect, multi-line editing, and image paste (planned) before atomic submission via `agent.prompt` or `pane.send_input`. |
-| **Clunky workspace, tab & split-pane navigation** | Desktop keyboard shortcuts (`prefix+w`, `prefix+h/j/k/l`) require awkward multi-key chords on touchscreens. | **Native Compose Shell Chrome + Direct Split Gestures:** Herdr's server renders *only* the pane grid (`PaneSurfaceFrame`). Android renders the Sidebar, Tab Bar, draggable BSP split handles (`layout.set_split_ratio`), and double-tap pane zoom (`pane.zoom`) natively at 120Hz. |
+| **Clunky workspace, tab & split-pane navigation** | Desktop keyboard shortcuts (`prefix+w`, `prefix+h/j/k/l`) require awkward multi-key chords on touchscreens. | **Native Compose Shell Chrome + Direct Split Gestures:** Herdr's server renders *only* the pane grid (`PaneSurfaceFrame`). Android renders the Sidebar, Tab Bar, draggable BSP split handles (`layout.set_split_ratio`), and double-tap pane zoom (`pane.zoom`) natively in Compose. |
 | **Hard to see or act on `blocked` / `done` coding agents** | Agents are buried across multiple SSH hosts, workspaces, and split panes. | **Unified Multi-Machine Agent Rail + Blocked Action Strip:** Aggregates `ClientShellAgent` states across all connected SSH machines. When viewing a `blocked` agent, a contextual action bar provides 1-tap `Approve (Enter)`, `Cancel (Esc)`, `y`, `n`, and option number buttons. |
 
 ---
@@ -344,9 +344,11 @@ All messages on `herdr-client.sock` (and `herdr remote-client-bridge`) use `[u32
 
 ## Part III: Android & Tablet Client UX Design — "Zen Canvas" (Design 2)
 
+> **Status: target design.** Part III describes the target UX. **This version:** the workspace screen is a column. The top HUD has two rows, and the split-thumb bar is at the bottom when the setting is on. The panes use all of the area between them, and the HUD and the bar do not cover the panes. The app sets no frame rate.
+
 ### 1. Edge-to-Edge "Zen Canvas" Layout with Floating HUDs (Jetpack Compose)
 
-The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet display is dedicated to the full-bleed hardware-accelerated terminal grid**, with zero permanent sidebars or bulky toolbars stealing columns or rows. All multi-machine navigation, workspace/tab switching, agent triage, and touch modifiers live in **translucent floating HUD pills, a slide-over Agent Command Drawer, and ergonomic split-thumb clusters**:
+The app uses the **Design 2 ("Zen Canvas")** architecture: **the full-bleed hardware-accelerated terminal grid gets most of the tablet display**, with zero permanent sidebars or bulky toolbars stealing columns or rows. All multi-machine navigation, workspace/tab switching, agent triage, and touch modifiers live in **translucent floating HUD pills, a slide-over Agent Command Drawer, and ergonomic split-thumb clusters**:
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -371,7 +373,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **96%+ of the tablet 
 +----------------------------------------------------------------------------------------------------+
 ```
 
-1. **Full-Bleed Terminal Canvas (96%+ Screen Area):**
+1. **Full-Bleed Terminal Canvas:**
    - Renders the multi-pane BSP split grid edge-to-edge across the entire tablet screen, with a crisp `2.dp` accent focus border on the active pane.
    - Floating top-And-bottom HUD elements use translucent Material 3 glass surfaces (`backdrop-filter` / `Surface` with alpha + `1.dp` border) that sit over padding zones or auto-fade to 40% opacity while typing.
 2. **Floating Top HUD Islands:**

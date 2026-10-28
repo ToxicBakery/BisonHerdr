@@ -241,7 +241,7 @@ class FakeHerdrServer(
                     paneId = "w1:p2",
                     workspaceId = "w1",
                     tabId = "w1:t1",
-                    label = "SSH Endpoint · Pane #2",
+                    label = "SSH Session · Pane #2",
                     cwd = "/home/ian/workspace/herdr-tablet/rust/herdr-mobile-core",
                     foregroundCwd = "/home/ian/workspace/herdr-tablet/rust/herdr-mobile-core",
                     focused = false,
@@ -1101,7 +1101,7 @@ class FakeHerdrServer(
                     scroll = PaneSurfaceScroll(offsetFromBottom = 0u, maxScrollback = 80u, viewportRows = topRightHeight.toUShort()),
                     focused = focusedPaneId == "w1:p2",
                     zoomed = false,
-                    title = "SSH Endpoint · Pane #2",
+                    title = "SSH Session · Pane #2",
                     agentStatus = AgentStatus.Idle,
                 ),
                 PaneSurfacePane(
