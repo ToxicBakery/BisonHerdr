@@ -344,7 +344,7 @@ All messages on `herdr-client.sock` (and `herdr remote-client-bridge`) use `[u32
 
 ## Part III: Android & Tablet Client UX Design — "Zen Canvas" (Design 2)
 
-> **Status: target design.** Part III describes the target UX. **This version:** the workspace screen is a column. The top HUD has two rows, and the split-thumb bar is at the bottom when the setting is on. The panes use all of the area between them, and the HUD and the bar do not cover the panes. The app sets no frame rate.
+> **Status: target design.** Part III describes the target UX. **This version:** the workspace screen is a column. The top HUD has two rows, and the split-thumb bar is at the bottom when the Split-Thumb bottom bar setting is on (the default). The panes use all of the area between them, and the HUD and the bar do not cover the panes. The app sets no frame rate.
 
 ### 1. Edge-to-Edge "Zen Canvas" Layout with Floating HUDs (Jetpack Compose)
 

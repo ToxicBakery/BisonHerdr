@@ -5,7 +5,7 @@
 It is designed around two core principles:
 
 1. **Survive Backgrounding & Network Roaming** — A foreground service keeps the SSH sessions open when you switch apps or when the tablet sleeps. In the background, the app stops its terminal reads. SSH uses TCP, so a Wi-Fi ↔ cellular change can close a session. The app then checks each session, connects again at once when a session does not reply, and keeps the last terminal state on the screen.
-2. **A Strong, Touch-First Terminal Experience as the Primary Input** — Instead of shrinking a desktop TUI onto glass or relegating touch to an afterthought, the terminal is a full-bleed, high-refresh native canvas paired with ergonomic split-thumb controls, direct touch gestures, and a native prompt composer that makes driving interactive shells, TUIs, and AI coding agents fast and natural on a tablet.
+2. **A Strong, Touch-First Terminal Experience as the Primary Input** — Instead of shrinking a desktop TUI onto glass or relegating touch to an afterthought, the terminal is an edge-to-edge native Compose canvas paired with ergonomic split-thumb controls, direct touch gestures, and a native prompt composer that makes driving interactive shells, TUIs, and AI coding agents fast and natural on a tablet.
 
 ---
 
@@ -23,7 +23,7 @@ Traditional SSH clients on Android drop connections when you switch apps to insp
 ### 2. Primary Input: Touch-First Terminal Experience
 On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. BisonHerdr replaces tiny text-mode chrome with native, ergonomic touch controls:
 
-- **Zen Canvas (Edge-to-Edge Pane Area)**: The app reads each visible pane with `pane.read` and draws only the pane cells. No Herdr sidebar or tab bar shows. The panes use all of the area between the top HUD and the thumb bar. A compact top HUD shows workspace and tab pills, agent attention badges, and a connection pill with the measured poll time.
+- **Zen Canvas (Edge-to-Edge Pane Area)**: The app reads each visible pane with `pane.read` and draws the pane cells with no Herdr chrome. The app shows no Herdr sidebar or tab bar. The panes use all of the area between the top HUD and the thumb bar. A compact top HUD shows workspace and tab pills, agent attention badges, and a connection pill with the measured poll time.
 - **Split-Thumb Ergonomic Floating Clusters**: Docked at the bottom-left (`Esc`, `Tab`, `Ctrl`, `Alt`, `^C`, `^B`, `/`, `|` by default) and bottom-right (`←`, `↓`, `↑`, `→`, `Enter`, and a drag trackpad for the arrows) corners, with the `Prompt` pill between them. The clusters are right under your thumbs when you hold a tablet in landscape, and the center viewport stays clear.
 - **Native Prompt & Command Composer**: An expandable card above the thumb keys with a multi-line text field, so the Android IME gives voice dictation, swipe typing, and autocorrect. You select the target: the focused pane, the first agent of the snapshot, or a broadcast. The app sends the prompt with Herdr's `agent.prompt` / `pane.send_input` RPCs.
 - **Direct BSP Touch Manipulation**: Drag pane dividers with snap points (25% / 33% / 50% / 67% / 75%), and double-tap a divider to set its split to 50%. Double-tap a pane to zoom or unzoom it (`pane.zoom`), and pinch with two fingers to change the font size.

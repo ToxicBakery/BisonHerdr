@@ -199,7 +199,7 @@ fun ConfigureMachineScreen(
                 }
 
                 // 1. Host & Connection Identity
-                SectionCard(title = "Host Identity & SSH Endpoint") {
+                SectionCard(title = "Host Identity & SSH Address") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),

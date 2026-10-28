@@ -53,8 +53,10 @@ import org.kodein.di.compose.viewmodel.rememberViewModel
 /**
  * Design 2 ("Zen Canvas") workspace terminal screen.
  *
- * A column holds the top HUD (two rows), the [TerminalSurfaceCanvas] with the slide-over Federated Agent Command
- * Center drawer, and the split-thumb bottom key clusters with the Native Prompt Composer pill when the setting is on.
+ * A column holds the top HUD (two rows) and the [TerminalSurfaceCanvas] with the slide-over Federated Agent Command
+ * Center drawer. When `AppSettings.splitThumbLayoutEnabled` is true, the column also holds the split-thumb bottom key
+ * clusters with the Native Prompt Composer pill. The Settings label of this setting is "Split-Thumb Left/Right
+ * Ergonomic Bottom Bar", and the setting is on by default.
  * The HUD sits above the canvas and the bottom bar sits below it, so they do not cover it. The canvas uses all of
  * the area between them. The design target is 96%+ of the screen for the canvas, and no code measures it.
  */
