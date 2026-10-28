@@ -5,6 +5,7 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration
 
 /**
  * Debug [SshBackend] that sends each call to [simulated] or to [real]. The machine id selects the backend.
@@ -14,6 +15,9 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * [authenticate] records the selected backend for the machine. All later calls for that machine go to the
  * recorded backend, also when [isSimulated] changes its answer. [disconnect] removes the record.
+ *
+ * [setSessionEvents] gives the receiver to the two backends, because each backend sends the events of its own
+ * machines.
  */
 class SelectingSshBackend(
     private val real: SshBackend,
@@ -66,4 +70,21 @@ class SelectingSshBackend(
 
     override fun disconnect(machineId: String) =
         (recordedBackends.remove(machineId) ?: select(machineId)).disconnect(machineId)
+
+    override fun setSessionEvents(events: SessionEvents) {
+        real.setSessionEvents(events)
+        simulated.setSessionEvents(events)
+    }
+
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult =
+        backendFor(machineId).checkLiveness(machineId, timeout)
+
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) =
+        backendFor(machineId).reconnectNow(machineId, deadSessionId)
+
+    override fun closeSockets(machineId: String) =
+        backendFor(machineId).closeSockets(machineId)
+
+    override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) =
+        backendFor(machine.id).refreshSurface(machine, route)
 }

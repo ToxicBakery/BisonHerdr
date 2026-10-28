@@ -35,7 +35,6 @@ import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.SshTransportManager
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.logging.Arbor
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -86,35 +85,34 @@ class BisonSessionService : Service(), DIAware {
     private var lastActiveAgentCount = 0
     private var disconnectAllLabel: String? = null
 
+    private val networkEvents = NetworkEventQueue()
+
+    /**
+     * Sends the changes of the default network to [networkEvents]. [collectNetworkEvents] gives them to
+     * [sshTransportManager] one at a time. The manager checks each machine a maximum of one time each second, so the
+     * two events after a change cause one check.
+     */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            log.d { "Default network available ($network); triggering fast roam" }
-            serviceScope.launch {
-                runCatching {
-                    sshTransportManager.onNetworkAvailable()
-                }.onFailure { error ->
-                    if (error is CancellationException) throw error
-                    log.w(error) { "Error handling onAvailable network roam" }
-                }
-            }
+            log.d { "Default network available ($network); check the sessions" }
+            networkEvents.send(NetworkEventQueue.Event.Available)
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-            log.d { "Network link properties changed (${linkProperties.interfaceName}); refreshing Mosh/SSH streams" }
-            serviceScope.launch {
-                runCatching {
-                    sshTransportManager.onNetworkAvailable()
-                }.onFailure { error ->
-                    if (error is CancellationException) throw error
-                    log.w(error) { "Error handling onLinkPropertiesChanged network roam" }
-                }
-            }
+            log.d { "Network link properties changed (${linkProperties.interfaceName}); check the sessions" }
+            networkEvents.send(NetworkEventQueue.Event.LinkPropertiesChanged)
+        }
+
+        override fun onLost(network: Network) {
+            log.d { "Default network lost ($network); close the SSH sockets" }
+            networkEvents.send(NetworkEventQueue.Event.Lost)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannels()
+        collectNetworkEvents()
         registerNetworkCallback()
         collectSshRequests()
         observeSessionStatusForForegroundNotification()
@@ -174,6 +172,24 @@ class BisonSessionService : Service(), DIAware {
         }
     }
 
+    /** Gives the network events to [sshTransportManager], one at a time and in order. */
+    private fun collectNetworkEvents() {
+        serviceScope.launch {
+            networkEvents.run(
+                handle = { event ->
+                    when (event) {
+                        NetworkEventQueue.Event.Available,
+                        NetworkEventQueue.Event.LinkPropertiesChanged,
+                        -> sshTransportManager.onNetworkAvailable()
+
+                        NetworkEventQueue.Event.Lost -> sshTransportManager.onNetworkLost()
+                    }
+                },
+                onError = { event, error -> log.w(error) { "Could not handle the network event $event" } },
+            )
+        }
+    }
+
     private fun collectSshRequests() {
         val fastInteractiveQueue = Channel<SshRequest>(Channel.UNLIMITED)
         val controlQueue = Channel<SshRequest>(Channel.UNLIMITED)
@@ -183,7 +199,7 @@ class BisonSessionService : Service(), DIAware {
                 runCatching {
                     dispatchSshRequest(request)
                 }.onFailure { error ->
-                    if (error is CancellationException) throw error
+                    rethrowIfCancelled(error)
                     log.e(error) { "Failed to handle fast interactive SshRequest: $request" }
                 }
             }
@@ -284,7 +300,7 @@ class BisonSessionService : Service(), DIAware {
                     getString(Res.string.service_notification_action_disconnect_all)
                 }
             }.onFailure { error ->
-                if (error is CancellationException) throw error
+                rethrowIfCancelled(error)
                 log.w(error) { "Could not load the Disconnect All label" }
             }.getOrNull()
             combine(

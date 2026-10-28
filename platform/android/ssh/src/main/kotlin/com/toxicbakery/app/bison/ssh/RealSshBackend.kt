@@ -9,6 +9,7 @@ import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
+import kotlin.time.Duration
 
 /**
  * The [SshBackend] that connects to a real Herdr host over JSch through [RealHerdrSshClient].
@@ -20,6 +21,9 @@ import java.io.IOException
  *
  * A password login reads the password from the [SecretStore]. When the store has no password, [authenticate]
  * returns [SshAuthResult.Failed] with a [MissingSecretException], and the client opens no connection.
+ *
+ * After a connect, the client reconnects on its own when the session closes, and sends the events of the loop to
+ * the receiver of [setSessionEvents]. See [SessionSupervisor].
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -108,9 +112,38 @@ class RealSshBackend internal constructor(
         client.disconnect(machineId)
     }
 
+    override fun setSessionEvents(events: SessionEvents) {
+        client.sessionEvents = events
+    }
+
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult =
+        client.checkLiveness(machineId, timeout)
+
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) {
+        client.reconnectNow(machineId, deadSessionId)
+    }
+
+    override fun closeSockets(machineId: String) {
+        client.closeSockets(machineId)
+    }
+
+    override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) {
+        client.refreshSnapshotAndSurface(machine, route)
+    }
+
     internal companion object {
         /** JSch starts the message of a refused login with one of these texts. */
         private val AUTH_FAILURE_PREFIXES = listOf("Auth fail", "Auth cancel")
+
+        /**
+         * JSch starts the message of these errors with one of these texts. The connection or the session closed, but
+         * the error has no [IOException] cause.
+         */
+        private val CLOSED_CONNECTION_PREFIXES = listOf(
+            "connection is closed by foreign host",
+            "channel is not opened.",
+            "session is down",
+        )
 
         /** The maximum number of causes that [toAuthResult] examines. */
         private const val MAX_CAUSE_DEPTH = 16
@@ -119,8 +152,11 @@ class RealSshBackend internal constructor(
          * Maps a login [error] from JSch to its [SshAuthResult] kind. A rejected host key is its
          * [SshAuthResult.HostKeyRejected] kind. A [MissingKeyException] at any level of the cause chain is
          * [SshAuthResult.KeyMissing]. A refused login is [SshAuthResult.AuthFailed]. An [IOException] at
-         * any level of the cause chain is [SshAuthResult.NetworkError]. All other errors
-         * are [SshAuthResult.Failed].
+         * any level of the cause chain is [SshAuthResult.NetworkError]. A [JSchException] with a message that
+         * starts with a text of [CLOSED_CONNECTION_PREFIXES] is also [SshAuthResult.NetworkError]. Only the message
+         * of [error] counts, because a cause with that text can be in an error that tells a different kind, for
+         * example a channel that the bastion refuses ([BastionChannelProxy.openFailure]). All other errors are
+         * [SshAuthResult.Failed].
          */
         fun toAuthResult(error: Throwable): SshAuthResult {
             val message = error.message.orEmpty()
@@ -134,6 +170,9 @@ class RealSshBackend internal constructor(
 
                 error is JSchException && AUTH_FAILURE_PREFIXES.any { message.startsWith(it) } ->
                     SshAuthResult.AuthFailed(message)
+
+                error is JSchException && CLOSED_CONNECTION_PREFIXES.any { message.startsWith(it) } ->
+                    SshAuthResult.NetworkError(error)
 
                 generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).any { it is IOException } ->
                     SshAuthResult.NetworkError(error)

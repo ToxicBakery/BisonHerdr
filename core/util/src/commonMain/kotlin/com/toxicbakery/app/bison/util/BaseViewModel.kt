@@ -1,12 +1,13 @@
 package com.toxicbakery.app.bison.util
 
 import androidx.lifecycle.ViewModel
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 
 /**
@@ -26,8 +27,17 @@ abstract class BaseViewModel<State, Event, Action>(
     protected val mutableState: MutableStateFlow<State> = MutableStateFlow(initialState)
     val state: StateFlow<State> = mutableState.asStateFlow()
 
-    private val mutableActions: MutableSharedFlow<Action> = MutableSharedFlow(extraBufferCapacity = 64)
-    val actions: SharedFlow<Action> = mutableActions.asSharedFlow()
+    private val actionChannel = Channel<Action>(
+        capacity = ACTION_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * The one-time actions, in order. Each action goes to one collector. An action that the view model sends before
+     * the screen collects waits in a buffer of [ACTION_CAPACITY] actions, so that the screen does not lose it. When
+     * the buffer is full, the oldest action goes away.
+     */
+    val actions: Flow<Action> = actionChannel.receiveAsFlow()
 
     abstract fun onEvent(event: Event)
 
@@ -40,10 +50,15 @@ abstract class BaseViewModel<State, Event, Action>(
     }
 
     protected fun emitAction(action: Action) {
-        mutableActions.tryEmit(action)
+        actionChannel.trySend(action)
     }
 
     protected suspend fun sendAction(action: Action) {
-        mutableActions.emit(action)
+        actionChannel.send(action)
+    }
+
+    private companion object {
+        /** The maximum number of actions that wait for a collector. */
+        const val ACTION_CAPACITY = 64
     }
 }

@@ -111,6 +111,12 @@ class WorkspaceTerminalViewModel(
 
     sealed interface Action {
         data object OpenMachineFederation : Action
+
+        /**
+         * Opens the connecting screen of [machineId]. The connection of the machine stopped for a host key decision
+         * or for a different cause that needs the user, and that screen shows it.
+         */
+        data class OpenConnectingMachine(val machineId: String) : Action
     }
 
     private val defaultSettingsFlow = MutableStateFlow(AppSettings())
@@ -182,6 +188,25 @@ class WorkspaceTerminalViewModel(
     val hardwareKeyTouchPrompt: StateFlow<SshRequest.PromptHardwareKeyTouch?> =
         sshStateManager.hardwareKeyTouchPrompt
 
+    init {
+        // The active machine needs a host key decision or a different action from the user. Show the connecting
+        // screen, because the terminal screen cannot show the cause. This occurs after a switch to the machine,
+        // and when the reconnect loop of the machine stops for the user.
+        viewModelScope.launch {
+            combine(
+                activeMachineIdFlow,
+                sshStateManager.hostKeyPrompts,
+                sshStateManager.needsUser,
+            ) { activeId, prompts, needsUser ->
+                activeId.takeIf { it in prompts || it in needsUser }
+            }
+                .distinctUntilChanged()
+                .collect { machineId ->
+                    if (machineId != null) sendAction(Action.OpenConnectingMachine(machineId))
+                }
+        }
+    }
+
     fun focusedPaneId(): String {
         val snapshotFocused = activeSnapshot.value?.focusedPaneId
         if (!snapshotFocused.isNullOrBlank()) return snapshotFocused
@@ -200,12 +225,19 @@ class WorkspaceTerminalViewModel(
     override fun onEvent(event: Event) {
         when (event) {
             is Event.SwitchMachine -> {
-                updateState { it.copy(activeMachineId = event.targetMachineId, isTypingHudFaded = false) }
-                viewModelScope.launch {
-                    if (!sshStateManager.isMachineConnected(event.targetMachineId)) {
-                        connect(event.targetMachineId)
+                val targetId = event.targetMachineId
+                updateState { it.copy(activeMachineId = targetId, isTypingHudFaded = false) }
+                // A machine that needs the user does not connect again on its own. The init block opens its
+                // connecting screen, and the user decides there.
+                val needsUser = targetId in sshStateManager.hostKeyPrompts.value ||
+                    targetId in sshStateManager.needsUser.value
+                if (!needsUser) {
+                    viewModelScope.launch {
+                        if (!sshStateManager.isMachineConnected(targetId)) {
+                            connect(targetId)
+                        }
+                        setSurfaceLease(targetId, active = true)
                     }
-                    setSurfaceLease(event.targetMachineId, active = true)
                 }
             }
 
@@ -618,40 +650,25 @@ class WorkspaceTerminalViewModel(
     private fun handleSubmitPrompt(prompt: String, target: PromptTarget) {
         if (prompt.isBlank()) return
         val targetMachineId = state.value.activeMachineId
-        val isRoaming = roamingStatus.value == RoamingStatus.RoamingReconnect ||
+        val isRoaming = sshStateManager.roamingState.value[targetMachineId] == RoamingStatus.RoamingReconnect ||
             !sshStateManager.isMachineConnected(targetMachineId)
 
         viewModelScope.launch {
             when (target) {
                 PromptTarget.FocusedPane -> {
                     val agent = focusedPaneAgent()
-                    val paneId = agent?.paneId ?: focusedPaneId()
-                    if (isRoaming) {
-                        sshStateManager.enqueuePrompt(
-                            machineId = targetMachineId,
-                            paneId = paneId,
-                            prompt = prompt,
-                            agentName = agent?.name,
-                        )
-                    }
-                    submitPrompt(
+                    queueOrSubmit(
+                        isRoaming = isRoaming,
                         machineId = targetMachineId,
-                        paneId = paneId,
+                        paneId = agent?.paneId ?: focusedPaneId(),
                         agentName = agent?.name,
                         prompt = prompt,
                     )
                 }
 
                 is PromptTarget.SpecificAgent -> {
-                    if (isRoaming) {
-                        sshStateManager.enqueuePrompt(
-                            machineId = targetMachineId,
-                            paneId = target.paneId,
-                            prompt = prompt,
-                            agentName = target.agentName,
-                        )
-                    }
-                    submitPrompt(
+                    queueOrSubmit(
+                        isRoaming = isRoaming,
                         machineId = targetMachineId,
                         paneId = target.paneId,
                         agentName = target.agentName,
@@ -665,15 +682,8 @@ class WorkspaceTerminalViewModel(
                         ?: listOf(focusedPaneId())
                     panes.forEach { paneId ->
                         val paneAgent = activeSnapshot.value?.agents?.firstOrNull { it.paneId == paneId }
-                        if (isRoaming) {
-                            sshStateManager.enqueuePrompt(
-                                machineId = targetMachineId,
-                                paneId = paneId,
-                                prompt = prompt,
-                                agentName = paneAgent?.name,
-                            )
-                        }
-                        submitPrompt(
+                        queueOrSubmit(
+                            isRoaming = isRoaming,
                             machineId = targetMachineId,
                             paneId = paneId,
                             agentName = paneAgent?.name,
@@ -682,6 +692,37 @@ class WorkspaceTerminalViewModel(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Puts [prompt] in the queue while [isRoaming] is true, and sends it in all other cases. The transport sends
+     * the queue after the connect or the reconnect.
+     *
+     * Do not queue the prompt and also send it. The transport also puts a prompt in the queue while it reconnects,
+     * so the prompt then goes out two times.
+     */
+    private suspend fun queueOrSubmit(
+        isRoaming: Boolean,
+        machineId: String,
+        paneId: String,
+        agentName: String?,
+        prompt: String,
+    ) {
+        if (isRoaming) {
+            sshStateManager.enqueuePrompt(
+                machineId = machineId,
+                paneId = paneId,
+                prompt = prompt,
+                agentName = agentName,
+            )
+        } else {
+            submitPrompt(
+                machineId = machineId,
+                paneId = paneId,
+                agentName = agentName,
+                prompt = prompt,
+            )
         }
     }
 

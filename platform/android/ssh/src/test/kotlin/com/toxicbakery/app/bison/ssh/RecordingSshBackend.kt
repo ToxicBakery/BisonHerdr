@@ -5,17 +5,36 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.time.Duration
+import kotlinx.coroutines.delay
 
 /**
  * An [SshBackend] that records each call and opens no connection. [authenticate] returns [authResult].
  * A test can change [authResult] between two calls.
+ *
+ * [checkLiveness] waits for [livenessDelay] and then returns [liveness]. [openSurface] runs [onOpenSurface], and
+ * [sendEndpointCommand] runs [onSendEndpointCommand], so that a test can make the step throw or wait.
+ * [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
+ * reconnect loop.
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
+    @Volatile var liveness: LivenessResult = LivenessResult.Live,
+    private val onOpenSurface: (suspend () -> Unit)? = null,
+    private val onSendEndpointCommand: (suspend () -> Unit)? = null,
 ) : SshBackend {
 
     /** One entry for each call: the method name and the machine id, for example `resize workbox`. */
     val calls: MutableList<String> = CopyOnWriteArrayList()
+
+    /** The time that each liveness check takes. */
+    @Volatile
+    var livenessDelay: Duration = Duration.ZERO
+
+    /** The receiver of the reconnect events, or null before [setSessionEvents]. */
+    @Volatile
+    var sessionEvents: SessionEvents? = null
+        private set
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
         calls += "authenticate ${machine.id}"
@@ -34,6 +53,7 @@ internal class RecordingSshBackend(
         isSurfaceActive: () -> Boolean,
     ) {
         calls += "openSurface ${machine.id}"
+        onOpenSurface?.invoke()
     }
 
     override suspend fun sendEndpointCommand(
@@ -43,6 +63,7 @@ internal class RecordingSshBackend(
         isMoshActive: Boolean,
     ): String? {
         calls += "sendEndpointCommand ${machine.id}"
+        onSendEndpointCommand?.invoke()
         return null
     }
 
@@ -62,5 +83,27 @@ internal class RecordingSshBackend(
 
     override fun disconnect(machineId: String) {
         calls += "disconnect $machineId"
+    }
+
+    override fun setSessionEvents(events: SessionEvents) {
+        sessionEvents = events
+    }
+
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): LivenessResult {
+        calls += "checkLiveness $machineId"
+        delay(livenessDelay)
+        return liveness
+    }
+
+    override fun reconnectNow(machineId: String, deadSessionId: Long?) {
+        calls += "reconnectNow $machineId $deadSessionId"
+    }
+
+    override fun closeSockets(machineId: String) {
+        calls += "closeSockets $machineId"
+    }
+
+    override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) {
+        calls += "refreshSurface ${machine.id}"
     }
 }

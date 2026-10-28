@@ -8,6 +8,10 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.net.ConnectException
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.SocketException
+import kotlin.concurrent.thread
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -145,6 +149,46 @@ class RealSshClientTest {
     }
 
     @Test
+    fun aHostThatClosesEachConnectionAtOnceGivesANetworkError() = runTest {
+        // The host accepts the TCP connection and closes it before it sends its SSH version.
+        ServerSocket(0, BACKLOG, InetAddress.getByName(TestSshServer.HOST)).use { socket ->
+            val acceptor = thread(name = "accept-then-close") {
+                try {
+                    while (true) socket.accept().close()
+                } catch (_: SocketException) {
+                    // The test closed the socket.
+                }
+            }
+            val machine = machine(
+                id = "closed-by-host",
+                username = TestSshServer.PASSWORD_USER,
+                authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(PASSWORD_REF)),
+            ).copy(port = socket.localPort)
+            val route = ProxyJumpTunnel().resolveRoute(machine)
+
+            val result = assertIs<SshAuthResult.NetworkError>(backend.authenticate(machine, route), debugLogDump())
+
+            assertEquals("connection is closed by foreign host", result.cause.message)
+            socket.close()
+            acceptor.join(CONNECT_TIMEOUT_MS.toLong())
+        }
+    }
+
+    @Test
+    fun jschErrorsOfAClosedConnectionAreNetworkErrors() {
+        val errors = listOf(
+            JSchException("connection is closed by foreign host"),
+            JSchException("channel is not opened."),
+            JSchException("session is down"),
+            BastionConnectException("jump@bastion.example:22", JSchException("connection is closed by foreign host")),
+        )
+
+        errors.forEach { error ->
+            assertEquals(SshAuthResult.NetworkError(error), RealSshBackend.toAuthResult(error), error.message)
+        }
+    }
+
+    @Test
     fun otherLoginErrorsAreFailed() {
         val error = JSchException("Algorithm negotiation fail")
 
@@ -232,6 +276,7 @@ class RealSshClientTest {
         /** A key alias that the key manager does not have. */
         const val MISSING_ALIAS = "real_ssh_client_test_missing_key"
         const val CONNECT_TIMEOUT_MS = 10_000
+        const val BACKLOG = 4
 
         /** The secret reference of [TestSshServer.PASSWORD]. */
         const val PASSWORD_REF = "password-test-server"

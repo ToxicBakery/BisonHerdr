@@ -9,13 +9,17 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ControlRequestRunnerTest {
@@ -57,6 +61,59 @@ class ControlRequestRunnerTest {
     }
 
     @Test
+    fun aTimeoutInsideARequestIsAFailedRequestAndTheLoopContinues() = runTest {
+        val requests = listOf(connect, SshRequest.Disconnect("workbox"))
+        val handled = mutableListOf<SshRequest>()
+        val errors = mutableListOf<Throwable>()
+
+        // The same loop as the control queue of the service.
+        for (request in requests) {
+            stateManager.runControlRequest(request) {
+                if (it is SshRequest.Connect) {
+                    stateManager.setConnectionProgress("workbox", ConnectionProgress.AuthenticatingSsh)
+                    withTimeout(TIMEOUT_MS) { awaitCancellation() }
+                }
+                handled += it
+            }?.let(errors::add)
+        }
+
+        assertIs<TimeoutCancellationException>(errors.single())
+        assertEquals(listOf<SshRequest>(SshRequest.Disconnect("workbox")), handled)
+        assertEquals(ConnectionProgress.Failed, progress())
+    }
+
+    @Test
+    fun aCancellationExceptionWhileTheCallerIsActiveIsAFailedRequest() = runTest {
+        val error = stateManager.runControlRequest(SshRequest.Disconnect("workbox")) {
+            throw CancellationException("A request cancelled its own work")
+        }
+
+        assertIs<CancellationException>(error)
+    }
+
+    @Test
+    fun rethrowIfCancelledThrowsOnlyForACancelledCaller() = runTest {
+        val error = CancellationException("stop")
+        // The caller is active, so the function does not throw.
+        rethrowIfCancelled(error)
+        rethrowIfCancelled(IOException("not a cancellation"))
+
+        var thrown: Throwable? = null
+        val cancelledCaller = launch {
+            try {
+                awaitCancellation()
+            } finally {
+                thrown = runCatching { rethrowIfCancelled(error) }.exceptionOrNull()
+            }
+        }
+        runCurrent()
+        cancelledCaller.cancel()
+        runCurrent()
+
+        assertSame(error, thrown)
+    }
+
+    @Test
     fun aConnectThatCompletesKeepsItsProgress() = runTest {
         val error = stateManager.runControlRequest(connect) {
             stateManager.markMachineConnected("workbox", ActiveBackbone.SshEndpoint(rttMs = 10))
@@ -86,5 +143,9 @@ class ControlRequestRunnerTest {
 
         assertIs<IOException>(error)
         assertEquals(ConnectionProgress.VerifyingUdpOrHello, progress())
+    }
+
+    private companion object {
+        const val TIMEOUT_MS = 10L
     }
 }

@@ -216,4 +216,24 @@ class SshManagersAndBusesTest {
         stateManager.clearHostKeyPrompt("workbox")
         assertEquals(mapOf("gpu-rig" to other), stateManager.hostKeyPrompts.value)
     }
+
+    @Test
+    fun needsUserKeepsOneCauseForEachMachineAndAConnectRemovesIt() {
+        val stateManager = SshStateManager()
+        val refused = NeedsUserCause.LoginRefused("Auth fail")
+
+        stateManager.setNeedsUser("workbox", NeedsUserCause.KeyMissing("work_key"))
+        stateManager.setNeedsUser("gpu-rig", NeedsUserCause.PasswordMissing)
+        stateManager.setNeedsUser("workbox", refused)
+        assertEquals(
+            mapOf("workbox" to refused, "gpu-rig" to NeedsUserCause.PasswordMissing),
+            stateManager.needsUser.value,
+        )
+
+        stateManager.clearNeedsUser("gpu-rig")
+        assertEquals(mapOf("workbox" to refused), stateManager.needsUser.value)
+
+        stateManager.markMachineConnected("workbox", ActiveBackbone.SshEndpoint(rttMs = 10))
+        assertTrue(stateManager.needsUser.value.isEmpty())
+    }
 }

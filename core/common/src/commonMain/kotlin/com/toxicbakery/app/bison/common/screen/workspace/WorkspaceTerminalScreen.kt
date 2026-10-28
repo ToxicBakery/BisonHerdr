@@ -29,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.toxicbakery.app.bison.common.navigation.NavigationController
+import com.toxicbakery.app.bison.common.navigation.ScreenKeyConnectingMachine
 import com.toxicbakery.app.bison.common.navigation.ScreenKeyMachineFederation
 import com.toxicbakery.app.bison.common.screen.workspace.composable.AgentCommandCenterDrawer
 import com.toxicbakery.app.bison.common.screen.workspace.composable.SplitThumbBottomBar
@@ -80,6 +81,19 @@ fun WorkspaceTerminalScreen(
     LaunchedEffect(machineId, workspaceId) {
         if (workspaceId != null) {
             viewModel.onEvent(WorkspaceTerminalViewModel.Event.FocusWorkspace(workspaceId))
+        }
+    }
+
+    LaunchedEffect(viewModel) {
+        viewModel.actions.collect { action ->
+            when (action) {
+                WorkspaceTerminalViewModel.Action.OpenMachineFederation ->
+                    navigationController.goTo(ScreenKeyMachineFederation)
+
+                // The connecting screen replaces this screen. After the connect, it opens the terminal again.
+                is WorkspaceTerminalViewModel.Action.OpenConnectingMachine ->
+                    navigationController.replaceWith(ScreenKeyConnectingMachine(action.machineId))
+            }
         }
     }
 
