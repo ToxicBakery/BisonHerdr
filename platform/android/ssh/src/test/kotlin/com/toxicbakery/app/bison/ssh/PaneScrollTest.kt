@@ -83,6 +83,7 @@ class PaneScrollTest {
         paneSurfaceBus = surfaceBus,
         semanticNotificationBus = SemanticNotificationBus(),
         knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+        secretStore = InMemorySecretStore(),
         remoteBatchExecutor = { _, _, lane, commands -> fake.execute(lane, commands) },
     )
 

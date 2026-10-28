@@ -17,6 +17,9 @@ import java.io.IOException
  *
  * Each session checks the host key against the [KnownHostsStore] before it sends credentials. [authenticate]
  * returns [SshAuthResult.HostKeyUnknown] or [SshAuthResult.HostKeyChanged] when the check stops the session.
+ *
+ * A password login reads the password from the [SecretStore]. When the store has no password, [authenticate]
+ * returns [SshAuthResult.Failed] with a [MissingSecretException], and the client opens no connection.
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -31,6 +34,7 @@ class RealSshBackend internal constructor(
         semanticNotificationBus: SemanticNotificationBus,
         keystoreKeyManager: AndroidKeystoreKeyManager,
         knownHostsStore: KnownHostsStore,
+        secretStore: SecretStore,
     ) : this(
         client = RealHerdrSshClient(
             sshDebugLog = sshDebugLog,
@@ -39,6 +43,7 @@ class RealSshBackend internal constructor(
             semanticNotificationBus = semanticNotificationBus,
             knownHostsStore = knownHostsStore,
             keystoreKeyManagerProvider = { keystoreKeyManager },
+            secretStore = secretStore,
         ),
         sshStateManager = sshStateManager,
     )

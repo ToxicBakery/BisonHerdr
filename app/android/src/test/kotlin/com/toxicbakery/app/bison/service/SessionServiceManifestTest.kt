@@ -1,5 +1,8 @@
 package com.toxicbakery.app.bison.service
 
+import com.toxicbakery.app.bison.store.AppSettingsStore
+import com.toxicbakery.app.bison.store.KnownHostsStore
+import com.toxicbakery.app.bison.store.MachineStore
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.test.Test
@@ -8,19 +11,17 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import org.w3c.dom.Document
 import org.w3c.dom.Element
+import org.w3c.dom.NodeList
 
 /**
- * Checks the manifest entries of [BisonSessionService].
+ * Checks the manifest entries of [BisonSessionService] and the backup rules of the app.
  *
  * `startForeground` throws when it passes a type that the manifest does not declare. Thus the
  * manifest type and the type in [BisonSessionService] must agree.
  */
 class SessionServiceManifestTest {
 
-    private val manifest: Document = DocumentBuilderFactory.newInstance()
-        .apply { isNamespaceAware = true }
-        .newDocumentBuilder()
-        .parse(manifestFile())
+    private val manifest: Document = parse(sourceFile("src/main/AndroidManifest.xml"))
 
     @Test
     fun serviceDeclaresOnlyTheSpecialUseType() {
@@ -60,17 +61,50 @@ class SessionServiceManifestTest {
         assertFalse("android.hardware.usb.host" in features)
     }
 
-    private fun elements(tagName: String): List<Element> {
-        val nodes = manifest.getElementsByTagName(tagName)
-        return (0 until nodes.length).map { index -> nodes.item(index) as Element }
+    /**
+     * Backups keep the machine list, the settings, and the known hosts, because they hold no secret. The include
+     * lists keep all other files out, for example the temporary files and the corrupt copies. The encrypted
+     * passwords are in `noBackupFilesDir`, which backups never read.
+     */
+    @Test
+    fun backupRulesIncludeOnlyTheStoreFilesThatHoldNoSecret() {
+        val application = elements("application").single()
+        assertEquals("true", application.androidAttribute("allowBackup"))
+        assertEquals("@xml/data_extraction_rules", application.androidAttribute("dataExtractionRules"))
+
+        val rules = parse(sourceFile("src/main/res/xml/data_extraction_rules.xml"))
+        val storeFiles = listOf(
+            MachineStore.MACHINES_FILE_NAME,
+            AppSettingsStore.SETTINGS_FILE_NAME,
+            KnownHostsStore.KNOWN_HOSTS_FILE_NAME,
+        )
+        for (sectionName in listOf("cloud-backup", "device-transfer")) {
+            val section = rules.elements(sectionName).single()
+            val includes = section.elements("include").map { it.getAttribute("domain") to it.getAttribute("path") }
+            assertEquals(storeFiles.map { "file" to it }, includes, sectionName)
+            assertTrue(section.elements("exclude").isEmpty(), sectionName)
+        }
+        assertEquals("true", rules.elements("cloud-backup").single().getAttribute("disableIfNoEncryptionCapabilities"))
     }
+
+    private fun elements(tagName: String): List<Element> = manifest.elements(tagName)
+
+    private fun Document.elements(tagName: String): List<Element> = getElementsByTagName(tagName).toElements()
+
+    private fun Element.elements(tagName: String): List<Element> = getElementsByTagName(tagName).toElements()
+
+    private fun NodeList.toElements(): List<Element> = (0 until length).map { index -> item(index) as Element }
 
     private fun Element.androidAttribute(name: String): String = getAttributeNS(ANDROID_NAMESPACE, name)
 
-    private fun manifestFile(): File =
+    private fun parse(file: File): Document = DocumentBuilderFactory.newInstance()
+        .apply { isNamespaceAware = true }
+        .newDocumentBuilder()
+        .parse(file)
+
+    private fun sourceFile(path: String): File =
         // Gradle runs the unit tests in the module directory. The second path is for a run from the root.
-        listOf(File("src/main/AndroidManifest.xml"), File("app/android/src/main/AndroidManifest.xml"))
-            .first { file -> file.isFile }
+        listOf(File(path), File("app/android/$path")).first { file -> file.isFile }
 
     private companion object {
         const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"

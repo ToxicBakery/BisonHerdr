@@ -22,7 +22,7 @@ import kotlinx.coroutines.test.runTest
  * Tests [RealSshBackend] and [RealHerdrSshClient] against a real SSH server ([TestSshServer]).
  *
  * The known hosts have the host key of the server, so each login gets to the authentication step.
- * [HostKeyCheckTest] tests the host key check.
+ * [HostKeyCheckTest] tests the host key check. A password login reads the password from [secretStore].
  */
 class RealSshClientTest {
 
@@ -30,6 +30,9 @@ class RealSshClientTest {
     private val server = TestSshServer().start()
     private val knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()).apply {
         runBlocking { put(server.knownHost()) }
+    }
+    private val secretStore = softwareKeySecretStore().apply {
+        runBlocking { put(PASSWORD_REF, TestSshServer.PASSWORD.encodeToByteArray()) }
     }
     private val backend = RealSshBackend(
         sshStateManager = SshStateManager(),
@@ -39,6 +42,7 @@ class RealSshClientTest {
         semanticNotificationBus = SemanticNotificationBus(),
         keystoreKeyManager = server.keyManager,
         knownHostsStore = knownHostsStore,
+        secretStore = secretStore,
     )
     private val machines = mutableListOf<HostMachine>()
 
@@ -49,16 +53,46 @@ class RealSshClientTest {
     }
 
     @Test
-    fun passwordLoginRunsACommand() = runTest {
+    fun passwordLoginReadsThePasswordFromTheSecretStoreAndRunsACommand() = runTest {
         val machine = machine(
             id = "password-login",
+            username = TestSshServer.PASSWORD_USER,
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(PASSWORD_REF)),
+        )
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+
+        assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
+        assertEquals("password login ok", backend.client.runCommand(machine, route, "echo password login ok").trim())
+    }
+
+    @Test
+    fun aMissingSecretStopsTheLoginBeforeTheConnection() = runTest {
+        val machine = machine(
+            id = "missing-secret",
+            username = TestSshServer.PASSWORD_USER,
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format("password-absent")),
+        )
+        val route = ProxyJumpTunnel().resolveRoute(machine)
+
+        val result = assertIs<SshAuthResult.Failed>(backend.authenticate(machine, route), debugLogDump())
+
+        val expected = MissingSecretException.messageFor(machine.name)
+        assertEquals(expected, assertIs<MissingSecretException>(result.cause).message)
+        assertEquals(0, server.credentialChecks, "The client sent credentials without a password")
+        assertTrue(debugLog.entries.value.any { it.isError && it.message.contains(expected) }, debugLogDump())
+    }
+
+    @Test
+    fun aPlainTextPasswordThatTheMigrationDidNotMoveStillLogsIn() = runTest {
+        val machine = machine(
+            id = "plain-text-password",
             username = TestSshServer.PASSWORD_USER,
             authMethod = SshAuthMethod.Password(encryptedPasswordRef = TestSshServer.PASSWORD),
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
 
         assertEquals(SshAuthResult.Success, backend.authenticate(machine, route), debugLogDump())
-        assertEquals("password login ok", backend.client.runCommand(machine, route, "echo password login ok").trim())
+        assertTrue(debugLog.entries.value.none { TestSshServer.PASSWORD in it.message }, debugLogDump())
     }
 
     @Test
@@ -79,9 +113,10 @@ class RealSshClientTest {
         val machine = machine(
             id = "wrong-password",
             username = TestSshServer.PASSWORD_USER,
-            authMethod = SshAuthMethod.Password(encryptedPasswordRef = "not the password"),
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(WRONG_PASSWORD_REF)),
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
+        secretStore.put(WRONG_PASSWORD_REF, "not the password".encodeToByteArray())
 
         val result = assertIs<SshAuthResult.AuthFailed>(backend.authenticate(machine, route))
         assertTrue(result.message.startsWith(AUTH_FAIL), result.message)
@@ -100,7 +135,7 @@ class RealSshClientTest {
         val machine = machine(
             id = "stopped-server",
             username = TestSshServer.PASSWORD_USER,
-            authMethod = SshAuthMethod.Password(encryptedPasswordRef = TestSshServer.PASSWORD),
+            authMethod = SshAuthMethod.Password(encryptedPasswordRef = SecretRef.format(PASSWORD_REF)),
         )
         val route = ProxyJumpTunnel().resolveRoute(machine)
         server.stop()
@@ -197,5 +232,9 @@ class RealSshClientTest {
         /** A key alias that the key manager does not have. */
         const val MISSING_ALIAS = "real_ssh_client_test_missing_key"
         const val CONNECT_TIMEOUT_MS = 10_000
+
+        /** The secret reference of [TestSshServer.PASSWORD]. */
+        const val PASSWORD_REF = "password-test-server"
+        const val WRONG_PASSWORD_REF = "password-wrong"
     }
 }

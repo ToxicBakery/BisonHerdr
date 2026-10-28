@@ -9,15 +9,23 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 /**
- * Android [StoreIOProvider] backed by [Context.getFilesDir] using atomic temporary-file writes,
+ * Android [StoreIOProvider] backed by a directory of the app, using atomic temporary-file writes,
  * file-descriptor `sync()`, and `Files.move(..., StandardCopyOption.REPLACE_EXISTING)`.
+ *
+ * [directory] gives the directory. The provider makes it at the first use.
  */
 class StoreIOProviderAndroid(
-    private val context: Context,
+    private val directory: () -> File,
 ) : StoreIOProvider {
 
+    /**
+     * Uses [Context.getFilesDir]. Auto Backup reads this directory, so the backup rules of the app manifest
+     * select the files that a backup copies.
+     */
+    constructor(context: Context) : this(directory = { context.filesDir })
+
     private val storageDir: File by lazy {
-        context.filesDir.apply { mkdirs() }
+        directory().apply { mkdirs() }
     }
 
     private fun resolveFile(fileName: String): File =
@@ -46,7 +54,7 @@ class StoreIOProviderAndroid(
     override fun moveCorruptAside(fileName: String) {
         val corruptFile = resolveFile(fileName)
         if (!corruptFile.exists()) return
-        val backupFile = resolveFile("$fileName.corrupt.${System.currentTimeMillis()}")
+        val backupFile = resolveFile("$fileName${StoreIOProvider.CORRUPT_COPY_INFIX}${System.currentTimeMillis()}")
         log.w { "Backing up corrupt store file $fileName to ${backupFile.name}" }
         moveFile(corruptFile, backupFile)
     }
@@ -56,6 +64,17 @@ class StoreIOProviderAndroid(
             Files.deleteIfExists(resolveFile(fileName).toPath())
         } catch (error: Exception) {
             log.w(error) { "Unable to delete $fileName" }
+        }
+    }
+
+    override fun deleteCorruptCopies(fileName: String) {
+        val prefix = "$fileName${StoreIOProvider.CORRUPT_COPY_INFIX}"
+        storageDir.listFiles { file -> file.name.startsWith(prefix) }?.forEach { file ->
+            try {
+                Files.deleteIfExists(file.toPath())
+            } catch (error: Exception) {
+                log.w(error) { "Unable to delete ${file.name}" }
+            }
         }
     }
 

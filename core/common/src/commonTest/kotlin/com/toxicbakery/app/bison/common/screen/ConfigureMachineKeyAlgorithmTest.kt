@@ -7,6 +7,7 @@ import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.model.KeystoreKeySupport
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.InMemorySecretStore
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.MachineStore
@@ -90,6 +91,7 @@ class ConfigureMachineKeyAlgorithmTest {
                 machineId = "",
                 machineStore = machineStore,
                 machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, SshRequestManager(), EndpointSnapshotBus()),
+                secretStore = InMemorySecretStore(),
                 keystoreKeySupport = noEd25519,
             )
             viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateHostname("devbox"))

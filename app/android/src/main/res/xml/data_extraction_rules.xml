@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backups copy only the store files that hold no secret. The include lists keep the temporary
+    files (*.tmp) and the corrupt copies (*.corrupt.*) out. The encrypted passwords and the device
+    marker are in noBackupFilesDir, which backups never read. A device key never leaves the device,
+    so a copy of an encrypted password has no use on a different device.
+-->
+<data-extraction-rules>
+    <cloud-backup disableIfNoEncryptionCapabilities="true">
+        <include domain="file" path="machines.json" />
+        <include domain="file" path="settings.json" />
+        <include domain="file" path="known_hosts.json" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="machines.json" />
+        <include domain="file" path="settings.json" />
+        <include domain="file" path="known_hosts.json" />
+    </device-transfer>
+</data-extraction-rules>

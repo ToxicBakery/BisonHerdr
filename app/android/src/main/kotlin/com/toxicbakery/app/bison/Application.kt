@@ -3,8 +3,10 @@ package com.toxicbakery.app.bison
 import android.content.Context
 import com.toxicbakery.app.bison.store.StoreIOProvider
 import com.toxicbakery.app.bison.store.StoreIOProviderAndroid
+import com.toxicbakery.app.bison.store.StoreIOProviderTags
 import com.toxicbakery.logging.Arbor
 import com.toxicbakery.logging.LogCatSeedling
+import java.io.File
 import org.kodein.di.DI
 import org.kodein.di.DIAware
 import org.kodein.di.bindProvider
@@ -25,6 +27,15 @@ class Application : android.app.Application(), DIAware {
                 context = instance<Application>()
             )
         }
+        // Backups do not read noBackupFilesDir. It has the device marker and the encrypted secrets.
+        bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.NO_BACKUP) {
+            val application = instance<Application>()
+            StoreIOProviderAndroid(directory = { application.noBackupFilesDir })
+        }
+        bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) {
+            val application = instance<Application>()
+            StoreIOProviderAndroid(directory = { File(application.noBackupFilesDir, SECRETS_DIRECTORY) })
+        }
     }
 
     override fun onCreate() {
@@ -37,5 +48,8 @@ class Application : android.app.Application(), DIAware {
 
     companion object {
         private val log = Arbor.tag("Application")
+
+        /** The directory of the encrypted secrets in `noBackupFilesDir`. */
+        private const val SECRETS_DIRECTORY = "secrets"
     }
 }

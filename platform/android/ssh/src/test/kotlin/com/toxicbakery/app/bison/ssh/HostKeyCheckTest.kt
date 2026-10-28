@@ -33,6 +33,7 @@ class HostKeyCheckTest {
         semanticNotificationBus = SemanticNotificationBus(),
         keystoreKeyManager = server.keyManager,
         knownHostsStore = knownHostsStore,
+        secretStore = InMemorySecretStore(),
     )
     private val passwordMachine = server.machine(
         id = "host-key-password",

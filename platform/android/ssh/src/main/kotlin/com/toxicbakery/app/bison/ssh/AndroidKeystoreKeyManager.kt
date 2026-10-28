@@ -218,6 +218,9 @@ class AndroidKeystoreKeyManager internal constructor(
         }
     }
 
+    /** Returns true when a key exists for [keyAlias]. It does not make a key. */
+    fun hasKey(keyAlias: String): Boolean = storedKeyExists(keyAlias)
+
     /**
      * Returns the stored key for [keyAlias] from [load], or null when the caller must create a key.
      *

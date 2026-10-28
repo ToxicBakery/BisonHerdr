@@ -218,6 +218,7 @@ class SshPlatformTest {
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
             knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+            secretStore = InMemorySecretStore(),
             remoteBatchExecutor = { _, _, lane, commands ->
                 if (lane == RealHerdrSshClient.WorkerLane.Input) inputLaneGate.await()
                 synchronized(recordedBatches) {

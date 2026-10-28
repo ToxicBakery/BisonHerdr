@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
@@ -50,6 +51,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -84,15 +86,19 @@ import com.toxicbakery.app.bison.resources.settings_about_open_release
 import com.toxicbakery.app.bison.resources.settings_about_update_available
 import com.toxicbakery.app.bison.resources.settings_app_check_updates
 import com.toxicbakery.app.bison.resources.settings_app_check_updates_summary
+import com.toxicbakery.app.bison.ssh.CredentialChecker
+import com.toxicbakery.app.bison.ssh.CredentialState
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.store.AppSettingsStore
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.version.AppVersion
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.localDI
 import org.kodein.di.instance
+import org.kodein.di.instanceOrNull
 
 /** Test tag of the top-bar chip indicating that a new release version is available. */
 const val UPDATE_AVAILABLE_TAG: String = "updateAvailable"
@@ -105,6 +111,20 @@ const val ABOUT_OPEN_RELEASE_TAG: String = "about-open-release"
 
 /** Test tag of the switch that toggles automatic daily update checks. */
 const val CHECK_FOR_UPDATES_TAG: String = "app-check-updates"
+
+/** The badge of a machine that needs a password or a key before a login can work. */
+const val NEEDS_SIGN_IN_LABEL: String = "Needs sign-in"
+
+/** The action of a machine that needs its password again. It opens the machine editor. */
+const val TYPE_PASSWORD_ACTION: String = "Type Password"
+
+/** The action of a machine that needs a new key. It opens the machine editor, which makes the key. */
+const val MAKE_NEW_KEY_ACTION: String = "Make a New Key"
+
+/** The notice after a restore from a backup, when a machine needs a password or a key again. */
+const val RESTORED_FROM_BACKUP_NOTICE: String =
+    "A backup does not keep passwords or device keys. Each machine that shows \"$NEEDS_SIGN_IN_LABEL\" " +
+        "needs its password again or a new key on this device."
 
 @Composable
 fun MachineFederationScreen(
@@ -135,8 +155,14 @@ fun MachineFederationScreen(
     val sshStateManager: SshStateManager by di.instance()
     val endpointSnapshotBus: EndpointSnapshotBus by di.instance()
     val appSettingsStore: AppSettingsStore by di.instance()
+    val credentialChecker: CredentialChecker? by di.instanceOrNull()
 
     val machines by machineStore.knownMachines.collectAsState()
+    val restoredFromBackup by machineStore.restoredFromBackup.collectAsState()
+    // The screen calculates the states again when the machines change and when the user comes back to the screen.
+    val credentialStates by produceState(emptyMap<String, CredentialState>(), machines, credentialChecker) {
+        value = credentialStatesOf(machines, credentialChecker)
+    }
     val connectedMachines by sshStateManager.connectedMachines.collectAsState()
     val backbones by sshStateManager.activeTransportBackbone.collectAsState()
     val snapshots by endpointSnapshotBus.snapshots.collectAsState()
@@ -248,18 +274,27 @@ fun MachineFederationScreen(
                     .fillMaxSize()
                     .padding(innerPadding),
             ) {
+                if (restoredFromBackup && credentialStates.values.any { it.needsSignIn }) {
+                    item(key = RESTORED_FROM_BACKUP_NOTICE, span = { GridItemSpan(maxLineSpan) }) {
+                        RestoredFromBackupNotice()
+                    }
+                }
                 items(machines, key = { it.id }) { machine ->
                     val isConnected = machine.id in connectedMachines
                     val backbone = backbones[machine.id]
                     val snapshot = snapshots[machine.id]
+                    val credentialState = credentialStates[machine.id] ?: CredentialState.Ready
                     HostMachineCard(
                         machine = machine,
                         isConnected = isConnected,
                         backbone = backbone,
                         snapshot = snapshot,
+                        credentialState = credentialState,
                         onPrimaryAction = {
                             when {
                                 isConnected -> onOpenWorkspaceTerminal(machine.id)
+                                // The editor takes the password again, or makes the key.
+                                credentialState.needsSignIn -> onConfigureMachine(machine.id)
                                 machine.authMethod.isSupported -> onConnectMachine(machine.id)
                                 // This version cannot connect with the method. The editor tells why (issue #23).
                                 else -> onConfigureMachine(machine.id)
@@ -286,12 +321,52 @@ fun MachineFederationScreen(
     }
 }
 
+/**
+ * Returns the [CredentialState] of each machine in [machines], by machine id. Without a [checker], or when the
+ * check fails, a machine is [CredentialState.Ready].
+ */
+private suspend fun credentialStatesOf(
+    machines: List<HostMachine>,
+    checker: CredentialChecker?,
+): Map<String, CredentialState> {
+    if (checker == null) return emptyMap()
+    return machines.associate { machine ->
+        val state = try {
+            checker.check(machine)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            CredentialState.Ready
+        }
+        machine.id to state
+    }
+}
+
+@Composable
+private fun RestoredFromBackupNotice() {
+    val palette = LocalBisonPalette.current
+    Surface(
+        color = palette.accentWarning.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, palette.accentWarning.copy(alpha = 0.45f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            text = RESTORED_FROM_BACKUP_NOTICE,
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.fgPrimary,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+    }
+}
+
 @Composable
 private fun HostMachineCard(
     machine: HostMachine,
     isConnected: Boolean,
     backbone: ActiveBackbone?,
     snapshot: ClientShellSnapshot?,
+    credentialState: CredentialState,
     onPrimaryAction: () -> Unit,
     onEdit: () -> Unit,
 ) {
@@ -303,6 +378,7 @@ private fun HostMachineCard(
         it.agentStatus == AgentStatus.Working
     } ?: 0
     val isAuthSupported = machine.authMethod.isSupported
+    val needsSignIn = !isConnected && credentialState.needsSignIn
 
     Surface(
         color = palette.bgSurface,
@@ -382,6 +458,12 @@ private fun HostMachineCard(
                         color = palette.accentError,
                     )
                 }
+                if (needsSignIn) {
+                    TelemetryBadge(
+                        text = NEEDS_SIGN_IN_LABEL,
+                        color = palette.accentWarning,
+                    )
+                }
                 if (snapshot != null) {
                     TelemetryBadge(
                         text = "${snapshot.workspaces.size} WS • ${snapshot.panes.size} Panes",
@@ -399,6 +481,14 @@ private fun HostMachineCard(
                         color = palette.accentSecondary,
                     )
                 }
+            }
+
+            if (needsSignIn && credentialState is CredentialState.KeyMissing) {
+                Text(
+                    text = credentialState.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.accentWarning,
+                )
             }
 
             Row(
@@ -419,7 +509,12 @@ private fun HostMachineCard(
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        text = if (isConnected) " Open Zen Canvas" else " Connect Host",
+                        text = when {
+                            isConnected -> " Open Zen Canvas"
+                            !needsSignIn -> " Connect Host"
+                            credentialState is CredentialState.KeyMissing -> " $MAKE_NEW_KEY_ACTION"
+                            else -> " $TYPE_PASSWORD_ACTION"
+                        },
                         fontWeight = FontWeight.SemiBold,
                     )
                 }

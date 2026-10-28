@@ -84,6 +84,10 @@ import kotlinx.serialization.json.put
  *
  * Each session checks the server host key against [knownHostsStore] through [KnownHostsRepository] before it
  * sends credentials. An unknown or changed key stops the session with a [HostKeyRejectedException].
+ *
+ * A password machine keeps a [SecretRef] value. The client reads the password from [secretStore] before each
+ * connection, and clears its copy after the connection. A missing password stops the session with a
+ * [MissingSecretException] before the client opens a connection.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -92,6 +96,8 @@ internal class RealHerdrSshClient(
     private val semanticNotificationBus: SemanticNotificationBus,
     private val knownHostsStore: KnownHostsStore,
     private val keystoreKeyManagerProvider: () -> AndroidKeystoreKeyManager = { AndroidKeystoreKeyManager() },
+    /** Gives the passwords of the machines that keep a [SecretRef] value. */
+    private val secretStore: SecretStore,
     private val remoteBatchExecutor: (
         suspend (
             machine: HostMachine,
@@ -1444,10 +1450,8 @@ internal class RealHerdrSshClient(
                 route.entryHost,
                 route.entryPort,
             )
-            if (machine.authMethod is SshAuthMethod.Password) {
-                val passwordAuth = machine.authMethod as SshAuthMethod.Password
-                session.setPassword(passwordAuth.encryptedPasswordRef.encodeToByteArray())
-            }
+            val password = (machine.authMethod as? SshAuthMethod.Password)?.let { resolvePassword(machine, it) }
+            password?.let(session::setPassword)
             val props = Properties().apply {
                 put("PreferredAuthentications", preferredAuths)
                 put("Compression", "none")
@@ -1459,10 +1463,37 @@ internal class RealHerdrSshClient(
                 session.setServerAliveCountMax(3)
             }
             JschAndroidCrypto.configureSession(session)
-            knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
+            try {
+                knownHostsRepository.connect(session, SOCKET_CONNECT_TIMEOUT_MS)
+            } finally {
+                // JSch keeps its own copy, and clears it after the login.
+                password?.fill(0)
+            }
             sessions[machine.id] = session
             session
         }
+    }
+
+    /**
+     * Returns the password of [machine]. Clear the result with zeros after use.
+     *
+     * A [SecretRef] value gives the password from [secretStore], or throws a [MissingSecretException]. A value with
+     * no prefix is a plain-text password that the load migration did not move. The client uses it as it is.
+     */
+    private suspend fun resolvePassword(machine: HostMachine, auth: SshAuthMethod.Password): ByteArray {
+        val value = auth.encryptedPasswordRef
+        if (!SecretRef.hasPrefix(value)) {
+            if (value.isNotEmpty()) {
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "The password of ${machine.name} is not in the secret store. The next start moves it.",
+                )
+            }
+            return value.encodeToByteArray()
+        }
+        val ref = SecretRef.parse(value) ?: throw MissingSecretException(machine.name)
+        return secretStore.get(ref) ?: throw MissingSecretException(machine.name)
     }
 
     private fun workerMapFor(lane: WorkerLane): ConcurrentHashMap<String, PersistentShellWorker> =

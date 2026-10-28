@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.common.screen.delegate.MachineViewModelDelegate
 import com.toxicbakery.app.bison.common.screen.machine.ConfigureMachineViewModel
 import com.toxicbakery.app.bison.model.KeyAlgorithm
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
+import com.toxicbakery.app.bison.ssh.InMemorySecretStore
 import com.toxicbakery.app.bison.ssh.KeyCreationException
 import com.toxicbakery.app.bison.ssh.KeyCreationFailure
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
@@ -48,6 +49,7 @@ class ConfigureMachinePublicKeyTest {
             machineId = "",
             machineStore = machineStore,
             machineViewModelDelegate = MachineViewModelDelegateImpl(machineStore, SshRequestManager(), EndpointSnapshotBus()),
+            secretStore = InMemorySecretStore(),
             sshPublicKeyProvider = provider,
         )
     }

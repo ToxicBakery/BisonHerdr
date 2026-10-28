@@ -10,15 +10,27 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.ssh.KeyCreationException
 import com.toxicbakery.app.bison.ssh.KeyCreationFailure
+import com.toxicbakery.app.bison.ssh.SecretRef
+import com.toxicbakery.app.bison.ssh.SecretStore
 import com.toxicbakery.app.bison.ssh.SshPublicKeyProvider
 import com.toxicbakery.app.bison.store.MachineStore
 import com.toxicbakery.app.bison.util.BaseViewModel
+import com.toxicbakery.logging.Arbor
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
+/**
+ * Edits one machine. A password goes into the [secretStore], and the machine keeps only a [SecretRef] value.
+ *
+ * - The password field never shows the stored password. When it is empty, "Save Host" keeps the stored password.
+ * - A new password gets a new reference, and the save removes the old secret.
+ * - A delete of the machine removes its secret.
+ */
 class ConfigureMachineViewModel(
     val machineId: String,
     private val machineStore: MachineStore,
     private val machineViewModelDelegate: MachineViewModelDelegate,
+    private val secretStore: SecretStore,
     keystoreKeySupport: KeystoreKeySupport = KeystoreKeySupport.AllAlgorithms,
     private val sshPublicKeyProvider: SshPublicKeyProvider? = null,
 ) : BaseViewModel<ConfigureMachineViewModel.State, ConfigureMachineViewModel.Event, ConfigureMachineViewModel.Action>(
@@ -64,6 +76,8 @@ class ConfigureMachineViewModel(
         /** The cause when the device key store did not make the key. The screen shows it next to the key types. */
         val keyCreationFailure: KeyCreationFailure? = null,
         val passwordRef: String = "",
+        /** Tells if the loaded machine has a stored password. The password field shows a hint for it. */
+        val storedPassword: StoredPassword = StoredPassword.None,
         /**
          * The hardware security key of a loaded machine. The screen cannot change it, so "Save Host" keeps
          * it with all of its fields. This version does not support the method (issue #23).
@@ -91,6 +105,18 @@ class ConfigureMachineViewModel(
         /** False when this version cannot log in with [authType]. The screen then blocks the connect. */
         val canConnect: Boolean
             get() = canSave && authType.isSupported
+    }
+
+    /** The state of the stored password of the loaded machine. */
+    enum class StoredPassword {
+        /** The machine has no stored password. */
+        None,
+
+        /** The machine has a stored password. An empty password field keeps it. */
+        Stored,
+
+        /** The machine refers to a stored password, but this device does not have it, for example after a restore. */
+        Missing,
     }
 
     sealed interface Event {
@@ -124,6 +150,10 @@ class ConfigureMachineViewModel(
     sealed interface Action {
         data class Saved(val machineId: String, val connectImmediately: Boolean) : Action
         data object Deleted : Action
+    }
+
+    init {
+        checkStoredPassword()
     }
 
     override fun onEvent(event: Event) {
@@ -166,10 +196,78 @@ class ConfigureMachineViewModel(
             Event.DeleteMachine -> {
                 val targetId = state.value.id
                 viewModelScope.launch {
+                    val removed = machineStore.getMachine(targetId)
                     removeMachine(targetId)
+                    storedPasswordRef(removed)?.let { ref -> removeSecret(ref) }
                     sendAction(Action.Deleted)
                 }
             }
+        }
+    }
+
+    /** Sets [StoredPassword.Missing] when the loaded machine refers to a password that this device does not have. */
+    private fun checkStoredPassword() {
+        val value = (machineStore.getMachine(machineId)?.authMethod as? SshAuthMethod.Password)?.encryptedPasswordRef
+        if (value == null || !SecretRef.hasPrefix(value)) return
+        val ref = SecretRef.parse(value)
+        if (ref == null) {
+            updateState { it.copy(storedPassword = StoredPassword.Missing) }
+            return
+        }
+        viewModelScope.launch {
+            val secret = try {
+                secretStore.get(ref)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.w(e) { "Could not read the stored password of $machineId." }
+                return@launch
+            }
+            if (secret == null) {
+                updateState { it.copy(storedPassword = StoredPassword.Missing) }
+            } else {
+                secret.fill(0)
+            }
+        }
+    }
+
+    /**
+     * Puts [password] into the [secretStore] with a new reference. Returns the [SecretRef] value, or null when the
+     * store fails. The failure shows in [State.validationError].
+     */
+    private suspend fun storePassword(password: String): String? {
+        val ref = SecretRef.newPasswordRef()
+        val secret = password.encodeToByteArray()
+        return try {
+            secretStore.put(ref, secret)
+            SecretRef.format(ref)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // The error comes from the device key store or the file system. It does not contain the password.
+            updateState { it.copy(validationError = "$PASSWORD_SAVE_ERROR ${e.message ?: e::class.simpleName}") }
+            null
+        } finally {
+            secret.fill(0)
+        }
+    }
+
+    /** Removes the stored password of [previous] when [saved] does not use it. */
+    private suspend fun removeReplacedPassword(previous: HostMachine?, saved: HostMachine) {
+        val oldRef = storedPasswordRef(previous) ?: return
+        if (storedPasswordRef(saved) != oldRef) {
+            removeSecret(oldRef)
+        }
+    }
+
+    /** Removes the secret of [ref]. A failure does not stop the caller, because the secret has no more use. */
+    private suspend fun removeSecret(ref: String) {
+        try {
+            secretStore.remove(ref)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.w(e) { "Could not remove the secret of a machine password." }
         }
     }
 
@@ -223,6 +321,9 @@ class ConfigureMachineViewModel(
             "host-${slug.ifBlank { "herdr" }}-${current.username.trim().lowercase()}"
         }
         val resolvedName = current.name.trim().ifBlank { current.hostname.trim() }
+        val previous = machineStore.getMachine(resolvedId)
+        val previousPasswordValue = (previous?.authMethod as? SshAuthMethod.Password)?.encryptedPasswordRef.orEmpty()
+        val typedPassword = current.passwordRef
 
         val authMethod: SshAuthMethod = when (current.authType) {
             AuthType.KeystoreKey -> SshAuthMethod.KeystoreKey(
@@ -230,8 +331,9 @@ class ConfigureMachineViewModel(
                 algorithm = current.keyAlgorithm,
                 requireBiometric = current.requireBiometric,
             )
+            // An empty password field keeps the stored password. A typed password replaces it below.
             AuthType.Password -> SshAuthMethod.Password(
-                encryptedPasswordRef = current.passwordRef,
+                encryptedPasswordRef = previousPasswordValue,
             )
             // The view model does not select this method, so it is the method of the loaded machine.
             AuthType.HardwareSecurityKey -> current.hardwareKey ?: SshAuthMethod.HardwareSecurityKey()
@@ -265,16 +367,47 @@ class ConfigureMachineViewModel(
         )
 
         viewModelScope.launch {
-            upsertMachine(machine)
-            if (connectImmediately) {
-                markPendingConnect(machine.id)
-                connect(machine.id)
+            val saved = if (current.authType == AuthType.Password && typedPassword.isNotEmpty()) {
+                val passwordValue = storePassword(typedPassword) ?: return@launch
+                machine.copy(authMethod = SshAuthMethod.Password(encryptedPasswordRef = passwordValue))
+            } else {
+                machine
             }
-            sendAction(Action.Saved(machineId = machine.id, connectImmediately = connectImmediately))
+            upsertMachine(saved)
+            removeReplacedPassword(previous, saved)
+            updateState { it.copy(passwordRef = "", storedPassword = storedPasswordOf(saved)) }
+            if (connectImmediately) {
+                markPendingConnect(saved.id)
+                connect(saved.id)
+            }
+            sendAction(Action.Saved(machineId = saved.id, connectImmediately = connectImmediately))
         }
     }
 
     companion object {
+        private val log = Arbor.tag("ConfigureMachineViewModel")
+
+        /** The hint below the password field when the machine has a stored password. */
+        const val STORED_PASSWORD_HINT: String =
+            "This device keeps the password of this machine. Leave this field empty to keep the stored password."
+
+        /** The hint below the password field when this device does not have the stored password. */
+        const val MISSING_PASSWORD_HINT: String =
+            "This device does not have the password of this machine. Type the password again."
+
+        /** The start of the error when the device cannot keep the password. */
+        const val PASSWORD_SAVE_ERROR: String = "The device could not keep the password:"
+
+        /** Returns the reference of the stored password of [machine], or null when it has no stored password. */
+        internal fun storedPasswordRef(machine: HostMachine?): String? =
+            (machine?.authMethod as? SshAuthMethod.Password)?.encryptedPasswordRef?.let(SecretRef::parse)
+
+        /** Returns [StoredPassword.Stored] when [machine] has a password value, else [StoredPassword.None]. */
+        internal fun storedPasswordOf(machine: HostMachine?): StoredPassword {
+            val value = (machine?.authMethod as? SshAuthMethod.Password)?.encryptedPasswordRef
+            return if (value.isNullOrEmpty()) StoredPassword.None else StoredPassword.Stored
+        }
+
         /** The text that the app shows for a login method that this version does not support. */
         const val UNSUPPORTED_AUTH_LABEL: String = "Not supported in this version"
 
@@ -315,7 +448,6 @@ class ConfigureMachineViewModel(
                 is SshAuthMethod.HardwareSecurityKey -> AuthType.HardwareSecurityKey
             }
             val keystoreAuth = existing.authMethod as? SshAuthMethod.KeystoreKey
-            val passwordAuth = existing.authMethod as? SshAuthMethod.Password
             // A key type that this device cannot create changes to the default type. Such a key
             // was never created on this device, so no working key is lost.
             val storedAlgorithm = keystoreAuth?.algorithm ?: keystoreKeySupport.defaultAlgorithm
@@ -342,7 +474,7 @@ class ConfigureMachineViewModel(
                 keyAlgorithm = keyAlgorithm,
                 availableKeyAlgorithms = available,
                 requireBiometric = keystoreAuth?.requireBiometric ?: false,
-                passwordRef = passwordAuth?.encryptedPasswordRef.orEmpty(),
+                storedPassword = storedPasswordOf(existing),
                 hardwareKey = existing.authMethod as? SshAuthMethod.HardwareSecurityKey,
                 proxyJumpEnabled = pj != null,
                 bastionHost = pj?.bastionHost.orEmpty(),
