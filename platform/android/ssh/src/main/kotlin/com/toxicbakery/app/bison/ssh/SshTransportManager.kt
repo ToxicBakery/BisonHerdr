@@ -13,10 +13,20 @@ import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Android SSH2 + Mosh UDP SSP + Herdr Endpoint Generation 1 transport coordinator.
@@ -33,9 +43,18 @@ import kotlinx.coroutines.sync.withLock
  *    + multiplexed SSH2 `herdr remote-api-bridge` exec channels for `events.subscribe`, `pane.layout`,
  *    `agent.read` (`source: "visible"`), `agent.prompt`, and routing Mosh focus RPCs via `herdr.sock`
  *    ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]).
- * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]).
+ * 5. Zero-bandwidth background parking ([setSurfaceLease]) and `NetworkCallback` fast-roaming ([onNetworkAvailable]
+ *    and [onNetworkLost]).
  *
  * The manager keeps the connection state. [backend] does the work that uses the connection to the machine.
+ *
+ * After a connect, the backend reconnects on its own when the session closes, and sends the events of its loop to
+ * the manager ([SessionEvents]). The manager shows [RoamingStatus.RoamingReconnect] during the loop. After a
+ * reconnect, it sets the surface lease again, reads the surface again, and sends the queued prompts. When the loop
+ * stops for the user, the manager puts the cause in [SshStateManager.needsUser] and marks the machine disconnected.
+ *
+ * [timeSource] measures the interval between two network checks of a machine. A test gives a source with virtual
+ * time.
  */
 class SshTransportManager(
     private val backend: SshBackend,
@@ -44,12 +63,65 @@ class SshTransportManager(
     private val sshDebugLog: SshDebugLog,
     private val paneSurfaceBus: PaneSurfaceBus,
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
     private val surfaceLeaseActive = ConcurrentHashMap<String, Boolean>()
     private val connectLocks = ConcurrentHashMap<String, Mutex>()
     private val presentationEpochCounter = AtomicLong(1L)
+
+    /** The time of the last network check of each machine. See [onNetworkAvailable]. */
+    private val lastNetworkChecks = ConcurrentHashMap<String, TimeMark>()
+
+    /** Receives the events of the reconnect loop of [backend]. */
+    private val reconnectEvents = object : SessionEvents {
+        override fun onReconnecting(machineId: String, cause: Throwable?) {
+            if (!sshStateManager.isMachineConnected(machineId)) return
+            sshStateManager.setRoamingStatus(machineId, RoamingStatus.RoamingReconnect)
+            val reason = cause?.let { ": ${detailOf(it)}" }.orEmpty()
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = RECONNECT_LOG_TAG,
+                message = "The session closed$reason. The app connects again.",
+                isError = true,
+            )
+        }
+
+        override fun onReconnectFailed(
+            machineId: String,
+            failures: Int,
+            result: SshAuthResult.NetworkError,
+            nextDelay: Duration,
+        ) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = RECONNECT_LOG_TAG,
+                message = "Attempt $failures failed: ${describe(result)}. The next attempt starts in " +
+                    "${nextDelay.inWholeMilliseconds} ms.",
+                isError = true,
+            )
+        }
+
+        override suspend fun onReconnected(machineId: String) {
+            sshDebugLog.record(machineId = machineId, tag = RECONNECT_LOG_TAG, message = "The session is open again")
+            restoreAfterReconnect(machineId)
+        }
+
+        override suspend fun onNeedsUser(machineId: String, result: SshAuthResult) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = RECONNECT_LOG_TAG,
+                message = "The reconnect loop stopped: ${describe(result)}. The machine waits for the user.",
+                isError = true,
+            )
+            stopForUser(machineId, causeOf(result), hostKeyPromptFor(machineId, result))
+        }
+    }
+
+    init {
+        backend.setSessionEvents(reconnectEvents)
+    }
 
     /**
      * Dispatches a cross-layer [SshRequest] from `MainActivity` or `BisonSessionService`.
@@ -126,6 +198,9 @@ class SshTransportManager(
 
     private suspend fun connectInternal(machine: HostMachine): Boolean {
         val machineId = machine.id
+        // A connect from the user removes the cause of an earlier stop.
+        sshStateManager.clearHostKeyPrompt(machineId)
+        sshStateManager.clearNeedsUser(machineId)
         if (!machine.authMethod.isSupported) {
             // The backend does not get the machine, so the app makes no network connection.
             sshDebugLog.record(
@@ -134,28 +209,51 @@ class SshTransportManager(
                 message = "Did not connect to ${machine.displayAddress}: $HARDWARE_KEY_NOT_SUPPORTED",
                 isError = true,
             )
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            failBeforeConnection(machineId, NeedsUserCause.Other(HARDWARE_KEY_NOT_SUPPORTED))
             return false
         }
         activeMachines[machineId] = machine
         surfaceLeaseActive[machineId] = true
 
         // Phase 1: AuthenticatingSsh (optionally via ProxyJump / Tailscale)
-        sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.AuthenticatingSsh)
         val proxy = machine.proxyJump
         if (machine.hostname.isBlank() || !machine.isValidPort ||
             (proxy != null && (proxy.bastionHost.isBlank() || proxy.bastionPort !in 1..65535 || proxy.bastionHost.endsWith(".invalid")))
         ) {
+            val message = "Invalid or unreachable SSH/Bastion endpoint for ${machine.displayAddress}"
             sshDebugLog.record(
                 machineId = machineId,
                 tag = "ProxyJump",
-                message = "Invalid or unreachable SSH/Bastion endpoint for ${machine.displayAddress}",
+                message = message,
                 isError = true,
             )
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            failBeforeConnection(machineId, NeedsUserCause.Other(message))
             return false
         }
+        return try {
+            runConnectSteps(machine)
+        } catch (error: Throwable) {
+            if (error is CancellationException && !currentCoroutineContext().isActive) {
+                // The caller stopped the connect. The progress must not stay at a connect step.
+                stopForUser(machineId, cause = null)
+                throw error
+            }
+            // A step that throws must not leave the progress at a connect step.
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "Transport",
+                message = "Connect to ${machine.displayAddress} failed: ${detailOf(error)}",
+                isError = true,
+            )
+            stopForUser(machineId, causeOf(error))
+            false
+        }
+    }
+
+    /** Runs the connect steps after the checks of [connectInternal]. Returns false when a step fails. */
+    private suspend fun runConnectSteps(machine: HostMachine): Boolean {
+        val machineId = machine.id
         val route = proxyJumpTunnel.resolveRoute(machine)
         val authResult = backend.authenticate(machine, route)
         if (authResult != SshAuthResult.Success) {
@@ -165,11 +263,8 @@ class SshTransportManager(
                 message = "Login to ${machine.displayAddress} failed: ${describe(authResult)}",
                 isError = true,
             )
-            if (authResult is SshAuthResult.HostKeyRejected) {
-                // The UI asks the user. The connection does not wait: the user connects again after a decision.
-                sshStateManager.setHostKeyPrompt(hostKeyPromptFor(machineId, authResult))
-            }
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            // The UI asks the user about a host key. The connection does not wait: the user connects again later.
+            stopForUser(machineId, causeOf(authResult), hostKeyPromptFor(machineId, authResult))
             return false
         }
 
@@ -177,7 +272,13 @@ class SshTransportManager(
         sshStateManager.setConnectionProgress(machineId, ConnectionProgress.BootstrappingMoshOrBridge)
         val backbone = backend.negotiateBackbone(machine, route)
         if (backbone == null) {
-            sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = "Transport",
+                message = NO_BACKBONE,
+                isError = true,
+            )
+            stopForUser(machineId, NeedsUserCause.Other(NO_BACKBONE))
             return false
         }
 
@@ -190,16 +291,47 @@ class SshTransportManager(
         return true
     }
 
+    /** Sets [cause] and [ConnectionProgress.Failed] for a connect that stopped before the backend got the machine. */
+    private fun failBeforeConnection(machineId: String, cause: NeedsUserCause) {
+        sshStateManager.setNeedsUser(machineId, cause)
+        sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+    }
+
     /**
-     * Disconnects [machineId], stopping any active Mosh UDP session and clearing cached control streams.
+     * Stops the connection of [machineId] after a failure. It releases the session and its resources, marks the
+     * machine disconnected, puts [cause] and [hostKeyPrompt] in the state, and sets [ConnectionProgress.Failed].
+     *
+     * The machine stays in [activeMachines], so that a connect with no profile can use it again. The steps cannot
+     * be cancelled, because the release can cancel the reconnect loop that calls this function.
      */
-    suspend fun disconnect(machineId: String) {
+    private suspend fun stopForUser(
+        machineId: String,
+        cause: NeedsUserCause?,
+        hostKeyPrompt: HostKeyPrompt? = null,
+    ) = withContext(NonCancellable) {
+        releaseConnection(machineId)
+        sshStateManager.markMachineDisconnected(machineId)
+        hostKeyPrompt?.let(sshStateManager::setHostKeyPrompt)
+        cause?.let { sshStateManager.setNeedsUser(machineId, it) }
+        sshStateManager.setConnectionProgress(machineId, ConnectionProgress.Failed)
+    }
+
+    /** Closes the session of [machineId], and releases its Mosh session, its surface fence, and its surface lease. */
+    private suspend fun releaseConnection(machineId: String) {
         backend.disconnect(machineId)
         moshUdpEngine.stopSession(machineId)
         surfaceDeltaAssembler.clear(machineId)
         surfaceLeaseActive.remove(machineId)
+    }
+
+    /**
+     * Disconnects [machineId], stopping any active Mosh UDP session and clearing cached control streams.
+     */
+    suspend fun disconnect(machineId: String) {
+        releaseConnection(machineId)
         activeMachines.remove(machineId)
         sshStateManager.clearHostKeyPrompt(machineId)
+        sshStateManager.clearNeedsUser(machineId)
         sshStateManager.markMachineDisconnected(machineId)
         sshDebugLog.record(
             machineId = machineId,
@@ -395,12 +527,17 @@ class SshTransportManager(
     }
 
     /**
-     * Invoked by `BisonSessionService`'s `ConnectivityManager.NetworkCallback` when a new default
-     * network interface (Wi-Fi <-> 5G <-> Tailscale) becomes available.
+     * Checks the sessions after a network change. `BisonSessionService` calls it when a default network becomes
+     * available or when its link properties change. A [SshRequest.TriggerNetworkRoam] calls it for one machine.
      *
-     * - Immediately sends a Mosh UDP SSP wakeup datagram so `mosh-server` updates its peer IP in `0ms`.
-     * - Recycles the TCP control sideband without waiting for kernel TCP retransmit timeouts.
-     * - Flushes any prompts queued in the Native Prompt Composer during the network handoff.
+     * For [machineId], or for each connected machine when it is null, the manager does these steps. It does them
+     * one time in each [NETWORK_CHECK_INTERVAL] for each machine, and ignores the calls between.
+     * - On the Mosh backbone, it sends a wakeup datagram, so that `mosh-server` gets the new address of the client.
+     * - It runs a liveness check with a timeout of [LIVENESS_TIMEOUT]: a keepalive message and one `exec true`. Each
+     *   backbone uses the SSH session for its control commands, so the check runs for each backbone.
+     * - When the check fails, it sets [RoamingStatus.RoamingReconnect] and asks the backend to reconnect now, with
+     *   no delay. After the reconnect, the reconnect events restore the status and send the queued prompts.
+     * - When the check passes, it restores the status and sends the queued prompts.
      */
     suspend fun onNetworkAvailable(machineId: String? = null) {
         val targets = if (machineId != null) {
@@ -410,7 +547,7 @@ class SshTransportManager(
         }
 
         for (id in targets) {
-            sshStateManager.setRoamingStatus(id, RoamingStatus.RoamingReconnect)
+            if (!takeNetworkCheck(id)) continue
             val currentBackbone = sshStateManager.activeTransportBackbone.value[id]
             if (currentBackbone is ActiveBackbone.MoshUdp) {
                 val roamedCount = moshUdpEngine.sendWakeupDatagram(id)
@@ -419,23 +556,102 @@ class SshTransportManager(
                     backbone = currentBackbone.copy(roamedCount = roamedCount),
                 )
             }
+            if (backend.checkLiveness(id, LIVENESS_TIMEOUT)) {
+                sshDebugLog.record(
+                    machineId = id,
+                    tag = "Roaming",
+                    message = "The session works on the new network",
+                )
+                if (sshStateManager.roamingState.value[id] == RoamingStatus.RoamingReconnect) {
+                    sshStateManager.setRoamingStatus(id, statusAfterRoam(id))
+                }
+                flushOfflinePrompts(id)
+            } else {
+                sshDebugLog.record(
+                    machineId = id,
+                    tag = "Roaming",
+                    message = "The session did not reply on the new network. The app connects again now.",
+                    isError = true,
+                )
+                if (sshStateManager.isMachineConnected(id)) {
+                    sshStateManager.setRoamingStatus(id, RoamingStatus.RoamingReconnect)
+                }
+                backend.reconnectNow(id)
+            }
+        }
+    }
+
+    /**
+     * Closes the sessions after the device lost its default network. `BisonSessionService` calls it from `onLost`.
+     *
+     * For each connected machine, it sets [RoamingStatus.RoamingReconnect] and closes the sockets at once. Thus the
+     * reconnect loop does not wait for a TCP timeout on the old network. The next [onNetworkAvailable] checks each
+     * machine at once.
+     */
+    fun onNetworkLost() {
+        for (id in sshStateManager.connectedMachines.value) {
+            lastNetworkChecks.remove(id)
+            sshStateManager.setRoamingStatus(id, RoamingStatus.RoamingReconnect)
             sshDebugLog.record(
                 machineId = id,
                 tag = "Roaming",
-                message = "Recycled control sideband on new network interface",
+                message = "The device lost its network. The app closed the sockets.",
+                isError = true,
             )
-            val statusAfterRoam = if (surfaceLeaseActive[id] == false) {
-                RoamingStatus.SurfaceParked
-            } else {
-                RoamingStatus.Healthy
-            }
-            sshStateManager.setRoamingStatus(id, statusAfterRoam)
-            flushOfflinePrompts(id)
+            backend.closeSockets(id)
         }
     }
 
     suspend fun triggerNetworkRoam(machineId: String? = null) {
         onNetworkAvailable(machineId)
+    }
+
+    /**
+     * Returns true and records the time when [machineId] had no network check in the last [NETWORK_CHECK_INTERVAL].
+     * Returns false when a check is too recent.
+     */
+    private fun takeNetworkCheck(machineId: String): Boolean {
+        var taken = false
+        lastNetworkChecks.compute(machineId) { _, last ->
+            if (last == null || last.elapsedNow() >= NETWORK_CHECK_INTERVAL) {
+                taken = true
+                timeSource.markNow()
+            } else {
+                last
+            }
+        }
+        return taken
+    }
+
+    /** Returns the status of a session that works: [RoamingStatus.SurfaceParked] while the lease is off. */
+    private fun statusAfterRoam(machineId: String): RoamingStatus =
+        if (surfaceLeaseActive[machineId] == false) RoamingStatus.SurfaceParked else RoamingStatus.Healthy
+
+    /**
+     * Restores [machineId] after the reconnect loop opened a new session. It sends `client_shell.surface.set
+     * { active: true }` again when the surface lease is on, reads the surface again, and sends the queued prompts.
+     */
+    private suspend fun restoreAfterReconnect(machineId: String) {
+        val machine = activeMachines[machineId] ?: return
+        if (surfaceLeaseActive[machineId] == false) {
+            sshStateManager.setRoamingStatus(machineId, RoamingStatus.SurfaceParked)
+        } else {
+            // This also sets RoamingStatus.Healthy, so that the queued prompts do not go back into the queue.
+            setSurfaceLease(machineId, active = true)
+        }
+        try {
+            backend.refreshSurface(machine, proxyJumpTunnel.resolveRoute(machine))
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            sshDebugLog.record(
+                machineId = machineId,
+                tag = RECONNECT_LOG_TAG,
+                message = "Could not read the surface after the reconnect: ${detailOf(error)}",
+                isError = true,
+            )
+        }
+        flushOfflinePrompts(machineId)
     }
 
     private suspend fun startControlSideband(
@@ -464,8 +680,8 @@ class SshTransportManager(
         when (result) {
             SshAuthResult.Success -> "Success"
             is SshAuthResult.AuthFailed -> "AuthFailed (${result.message})"
-            is SshAuthResult.NetworkError -> "NetworkError (${result.cause.message ?: result.cause::class.simpleName})"
-            is SshAuthResult.Failed -> "Failed (${result.cause.message ?: result.cause::class.simpleName})"
+            is SshAuthResult.NetworkError -> "NetworkError (${detailOf(result.cause)})"
+            is SshAuthResult.Failed -> "Failed (${detailOf(result.cause)})"
             is SshAuthResult.HostKeyUnknown ->
                 "HostKeyUnknown (${result.presented.hostPort} ${result.presented.keyType} ${result.presented.fingerprint})"
 
@@ -476,7 +692,8 @@ class SshTransportManager(
             is SshAuthResult.KeyMissing -> "KeyMissing (${result.message})"
         }
 
-    private fun hostKeyPromptFor(machineId: String, result: SshAuthResult.HostKeyRejected): HostKeyPrompt =
+    /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */
+    private fun hostKeyPromptFor(machineId: String, result: SshAuthResult): HostKeyPrompt? =
         when (result) {
             is SshAuthResult.HostKeyUnknown -> HostKeyPrompt.Unknown(machineId = machineId, presented = result.presented)
             is SshAuthResult.HostKeyChanged -> HostKeyPrompt.Changed(
@@ -484,7 +701,36 @@ class SshTransportManager(
                 known = result.known,
                 presented = result.presented,
             )
+
+            else -> null
         }
+
+    /** Returns the [NeedsUserCause] that the UI shows for the failed login [result]. */
+    private fun causeOf(result: SshAuthResult): NeedsUserCause =
+        when (result) {
+            is SshAuthResult.AuthFailed -> NeedsUserCause.LoginRefused(result.message)
+            is SshAuthResult.HostKeyUnknown -> NeedsUserCause.HostKeyUnknown(result.presented.hostPort)
+            is SshAuthResult.HostKeyChanged -> NeedsUserCause.HostKeyChanged(result.presented.hostPort)
+            is SshAuthResult.KeyMissing -> NeedsUserCause.KeyMissing(result.keyAlias)
+            is SshAuthResult.NetworkError -> NeedsUserCause.Unreachable(detailOf(result.cause))
+            is SshAuthResult.Failed -> causeOf(result.cause)
+            // A login that passed needs nothing. Only an error in the caller gets here.
+            SshAuthResult.Success -> NeedsUserCause.Other(describe(result))
+        }
+
+    /** Returns the [NeedsUserCause] that the UI shows for a connect step that threw [error]. */
+    private fun causeOf(error: Throwable): NeedsUserCause {
+        val chain = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
+        return when {
+            chain.any { it is MissingSecretException } -> NeedsUserCause.PasswordMissing
+            chain.any { it is IOException } -> NeedsUserCause.Unreachable(detailOf(error))
+            else -> NeedsUserCause.Other(detailOf(error))
+        }
+    }
+
+    /** Returns the message of [error], or the name of its class when it has no message. */
+    private fun detailOf(error: Throwable): String =
+        error.message?.takeIf { it.isNotBlank() } ?: error::class.simpleName ?: "Unknown error"
 
     private suspend fun flushOfflinePrompts(machineId: String) {
         val pending = sshStateManager.flushQueuedPrompts(machineId)
@@ -505,6 +751,22 @@ class SshTransportManager(
         internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
+
+        /** The maximum time of the liveness check of one session in [onNetworkAvailable]. */
+        val LIVENESS_TIMEOUT: Duration = 3.seconds
+
+        /** The minimum time between two network checks of one machine in [onNetworkAvailable]. */
+        val NETWORK_CHECK_INTERVAL: Duration = 1.seconds
+
+        /** The debug log tag of the reconnect loop. */
+        internal const val RECONNECT_LOG_TAG: String = "Reconnect"
+
+        /** The error text when no backbone that the transport mode of the machine permits is available. */
+        internal const val NO_BACKBONE: String =
+            "No transport that the transport mode of the machine permits is available"
+
+        /** The maximum number of causes that the manager examines in an error. */
+        private const val MAX_CAUSE_DEPTH = 16
 
         /**
          * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey]. This version does not

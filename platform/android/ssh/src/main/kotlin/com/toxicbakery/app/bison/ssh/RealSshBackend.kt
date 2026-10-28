@@ -9,6 +9,7 @@ import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.IOException
+import kotlin.time.Duration
 
 /**
  * The [SshBackend] that connects to a real Herdr host over JSch through [RealHerdrSshClient].
@@ -20,6 +21,9 @@ import java.io.IOException
  *
  * A password login reads the password from the [SecretStore]. When the store has no password, [authenticate]
  * returns [SshAuthResult.Failed] with a [MissingSecretException], and the client opens no connection.
+ *
+ * After a connect, the client reconnects on its own when the session closes, and sends the events of the loop to
+ * the receiver of [setSessionEvents]. See [SessionSupervisor].
  */
 class RealSshBackend internal constructor(
     internal val client: RealHerdrSshClient,
@@ -106,6 +110,25 @@ class RealSshBackend internal constructor(
 
     override fun disconnect(machineId: String) {
         client.disconnect(machineId)
+    }
+
+    override fun setSessionEvents(events: SessionEvents) {
+        client.sessionEvents = events
+    }
+
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean =
+        client.checkLiveness(machineId, timeout)
+
+    override fun reconnectNow(machineId: String) {
+        client.reconnectNow(machineId)
+    }
+
+    override fun closeSockets(machineId: String) {
+        client.closeSockets(machineId)
+    }
+
+    override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) {
+        client.refreshSnapshotAndSurface(machine, route)
     }
 
     internal companion object {

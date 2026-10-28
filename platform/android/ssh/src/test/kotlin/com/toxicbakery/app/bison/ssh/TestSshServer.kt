@@ -162,6 +162,11 @@ internal class TestSshServer(
         sshd = null
     }
 
+    /** Closes all open sessions at once. The server stays on its [port] and accepts new sessions. */
+    fun closeSessions() {
+        sshd?.activeSessions?.forEach { it.close(true) }
+    }
+
     override fun close() = stop()
 
     /** Returns a [HostMachine] that connects to this server as [username] with [authMethod]. */

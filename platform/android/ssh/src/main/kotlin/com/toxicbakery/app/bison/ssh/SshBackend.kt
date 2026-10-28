@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
+import kotlin.time.Duration
 
 /**
  * Does the work of [SshTransportManager] that uses the connection to a machine.
@@ -11,6 +12,10 @@ import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
  * [SshTransportManager] keeps the connection state, the surface lease, and the prompt queue. It calls the
  * backend for each connection step. [RealSshBackend] is the only backend in release builds. Debug builds
  * also have a simulated backend for the machines that the fake server made.
+ *
+ * A backend with sessions that can close, such as [RealSshBackend], reconnects on its own. It sends the events of
+ * its reconnect loop to the [SessionEvents] of [setSessionEvents]. The default functions of the reconnect part
+ * apply to a backend with no network connection: it has no loop, and its session is always live.
  */
 interface SshBackend {
 
@@ -66,4 +71,25 @@ interface SshBackend {
      * Closes the session of [machineId] and releases its resources.
      */
     fun disconnect(machineId: String)
+
+    /** Sets the receiver of the events of the reconnect loop. The default backend has no loop and sends no events. */
+    fun setSessionEvents(events: SessionEvents) = Unit
+
+    /**
+     * Returns true when the session of [machineId] replies in [timeout]. Returns false when the machine has no open
+     * session. The default backend has no network connection, so its session is always live.
+     */
+    suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean = true
+
+    /** Starts a reconnect attempt for [machineId] now, with no delay. The default backend does nothing. */
+    fun reconnectNow(machineId: String) = Unit
+
+    /**
+     * Closes the network sockets of [machineId] after the device lost its network, and starts the reconnect loop.
+     * Thus the next attempt does not wait for a TCP timeout on the old network. The default backend does nothing.
+     */
+    fun closeSockets(machineId: String) = Unit
+
+    /** Reads the snapshot and the surface of [machine] again, for example after a reconnect. */
+    suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) = Unit
 }

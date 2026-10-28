@@ -47,17 +47,24 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.time.Duration
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -94,6 +101,11 @@ import kotlinx.serialization.json.put
  * user and the credentials of the machine. It then logs in to the target over a `direct-tcpip` channel of the
  * bastion session ([BastionChannelProxy]), and runs all commands on the target. Each session checks the host key of
  * its own `host:port`.
+ *
+ * Only a connect step opens a session on demand. After the connect, [startLivePolling] makes a [SessionSupervisor]
+ * for the machine, and only the supervisor opens its sessions. When a session closes, the supervisor reconnects in
+ * [reconnectScope] with the delays from [reconnectDelays]. It sends its events to [sessionEvents]. A command that
+ * finds a closed session waits only for the attempt that runs now, and then fails.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -112,6 +124,10 @@ internal class RealHerdrSshClient(
             commands: List<RemoteShellCommand>,
         ) -> String
     )? = null,
+    /** Runs the reconnect loops. A test gives a scope with virtual time. */
+    private val reconnectScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** Gives the delay of a reconnect loop after a number of failed attempts in sequence. */
+    private val reconnectDelays: (failures: Int) -> Duration = ReconnectBackoff()::delayAfter,
 ) {
     internal enum class WorkerLane {
         Input,
@@ -215,6 +231,41 @@ internal class RealHerdrSshClient(
      */
     private val bastionSessions = ConcurrentHashMap<String, Session>()
     private val sessionOpenLocks = ConcurrentHashMap<String, Mutex>()
+
+    /**
+     * The supervisor of each machine that completed a connect. While a machine has a supervisor, only the supervisor
+     * opens its sessions. See [SessionSupervisor].
+     */
+    private val supervisors = ConcurrentHashMap<String, SessionSupervisor>()
+
+    /** Receives the events of the reconnect loops. [RealSshBackend.setSessionEvents] sets it. */
+    @Volatile
+    internal var sessionEvents: SessionEvents? = null
+
+    /** Sends the events of each supervisor to [sessionEvents] when it is set. */
+    private val supervisorEvents = object : SessionEvents {
+        override fun onReconnecting(machineId: String, cause: Throwable?) {
+            sessionEvents?.onReconnecting(machineId, cause)
+        }
+
+        override fun onReconnectFailed(
+            machineId: String,
+            failures: Int,
+            result: SshAuthResult.NetworkError,
+            nextDelay: Duration,
+        ) {
+            sessionEvents?.onReconnectFailed(machineId, failures, result, nextDelay)
+        }
+
+        override suspend fun onReconnected(machineId: String) {
+            sessionEvents?.onReconnected(machineId)
+        }
+
+        override suspend fun onNeedsUser(machineId: String, result: SshAuthResult) {
+            sessionEvents?.onNeedsUser(machineId, result)
+        }
+    }
+
     private val inputLaneLocks = ConcurrentHashMap<String, Mutex>()
     private val pollLaneLocks = ConcurrentHashMap<String, Mutex>()
     private val inputWorkers = ConcurrentHashMap<String, PersistentShellWorker>()
@@ -273,11 +324,15 @@ internal class RealHerdrSshClient(
     /**
      * Opens the session to [machine] and runs one check command. Returns the error when the session does
      * not open, so that the caller can tell the kind of the failure.
+     *
+     * This is a connect from the user. It stops the reconnect loop of an earlier connect, and [startLivePolling]
+     * starts a new loop after the connect.
      */
     suspend fun connectAndVerify(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Result<Unit> = withContext(Dispatchers.IO) {
+        supervisors.remove(machine.id)?.stop()
         runCatching {
             val out = executeBatchOnLane(
                 machine = machine,
@@ -336,18 +391,34 @@ internal class RealHerdrSshClient(
         }.getOrDefault(false)
     }
 
+    /**
+     * Makes the [SessionSupervisor] of [machine] and starts the poll loop. This is the last connect step.
+     *
+     * The poll loop reads the snapshot and the surface each [LIVE_POLL_INTERVAL_MS] while [isSurfaceActive] returns
+     * true. It pauses while the supervisor reconnects, and it stops when the supervisor stops.
+     */
     fun startLivePolling(
         machine: HostMachine,
         route: ResolvedSshRoute,
         isSurfaceActive: () -> Boolean,
     ) {
+        val supervisor = SessionSupervisor(
+            machineId = machine.id,
+            scope = reconnectScope,
+            delayAfter = reconnectDelays,
+            isSessionLive = { liveSession(machine.id) != null },
+            attempt = { reconnectAttempt(machine, route) },
+            events = supervisorEvents,
+        )
+        supervisors.put(machine.id, supervisor)?.stop()
         pollJobs.remove(machine.id)?.cancel()
         val job = scope.launch {
-            while (isActive) {
+            while (isActive && supervisor.awaitLive()) {
                 if (isSurfaceActive()) {
                     runCatching {
                         refreshSnapshotAndSurface(machine, route)
                     }.onFailure { err ->
+                        ensureActive()
                         sshDebugLog.record(
                             machineId = machine.id,
                             tag = "RealSSH",
@@ -363,6 +434,7 @@ internal class RealHerdrSshClient(
     }
 
     fun disconnect(machineId: String) {
+        supervisors.remove(machineId)?.stop()
         pollJobs.remove(machineId)?.cancel()
         paneScrollJobs.remove(machineId)?.cancel()
         paneScrollSignals.remove(machineId)?.close()
@@ -386,6 +458,67 @@ internal class RealHerdrSshClient(
      * session is open too.
      */
     internal fun hasLiveSession(machineId: String): Boolean = liveSession(machineId) != null
+
+    /**
+     * Checks that the session of [machineId] works. It sends a keepalive message, and then runs `true` on an `exec`
+     * channel. Returns false when the machine has no open session, when a step fails, or when the steps take more
+     * than [timeout].
+     *
+     * A socket on a lost network can stay open for minutes, so only a reply from the host proves that the session
+     * works. A write to such a socket can block for longer than [timeout], so the check runs in a different
+     * coroutine, and the caller stops at [timeout] in real time.
+     */
+    internal suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean = withContext(Dispatchers.IO) {
+        val session = liveSession(machineId) ?: return@withContext false
+        val check = scope.async { probeSession(session, timeout) }
+        withTimeoutOrNull(timeout) { check.await() } ?: false.also { check.cancel() }
+    }
+
+    /** Sends a keepalive message and runs `true` on [session]. Returns true when the command ends in [timeout]. */
+    private suspend fun probeSession(session: Session, timeout: Duration): Boolean {
+        val deadline = TimeSource.Monotonic.markNow() + timeout
+        return try {
+            session.sendKeepAliveMsg()
+            val channel = session.openChannel("exec") as ChannelExec
+            try {
+                channel.setCommand("true")
+                channel.connect(remainingMs(deadline))
+                while (!channel.isClosed && deadline.hasNotPassedNow()) {
+                    delay(LIVENESS_POLL_INTERVAL_MS)
+                }
+                channel.isClosed && channel.exitStatus == 0
+            } finally {
+                channel.disconnect()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Asks the supervisor of [machineId] for an attempt now. See [SessionSupervisor.reconnectNow]. */
+    internal fun reconnectNow(machineId: String) {
+        supervisors[machineId]?.reconnectNow()
+    }
+
+    /**
+     * Closes the workers and the sessions of [machineId] at once, after the device lost its network, and tells the
+     * supervisor. Thus the next attempt does not wait for a TCP timeout on the old network.
+     */
+    internal fun closeSockets(machineId: String) {
+        inputWorkers.remove(machineId)?.close()
+        pollWorkers.remove(machineId)?.close()
+        closeSessions(machineId)
+        supervisors[machineId]?.sessionLost(IOException("The device lost its network"))
+    }
+
+    /**
+     * Returns the time to [deadline] in milliseconds for a JSch timeout. JSch reads 0 as no limit, so the result is
+     * 1 or more.
+     */
+    private fun remainingMs(deadline: TimeMark): Int =
+        (-deadline.elapsedNow().inWholeMilliseconds).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
 
     /** Returns the `host:port` text of the target of [route], and the bastion when the route has one. */
     private fun describeRoute(route: ResolvedSshRoute): String =
@@ -1450,13 +1583,71 @@ internal class RealHerdrSshClient(
         }
     }
 
+    /**
+     * Returns the live session of [machine].
+     *
+     * A machine with a [SessionSupervisor] gets a session only from its supervisor. When its session is closed, this
+     * function tells the supervisor and throws a [SessionUnavailableException]. A machine with no supervisor is at a
+     * connect step, and this function opens its session.
+     */
     private suspend fun getOrOpenSession(
         machine: HostMachine,
         route: ResolvedSshRoute,
     ): Session {
         liveSession(machine.id)?.let { return it }
-        return sessionMutexFor(machine.id).withLock {
-            liveSession(machine.id)?.let { return@withLock it }
+        val supervisor = supervisors[machine.id] ?: return openSessionLocked(machine, route, keepLiveSession = true)
+        supervisor.sessionLost()
+        throw SessionUnavailableException(machine.name)
+    }
+
+    /**
+     * Waits for the session of a machine with a [SessionSupervisor] before a command. It waits only for the
+     * attempt that runs now ([SessionSupervisor.awaitCurrentAttempt]). Throws a [SessionUnavailableException] when
+     * no session is live after that attempt. A machine with no supervisor does not wait.
+     */
+    private suspend fun awaitSession(machine: HostMachine) {
+        val supervisor = supervisors[machine.id] ?: return
+        if (liveSession(machine.id) != null) return
+        supervisor.sessionLost()
+        if (!supervisor.awaitCurrentAttempt()) throw SessionUnavailableException(machine.name)
+    }
+
+    /**
+     * One attempt of the reconnect loop of [machine]. It closes the old sessions, opens new sessions, and returns the
+     * kind of the result. The attempt reads the password again, because the user can change it.
+     */
+    private suspend fun reconnectAttempt(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult =
+        withContext(Dispatchers.IO) {
+            try {
+                openSessionLocked(machine, route, keepLiveSession = false)
+                // The supervisor stopped while the session opened, for example because the user disconnected.
+                if (!isActive) closeSessions(machine.id)
+                ensureActive()
+                sshDebugLog.record(
+                    machineId = machine.id,
+                    tag = "RealSSH",
+                    message = "Reconnected to ${describeRoute(route)}",
+                )
+                SshAuthResult.Success
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                RealSshBackend.toAuthResult(error)
+            }
+        }
+
+    /**
+     * Opens new sessions for [machine] under the session lock of the machine, and returns the target session. The old
+     * sessions and workers close first. When [keepLiveSession] is true and the machine has a live session, this
+     * function returns that session and opens nothing.
+     */
+    private suspend fun openSessionLocked(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        keepLiveSession: Boolean,
+    ): Session =
+        sessionMutexFor(machine.id).withLock {
+            if (keepLiveSession) liveSession(machine.id)?.let { return@withLock it }
             inputWorkers.remove(machine.id)?.close()
             pollWorkers.remove(machine.id)?.close()
             // Close the old sessions. When the bastion session is dead, the target session is dead too.
@@ -1500,7 +1691,6 @@ internal class RealHerdrSshClient(
                 password?.fill(0)
             }
         }
-    }
 
     /**
      * Returns the open session of [machineId], or null. A session through a bastion is open only while its bastion
@@ -1670,6 +1860,9 @@ internal class RealHerdrSshClient(
         if (customExecutor != null) {
             return customExecutor(machine, route, lane, commands)
         }
+        // Wait for a reconnect outside the lane lock, so that a long reconnect does not block the other users of
+        // the lane.
+        awaitSession(machine)
         return laneMutexFor(machine.id, lane).withLock {
             val session = getOrOpenSession(machine, route)
             runCatching {
@@ -2457,6 +2650,7 @@ internal class RealHerdrSshClient(
         private const val CHANNEL_CONNECT_TIMEOUT_MS = 5_000
         private const val IPTOS_LOWDELAY = 0x10
         private const val LIVE_POLL_INTERVAL_MS = 400L
+        private const val LIVENESS_POLL_INTERVAL_MS = 10L
         private const val PTY_ECHO_SETTLE_DELAY_MS = 18L
         private const val OPTIMISTIC_ECHO_TTL_MS = 1_500L
         private const val MAX_OPTIMISTIC_EDITS = 128

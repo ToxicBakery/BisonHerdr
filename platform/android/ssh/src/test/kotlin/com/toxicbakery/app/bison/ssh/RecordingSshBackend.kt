@@ -5,17 +5,29 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.time.Duration
 
 /**
  * An [SshBackend] that records each call and opens no connection. [authenticate] returns [authResult].
  * A test can change [authResult] between two calls.
+ *
+ * [checkLiveness] returns [live]. [openSurface] runs [onOpenSurface], so that a test can make the step throw or
+ * wait. [sessionEvents] is the receiver that [setSessionEvents] got, so that a test can send the events of a
+ * reconnect loop.
  */
 internal class RecordingSshBackend(
     @Volatile var authResult: SshAuthResult = SshAuthResult.Success,
+    @Volatile var live: Boolean = true,
+    private val onOpenSurface: (suspend () -> Unit)? = null,
 ) : SshBackend {
 
     /** One entry for each call: the method name and the machine id, for example `resize workbox`. */
     val calls: MutableList<String> = CopyOnWriteArrayList()
+
+    /** The receiver of the reconnect events, or null before [setSessionEvents]. */
+    @Volatile
+    var sessionEvents: SessionEvents? = null
+        private set
 
     override suspend fun authenticate(machine: HostMachine, route: ResolvedSshRoute): SshAuthResult {
         calls += "authenticate ${machine.id}"
@@ -34,6 +46,7 @@ internal class RecordingSshBackend(
         isSurfaceActive: () -> Boolean,
     ) {
         calls += "openSurface ${machine.id}"
+        onOpenSurface?.invoke()
     }
 
     override suspend fun sendEndpointCommand(
@@ -62,5 +75,26 @@ internal class RecordingSshBackend(
 
     override fun disconnect(machineId: String) {
         calls += "disconnect $machineId"
+    }
+
+    override fun setSessionEvents(events: SessionEvents) {
+        sessionEvents = events
+    }
+
+    override suspend fun checkLiveness(machineId: String, timeout: Duration): Boolean {
+        calls += "checkLiveness $machineId"
+        return live
+    }
+
+    override fun reconnectNow(machineId: String) {
+        calls += "reconnectNow $machineId"
+    }
+
+    override fun closeSockets(machineId: String) {
+        calls += "closeSockets $machineId"
+    }
+
+    override suspend fun refreshSurface(machine: HostMachine, route: ResolvedSshRoute) {
+        calls += "refreshSurface ${machine.id}"
     }
 }
