@@ -55,7 +55,8 @@ import org.kodein.di.compose.viewmodel.rememberViewModel
  *
  * A column holds the top HUD (two rows), the [TerminalSurfaceCanvas] with the slide-over Federated Agent Command
  * Center drawer, and the split-thumb bottom key clusters with the Native Prompt Composer pill when the setting is on.
- * The canvas uses all of the area between the HUD and the bottom bar, and they do not cover it.
+ * The HUD sits above the canvas and the bottom bar sits below it, so they do not cover it. The canvas uses all of
+ * the area between them. The design target is 96%+ of the screen for the canvas, and no code measures it.
  */
 @Composable
 fun WorkspaceTerminalScreen(

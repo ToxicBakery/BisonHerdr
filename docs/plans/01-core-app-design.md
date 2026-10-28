@@ -348,7 +348,7 @@ All messages on `herdr-client.sock` (and `herdr remote-client-bridge`) use `[u32
 
 ### 1. Edge-to-Edge "Zen Canvas" Layout with Floating HUDs (Jetpack Compose)
 
-The app uses the **Design 2 ("Zen Canvas")** architecture: **the full-bleed hardware-accelerated terminal grid gets most of the tablet display**, with zero permanent sidebars or bulky toolbars stealing columns or rows. All multi-machine navigation, workspace/tab switching, agent triage, and touch modifiers live in **translucent floating HUD pills, a slide-over Agent Command Drawer, and ergonomic split-thumb clusters**:
+The app uses the **Design 2 ("Zen Canvas")** architecture: **the full-bleed hardware-accelerated terminal grid gets most of the tablet display (target: 96%+ of the screen; no code measures it)**, with zero permanent sidebars or bulky toolbars stealing columns or rows. All multi-machine navigation, workspace/tab switching, agent triage, and touch modifiers live in **translucent floating HUD pills, a slide-over Agent Command Drawer, and ergonomic split-thumb clusters**:
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -373,7 +373,7 @@ The app uses the **Design 2 ("Zen Canvas")** architecture: **the full-bleed hard
 +----------------------------------------------------------------------------------------------------+
 ```
 
-1. **Full-Bleed Terminal Canvas:**
+1. **Full-Bleed Terminal Canvas (target: 96%+ of the screen; no code measures it):**
    - Renders the multi-pane BSP split grid edge-to-edge across the entire tablet screen, with a crisp `2.dp` accent focus border on the active pane.
    - Floating top-And-bottom HUD elements use translucent Material 3 glass surfaces (`backdrop-filter` / `Surface` with alpha + `1.dp` border) that sit over padding zones or auto-fade to 40% opacity while typing.
 2. **Floating Top HUD Islands:**
