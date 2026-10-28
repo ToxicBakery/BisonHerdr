@@ -1,5 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.JSchException
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -163,6 +165,28 @@ class ProxyJumpTest {
     }
 
     @Test
+    fun eachChannelOpenFailureGetsTheKindOfItsReason() {
+        val proxy = BastionChannelProxy(JSch().getSession("jump", "bastion.example", 22), "jump@bastion.example:22")
+        val cause = JSchException("channel is not opened.")
+        val expected = mapOf(
+            BastionChannelProxy.SSH_OPEN_ADMINISTRATIVELY_PROHIBITED to SshAuthResult.Failed::class,
+            BastionChannelProxy.SSH_OPEN_CONNECT_FAILED to SshAuthResult.NetworkError::class,
+            BastionChannelProxy.SSH_OPEN_UNKNOWN_CHANNEL_TYPE to SshAuthResult.Failed::class,
+            BastionChannelProxy.SSH_OPEN_RESOURCE_SHORTAGE to SshAuthResult.NetworkError::class,
+            BastionChannelProxy.NO_REASON to SshAuthResult.NetworkError::class,
+        )
+
+        expected.forEach { (reason, kind) ->
+            val failure = proxy.openFailure(reason, "10.0.0.42:22", cause)
+            val result = RealSshBackend.toAuthResult(asSessionConnectError(failure))
+
+            assertEquals(kind, result::class, "Reason $reason gave $result")
+            assertTrue(failure.message.orEmpty().contains("jump@bastion.example:22"), failure.message)
+            assertTrue(failure.message.orEmpty().contains("10.0.0.42:22"), failure.message)
+        }
+    }
+
+    @Test
     fun aStoppedTargetBehindTheBastionGivesANetworkError() = runTest {
         acceptBothHostKeys()
         val machine = passwordMachine("bastion-target-down")
@@ -268,6 +292,13 @@ class ProxyJumpTest {
     /** Runs a command on [machine] and returns the name of the server that ran it. */
     private suspend fun serverNameOf(machine: HostMachine): String =
         backend.client.runCommand(machine, route(machine), "echo \$${TestSshServer.NAME_VARIABLE}").trim()
+
+    /** Returns the error that JSch `Session.connect` throws when `Proxy.connect` throws [error]. */
+    private fun asSessionConnectError(error: Exception): Exception =
+        when (error) {
+            is RuntimeException, is JSchException -> error
+            else -> JSchException("Session.connect: $error", error)
+        }
 
     /** Waits a maximum of [AWAIT_TIMEOUT_MS] for [condition]. */
     private fun awaitCondition(description: String, condition: () -> Boolean) {

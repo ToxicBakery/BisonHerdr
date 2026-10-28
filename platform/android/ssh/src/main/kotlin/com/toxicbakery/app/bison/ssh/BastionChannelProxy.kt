@@ -53,8 +53,7 @@ internal class BastionChannelProxy(
      * Opens a `direct-tcpip` channel from the bastion to [host] and [port]. JSch gives the `host:port` of the
      * target session. The bastion makes the TCP connection to the target.
      *
-     * A refused channel throws a [JSchException]. A bastion that cannot connect to the target, or that does not
-     * reply, throws an [IOException]. Each error names the bastion and the target.
+     * See [openFailure] for the errors. Each error names the bastion and the target.
      */
     override fun connect(socketFactory: SocketFactory?, host: String, port: Int, timeout: Int) {
         val target = KnownHost.formatHostPort(host, port)
@@ -95,7 +94,13 @@ internal class BastionChannelProxy(
         pipe.close()
     }
 
-    private fun openFailure(reason: Int, target: String, error: JSchException?): Exception {
+    /**
+     * Returns the error for a channel to [target] that did not open. [reason] is the reason code of the bastion, or
+     * [NO_REASON]. A failure that a later attempt can correct is an [IOException], so that
+     * [RealSshBackend.toAuthResult] gives [SshAuthResult.NetworkError]: the bastion cannot connect to the target, has
+     * no resources at this time, or does not reply. A channel that the bastion refuses is a [JSchException].
+     */
+    internal fun openFailure(reason: Int, target: String, error: JSchException?): Exception {
         val failure = "The bastion $bastionAddress did not open a channel to $target"
         return when (reason) {
             SSH_OPEN_ADMINISTRATIVELY_PROHIBITED -> JSchException(
@@ -108,15 +113,16 @@ internal class BastionChannelProxy(
 
             SSH_OPEN_UNKNOWN_CHANNEL_TYPE -> JSchException("$failure: the bastion does not know direct-tcpip.", error)
 
-            SSH_OPEN_RESOURCE_SHORTAGE -> JSchException("$failure: the bastion has no resources for it.", error)
+            SSH_OPEN_RESOURCE_SHORTAGE ->
+                IOException("$failure: the bastion has no resources for it at this time.", error)
 
             // No reply in the timeout, or the bastion session closed.
             else -> IOException("$failure: ${error?.message ?: "the channel closed"}", error)
         }
     }
 
-    private companion object {
-        const val DIRECT_TCPIP = "direct-tcpip"
+    internal companion object {
+        private const val DIRECT_TCPIP = "direct-tcpip"
 
         /** The JSch exit status of a channel that got no SSH_MSG_CHANNEL_OPEN_FAILURE. */
         const val NO_REASON = -1
