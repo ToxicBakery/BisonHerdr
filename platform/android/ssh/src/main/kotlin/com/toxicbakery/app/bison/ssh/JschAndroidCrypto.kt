@@ -5,7 +5,9 @@ import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SignatureEdDSA
 import com.jcraft.jsch.XDH
+import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.KeyAlgorithm
+import com.toxicbakery.app.bison.model.SshAuthMethod
 import java.nio.ByteBuffer
 import java.security.InvalidKeyException
 import java.security.KeyFactory
@@ -13,6 +15,10 @@ import java.security.KeyPairGenerator
 import java.security.NoSuchAlgorithmException
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.KeyAgreement
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.runBlocking
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
@@ -46,6 +52,25 @@ internal object JschAndroidCrypto {
         session.setConfig("ssh-ed25519-cert-v01@openssh.com", ED25519_CLASS_NAME)
         session.setConfig("xdh", XDH_CLASS_NAME)
     }
+
+    /** The OpenSSH `sk` public key algorithms that [HardwareKeyJschIdentity] uses. */
+    val SECURITY_KEY_ALGORITHMS: List<String> = HardwareKeyType.entries.filter { it.isFido2 }.map { it.opensshKeyType }
+
+    /**
+     * Lets [session] log in with a [HardwareKeyJschIdentity]. `UserAuthPublicKey` of JSch uses an identity only
+     * when its algorithm is in `PubkeyAcceptedAlgorithms`, so this function adds [SECURITY_KEY_ALGORITHMS] to the
+     * list of [session]. It changes only [session], not the global configuration of JSch.
+     *
+     * JSch 2.28.x needs no `Signature` class for the `sk` names. `Session.checkSignatures` checks only the names in
+     * `CheckSignatures` (by default `ssh-ed25519,ssh-ed448`), and the identity makes the signature.
+     */
+    fun enableSecurityKeyAlgorithms(session: Session) {
+        val accepted = session.getConfig(PUBKEY_ACCEPTED_ALGORITHMS).orEmpty().split(',').filter { it.isNotBlank() }
+        val added = SECURITY_KEY_ALGORITHMS.filter { it !in accepted }
+        session.setConfig(PUBKEY_ACCEPTED_ALGORITHMS, (accepted + added).joinToString(","))
+    }
+
+    private const val PUBKEY_ACCEPTED_ALGORITHMS = "PubkeyAcceptedAlgorithms"
 }
 
 /**
@@ -218,5 +243,66 @@ internal class AndroidKeystoreJschIdentity(
 
     override fun clear() {
         // Hardware-backed AndroidKeyStore private keys remain in secure storage
+    }
+}
+
+/**
+ * The JSch [Identity] of a FIDO2 security key: it gives the public key of [key] and the signatures of [signer] to
+ * JSch for `publickey` authentication with an OpenSSH `sk` key.
+ *
+ * [getPublicKeyBlob] gives the `sk` public key blob from the enrolled values of [key] ([SecurityKeyPublicKeys]).
+ * [getSignature] blocks the JSch thread while [signer] waits for the key and for the touch of the user. JSch sends
+ * the returned `PROTOCOL.u2f` blob in the packet with no change. JSch asks the server first if it accepts the key,
+ * so the user touches the key only for a key that the server knows.
+ *
+ * A [HardwareKeyException] from [signer] goes through `Session.connect`, because it is a [RuntimeException]. The wait
+ * is a child of [callerJob], so a cancel of the login stops it with a [kotlinx.coroutines.CancellationException].
+ *
+ * The client makes the identity at the start of the login, before the TCP connection. The identity takes the cancel
+ * mark of the machine then ([HardwareKeySigner.cancelMark]). When the user disconnects the machine before JSch asks for
+ * the signature, [getSignature] thus stops with [HardwareKeyException.Reason.Cancelled] and shows no prompt.
+ */
+internal class HardwareKeyJschIdentity(
+    private val machineId: String,
+    private val key: SshAuthMethod.HardwareSecurityKey,
+    private val signer: HardwareKeySigner,
+    private val callerJob: Job?,
+) : Identity {
+
+    private val cancelMark: Long = signer.cancelMark(machineId)
+
+    override fun setPassphrase(passphrase: ByteArray?): Boolean = true
+
+    override fun getPublicKeyBlob(): ByteArray = SecurityKeyPublicKeys.blob(key)
+
+    override fun getSignature(data: ByteArray?): ByteArray? =
+        getSignature(data, null)
+
+    override fun getSignature(data: ByteArray?, alg: String?): ByteArray? {
+        if (data == null) return null
+        // An error of the child must not fail the caller job, so the child returns it as a value.
+        val result = runBlocking(callerJob ?: EmptyCoroutineContext) {
+            try {
+                Result.success(signer.sign(machineId, key, data, cancelMark))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+        }
+        return result.getOrThrow()
+    }
+
+    @Deprecated("Deprecated in JSch Identity")
+    override fun decrypt(): Boolean = true
+
+    override fun getAlgName(): String = key.keyType.opensshKeyType
+
+    override fun getName(): String = "security-key:${key.keyType.opensshKeyType}"
+
+    override fun isEncrypted(): Boolean = false
+
+    override fun clear() {
+        // The private key stays on the security key.
     }
 }

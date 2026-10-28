@@ -1178,7 +1178,7 @@ class FakeHerdrServer(
         writeLinesIntoRect(cells, totalCols, totalRows, leftRect, leftLines)
 
         if (!isZoomed) {
-            // Render Top-Right Pane (Pane #2: SSH Endpoint Diagnostics)
+            // Render Top-Right Pane (SSH Session · Pane #2)
             val topRightLines = listOf(
                 StyledLine("╭─ SSH Session · Pane #2 ──────────────────────────╮", mauvePurple, bold = true),
                 StyledLine("$ herdr api snapshot", warmText),

@@ -2,6 +2,7 @@ package com.toxicbakery.app.bison.ssh
 
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.model.ConnectionProgress
+import com.toxicbakery.app.bison.model.FeatureFlags
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -37,8 +38,9 @@ import kotlinx.serialization.json.putJsonObject
  * Android SSH transport coordinator for Herdr hosts.
  *
  * Runs the connect steps of a machine (`Part IV.2` of `01-core-app-design.md` gives the target design):
- * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager] or `Password`, optionally via [ProxyJumpTunnel]).
- *    A machine with an [SshAuthMethod] that this version does not support fails before this phase (issue #23).
+ * 1. `AuthenticatingSsh` (via [AndroidKeystoreKeyManager], `Password`, or a FIDO2 security key, optionally via
+ *    [ProxyJumpTunnel]). A machine with an [SshAuthMethod] that [featureFlags] does not support fails before this
+ *    phase (issue #23).
  * 2. `BootstrappingMoshOrBridge`: The backend selects the backbone ([SshBackend.negotiateBackbone]). This version
  *    has no Mosh transport (issue #22), so the backbone is always [ActiveBackbone.SshEndpoint]: the SSH session of
  *    the machine.
@@ -74,6 +76,8 @@ class SshTransportManager(
     var proxyJumpTunnel: ProxyJumpTunnel = ProxyJumpTunnel(sshDebugLog = sshDebugLog),
     private val timeSource: TimeSource = TimeSource.Monotonic,
     private val promptScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** Decides which [SshAuthMethod] values the manager connects. See [SshAuthMethod.isSupported]. */
+    private val featureFlags: FeatureFlags = FeatureFlags(),
 ) {
     private val surfaceDeltaAssembler = SurfaceDeltaAssembler()
     private val activeMachines = ConcurrentHashMap<String, HostMachine>()
@@ -168,7 +172,13 @@ class SshTransportManager(
             )
 
             is SshRequest.TriggerNetworkRoam -> onNetworkAvailable(request.machineId)
-            is SshRequest.PromptHardwareKeyTouch -> sshStateManager.setHardwareKeyTouchPrompt(request)
+            // Only a HardwareKeySigner call puts a touch prompt, because only the call can stop when the user closes
+            // the prompt. A prompt from a request has no owner, so the manager ignores it.
+            is SshRequest.PromptHardwareKeyTouch -> sshDebugLog.record(
+                machineId = request.machineId,
+                tag = "FIDO2",
+                message = "Ignored a touch prompt request with no security key call",
+            )
         }
     }
 
@@ -214,7 +224,7 @@ class SshTransportManager(
         // A connect from the user removes the cause of an earlier stop.
         sshStateManager.clearHostKeyPrompt(machineId)
         sshStateManager.clearNeedsUser(machineId)
-        if (!machine.authMethod.isSupported) {
+        if (!machine.authMethod.isSupported(featureFlags)) {
             // The backend does not get the machine, so the app makes no network connection.
             sshDebugLog.record(
                 machineId = machineId,
@@ -779,9 +789,12 @@ class SshTransportManager(
     private fun causeOf(error: Throwable): NeedsUserCause {
         val chain = generateSequence(error) { it.cause }.take(MAX_CAUSE_DEPTH).toList()
         val userInput = chain.filterIsInstance<UserInputException>().firstOrNull()
+        val hardwareKey = chain.filterIsInstance<HardwareKeyException>().firstOrNull()
         return when {
             userInput != null -> causeOf(userInput.result)
             chain.any { it is MissingSecretException } -> NeedsUserCause.PasswordMissing
+            // A security key error with an IOException cause is not a network error.
+            hardwareKey != null -> NeedsUserCause.Other(detailOf(hardwareKey))
             chain.any { it is IOException } -> NeedsUserCause.Unreachable(detailOf(error))
             else -> NeedsUserCause.Other(detailOf(error))
         }
@@ -853,8 +866,9 @@ class SshTransportManager(
         private const val MAX_CAUSE_DEPTH = 16
 
         /**
-         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey]. This version does not
-         * support that method. Issue #23 (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
+         * The error text for a machine that uses [SshAuthMethod.HardwareSecurityKey] when the build does not support
+         * it: [FeatureFlags.hardwareSecurityKeys] is false, or the key type is not FIDO2. Issue #23
+         * (https://github.com/ToxicBakery/BisonHerdr/issues/23) adds FIDO2 keys.
          */
         internal const val HARDWARE_KEY_NOT_SUPPORTED: String =
             "This version does not support hardware security keys (issue #23)"
@@ -862,15 +876,15 @@ class SshTransportManager(
         /**
          * Builds the SSH bootstrap command that probes `mosh-server`, writes the ephemeral tablet
          * `HERDR_CONFIG_PATH` config, and launches `mosh-server new -s -c 256 -l LANG=en_US.UTF-8 -p <port_range> -- env HERDR_CONFIG_PATH=<tablet_cfg> herdr`.
-         * No code runs this command in this version. Issue #22 adds the Mosh path.
+         * No code runs this command in this version. Issue #22 adds the Mosh path. The `herdr` command selects the
+         * Herdr session of the machine. See [HerdrCommand].
          */
         fun buildMoshServerBootstrapCommand(machine: HostMachine): String {
             val moshBin = machine.moshServerPath?.takeIf { it.isNotBlank() } ?: "mosh-server"
             val portRange = machine.moshUdpPortRange.ifBlank { HostMachine.DEFAULT_MOSH_UDP_PORT_RANGE }
-            val sessionArg = machine.herdrSessionName?.takeIf { it.isNotBlank() }?.let { " --session $it" }.orEmpty()
             return "command -v $moshBin >/dev/null 2>&1 && " +
                 "$moshBin new -s -c 256 -l LANG=en_US.UTF-8 -p $portRange -- " +
-                "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
+                "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH ${HerdrCommand.of(machine)}"
         }
 
         /** Returns the error response line of [request] with the code [NO_RESPONSE_CODE] and [message]. */
