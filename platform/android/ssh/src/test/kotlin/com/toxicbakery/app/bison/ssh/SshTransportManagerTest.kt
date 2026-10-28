@@ -98,7 +98,7 @@ class SshTransportManagerTest {
     }
 
     @Test
-    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLine() = runTest {
+    fun anRpcErrorOnTheRealPathWritesExactlyOneErrorLineOnEachLane() = runTest {
         // Each command batch fails, as on a broken SSH channel.
         val client = RealHerdrSshClient(
             sshDebugLog = debugLog,
@@ -114,13 +114,28 @@ class SshTransportManagerTest {
         // A resize gives the profile of the machine to the manager, with no command on the host.
         manager.handleRequest(SshRequest.ResizeShell(lanBox.id, cols = 80u, rows = 24u), lanBox)
 
-        val response = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
+        // pane.layout uses the poll lane of the client.
+        val layoutResponse = manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.paneLayout(tabId = "w1:t1"))
 
-        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
-        val errors = debugLog.entries.value.filter { it.isError }
-        assertEquals(1, errors.size, debugLogDump())
-        assertTrue(errors.single().message.startsWith("RPC pane.layout error: Broken pipe"), debugLogDump())
+        assertTrue(layoutResponse.contains(SshTransportManager.NO_RESPONSE_CODE), layoutResponse)
+        assertEquals(listOf("RPC pane.layout error: Broken pipe"), errorMessages(), debugLogDump())
+
+        // pane.send_keys uses the input lane of the client, which has its own error path.
+        val keysResponse = manager.sendEndpointCommand(
+            lanBox.id,
+            HerdrRpcBuilder.paneSendKeys(paneId = "w1:p1", keys = listOf("Enter")),
+        )
+
+        assertTrue(keysResponse.contains(SshTransportManager.NO_RESPONSE_CODE), keysResponse)
+        assertEquals(
+            listOf("RPC pane.layout error: Broken pipe", "RPC pane.send_keys error: Broken pipe"),
+            errorMessages(),
+            debugLogDump(),
+        )
     }
+
+    /** Returns the messages of the error entries of the debug log, in sequence. */
+    private fun errorMessages(): List<String> = debugLog.entries.value.filter { it.isError }.map { it.message }
 
     @Test
     fun anRpcForAMachineWithNoProfileGivesAnErrorResponse() = runTest {
