@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Live end-to-end check of the terminal cursor position against an agy (Antigravity CLI) agent.
 #
+# CI does not run this script or AgyCursorPlacementE2ETest. The check needs herdr, agy, and an
+# Android emulator, so run it on a developer computer. In CI, RealSshClientTest in
+# :platform:android:ssh tests the real SSH path against an in-process SSH server.
+#
 # The script does these steps:
 #   1. Starts an isolated Herdr session and runs `agy` in a new workspace.
 #   2. Starts a private sshd on 127.0.0.1. The sshd sets HERDR_SOCKET_PATH to the isolated session.

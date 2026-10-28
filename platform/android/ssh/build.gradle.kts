@@ -35,6 +35,8 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.testJunit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.sshd.core)
+    testRuntimeOnly(libs.slf4j.nop)
 
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.testExt.junit)

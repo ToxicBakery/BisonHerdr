@@ -261,6 +261,23 @@ internal class RealHerdrSshClient(
         }
     }
 
+    /**
+     * Runs the shell [command] on [machine] and returns its standard output. The call opens the session when
+     * necessary. It throws the SSH error when the session does not open, for example a failed login.
+     */
+    internal suspend fun runCommand(
+        machine: HostMachine,
+        route: ResolvedSshRoute,
+        command: String,
+    ): String = withContext(Dispatchers.IO) {
+        executeBatchOnLane(
+            machine = machine,
+            route = route,
+            lane = WorkerLane.Poll,
+            commands = listOf(RemoteShellCommand.Exec(command)),
+        )
+    }
+
     suspend fun checkMoshServerAvailable(
         machine: HostMachine,
         route: ResolvedSshRoute,
