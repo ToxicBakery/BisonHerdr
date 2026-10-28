@@ -17,7 +17,7 @@ Traditional SSH clients on Android drop connections when you switch apps to insp
 - **Android Foreground Service (`connectedDevice` / `specialUse`)**: Holds active transport sockets open inside a persistent `BisonSessionService` with live notification actions (*Approve Pending Agent*, *Disconnect All*) while you switch to browsers, docs, or other apps.
 - **Mosh UDP SSP Backbone + Zero-Traffic Background Suspend (planned)**: This version does not include Mosh. The SSH endpoint path is the only transport. A later version will use Mosh's State Synchronization Protocol (`AES-128-OCB` over UDP). Then the app sends no packets in the background, and gets the latest terminal frame in one UDP round trip when it comes back. [Issue #22](https://github.com/ToxicBakery/BisonHerdr/issues/22) has the work for Mosh.
 - **Zero-Bandwidth Daemon Surface Lease**: When `ON_STOP` fires on the Herdr control channel, the client sends `client_shell.surface.set({ active: false })` to pause high-frequency terminal surface deltas while retaining the logical session lease, then restores the viewport and requests a fresh keyframe via `client_shell.surface.set({ active: true })` on `ON_START`.
-- **Sub-100ms Network Roaming (`ConnectivityManager.NetworkCallback`)**: Detects Wi-Fi ↔ cellular handoffs immediately and re-establishes the Herdr control sideband in the background. The UDP socket rebind and the SSP heartbeat need Mosh, which is planned.
+- **Sub-100ms Network Roaming (`ConnectivityManager.NetworkCallback`, planned)**: In this version, a network change has no effect on the SSH session. A later version will detect Wi-Fi ↔ cellular handoffs immediately, and connect the SSH session and the Herdr control sideband again in the background. Items 10 and 11 of [issue #20](https://github.com/ToxicBakery/BisonHerdr/issues/20) hold this work. The UDP socket rebind and the SSP heartbeat need Mosh, which is also planned.
 
 ### 2. Primary Input: Touch-First Terminal Experience
 On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-class inputs. BisonHerdr replaces tiny text-mode chrome with native, ergonomic touch controls:
@@ -34,7 +34,7 @@ On a tablet, touch and the on-screen keyboard (or folio keyboard) are first-clas
 
 | Layer | Technology | Responsibility |
 | :--- | :--- | :--- |
-| **UI & Ergonomics** | Jetpack Compose + Material 3 Adaptive (`WindowSizeClass`) | 120Hz `PaneSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, command palette, multi-machine fleet drawer |
+| **UI & Ergonomics** | Jetpack Compose + Material 3 Adaptive (`WindowSizeClass`) | 120Hz `TerminalSurfaceCanvas`, BSP split-tree layout, split-thumb clusters, command palette, multi-machine fleet drawer |
 | **Shared Client Logic** | Kotlin Multiplatform (`commonMain`) + Kodein DI | Unidirectional MVI state stores, session lifecycle orchestration, SSH host management, theme & keymap persistence |
 | **Terminal & Transport Core** | Kotlin (`:core:protocol`, `:platform:android:ssh`) + [JSch](https://github.com/mwiede/jsch) | SSH transport over JSch + Herdr Endpoint Generation 1 models and `SurfaceDeltaAssembler` in `:core:protocol`. A Mosh UDP SSP client and a `libghostty-vt` VT parser are planned. |
 | **Remote Host Daemon** | [Herdr](https://github.com/herdrdev/herdr) (`remote-client-bridge` / `remote-api-bridge`) | Unmodified remote daemon providing persistent workspaces, BSP panes, PTY multiplexer, coding-agent status detection (`claude`, `codex`, `gemini`, `aider`, `opencode`), and JSON-RPC control plane |
