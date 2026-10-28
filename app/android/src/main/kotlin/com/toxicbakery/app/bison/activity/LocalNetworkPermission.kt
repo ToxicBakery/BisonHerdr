@@ -32,6 +32,7 @@ import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.hasLocalNetworkPermission
 import kotlinx.coroutines.CompletableDeferred
+import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.stringResource
 
 /** A dialog of the app about the local network permission. See [LocalNetworkPermissionFlow]. */
@@ -206,24 +207,34 @@ internal class LocalNetworkPermissionRequester(
 }
 
 /**
+ * Returns the body text and the text of the main button of [dialog]. When [timedOut] is true, the app does not know
+ * that the host is on the local network. Then the body tells only that Android can stop the connection.
+ */
+internal fun localNetworkDialogTexts(
+    dialog: LocalNetworkDialog,
+    timedOut: Boolean,
+): Pair<StringResource, StringResource> =
+    when (dialog) {
+        LocalNetworkDialog.Rationale -> if (timedOut) {
+            Res.string.local_network_permission_rationale_body_timed_out
+        } else {
+            Res.string.local_network_permission_rationale_body
+        } to Res.string.local_network_permission_rationale_continue
+        LocalNetworkDialog.Settings -> if (timedOut) {
+            Res.string.local_network_permission_settings_body_timed_out
+        } else {
+            Res.string.local_network_permission_settings_body
+        } to Res.string.local_network_permission_settings_open
+    }
+
+/**
  * Shows [open] with the texts of its [LocalNetworkPermissionRequester.OpenDialog.dialog]. After a connect timeout, the
  * app does not know that the host is on the local network. Then the texts tell only that Android can stop the
  * connection.
  */
 @Composable
 internal fun LocalNetworkPermissionDialog(open: LocalNetworkPermissionRequester.OpenDialog) {
-    val (body, confirm) = when (open.dialog) {
-        LocalNetworkDialog.Rationale -> if (open.timedOut) {
-            Res.string.local_network_permission_rationale_body_timed_out
-        } else {
-            Res.string.local_network_permission_rationale_body
-        } to Res.string.local_network_permission_rationale_continue
-        LocalNetworkDialog.Settings -> if (open.timedOut) {
-            Res.string.local_network_permission_settings_body_timed_out
-        } else {
-            Res.string.local_network_permission_settings_body
-        } to Res.string.local_network_permission_settings_open
-    }
+    val (body, confirm) = localNetworkDialogTexts(open.dialog, open.timedOut)
     AlertDialog(
         onDismissRequest = { open.answer.complete(false) },
         title = { Text(stringResource(Res.string.local_network_permission_title)) },

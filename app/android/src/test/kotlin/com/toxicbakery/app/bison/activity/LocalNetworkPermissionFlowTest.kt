@@ -1,5 +1,12 @@
 package com.toxicbakery.app.bison.activity
 
+import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.local_network_permission_rationale_body
+import com.toxicbakery.app.bison.resources.local_network_permission_rationale_body_timed_out
+import com.toxicbakery.app.bison.resources.local_network_permission_rationale_continue
+import com.toxicbakery.app.bison.resources.local_network_permission_settings_body
+import com.toxicbakery.app.bison.resources.local_network_permission_settings_body_timed_out
+import com.toxicbakery.app.bison.resources.local_network_permission_settings_open
 import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
 import com.toxicbakery.app.bison.ssh.NeedsUserCause
 import com.toxicbakery.app.bison.ssh.SshRequest
@@ -142,6 +149,29 @@ class LocalNetworkPermissionFlowTest {
                 "app settings",
             ),
             steps,
+        )
+    }
+
+    @Test
+    fun eachDialogHasATextForEachReason() {
+        assertEquals(
+            Res.string.local_network_permission_rationale_body to
+                Res.string.local_network_permission_rationale_continue,
+            localNetworkDialogTexts(LocalNetworkDialog.Rationale, timedOut = false),
+        )
+        assertEquals(
+            Res.string.local_network_permission_rationale_body_timed_out to
+                Res.string.local_network_permission_rationale_continue,
+            localNetworkDialogTexts(LocalNetworkDialog.Rationale, timedOut = true),
+        )
+        assertEquals(
+            Res.string.local_network_permission_settings_body to Res.string.local_network_permission_settings_open,
+            localNetworkDialogTexts(LocalNetworkDialog.Settings, timedOut = false),
+        )
+        assertEquals(
+            Res.string.local_network_permission_settings_body_timed_out to
+                Res.string.local_network_permission_settings_open,
+            localNetworkDialogTexts(LocalNetworkDialog.Settings, timedOut = true),
         )
     }
 
