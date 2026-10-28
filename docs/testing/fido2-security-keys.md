@@ -28,14 +28,24 @@ keys can work, but nobody tested them.
 - An SSH server with OpenSSH 8.2 or later and Herdr, that the device can reach over the
   network. Use the host of the other manual tests. OpenSSH 8.2 and later accept
   `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com` by default.
-- A second SSH server for the ProxyJump test (card D, step D10). The bastion user must
-  have the public key of the YubiKey in `~/.ssh/authorized_keys`.
+- A second SSH server for the ProxyJump tests (card D, steps D11 and D12). The bastion
+  user must have the public key of the YubiKey in `~/.ssh/authorized_keys`.
 - A computer with this repository, the Android SDK, and `adb`.
 
-## Step 0: Install a build with the flag on
+## Step 0: Check the servers and install a build with the flag on
 
-1. Connect the device to the computer with `adb`.
-2. Run this command from the root of the repository:
+1. On each SSH server, run this command:
+
+   ```
+   sudo sshd -T | grep -iE 'pubkeyacceptedalgorithms|pubkeyauthoptions'
+   ```
+
+   The `pubkeyacceptedalgorithms` line must show `sk-ssh-ed25519@openssh.com` and
+   `sk-ecdsa-sha2-nistp256@openssh.com`. The `pubkeyauthoptions` line must not show
+   `verify-required`, because this version cannot send a PIN. If a check fails, change
+   `sshd_config` before you start.
+2. Connect the device to the computer with `adb`.
+3. Run this command from the root of the repository:
 
    ```
    ./gradlew :app:android:installDebug -Pbison.hardwareSecurityKeys=true
@@ -43,9 +53,9 @@ keys can work, but nobody tested them.
 
    The Gradle property sets `BuildConfig.HARDWARE_SECURITY_KEYS`. Do not put the
    property in a `gradle.properties` file, because each later build then gets the flag.
-3. Open the app and tap the button that adds a host.
-4. Make sure that "SSH Authentication Strategy" shows the "FIDO2 Security Key" choice.
-   If the choice does not show, the build does not have the flag. Do step 2 again.
+4. Open the app and tap the button that adds a host.
+5. Make sure that "SSH Authentication Strategy" shows the "FIDO2 Security Key" choice.
+   If the choice does not show, the build does not have the flag. Do step 3 again.
 
 ## Card A: USB-C with `sk-ssh-ed25519@openssh.com`
 
@@ -101,6 +111,8 @@ Use the machine of card A for each step.
 | D9 | Remove the YubiKey from the USB-C port, and connect it again. Android then forgets the USB permission. Tap "Connect Host". When Android asks for the USB permission, deny it. | The permission dialog closes and does not show again during this request. The touch sheet stays. Tap "Cancel" on the touch sheet. The error contains "The security key request was cancelled." |
 | D10 | Tap "Connect Host" again. Allow the USB permission and touch the key. | The terminal opens. |
 | D11 | In the editor, turn on the ProxyJump bastion with the second SSH server. Tap "Save & Connect". | The touch sheet shows two times: first for the bastion, then for the host. Touch the key each time. The terminal opens. |
+| D12 | Remove the key from the USB-C port. Select "NFC" in the editor, and tap "Save & Connect". | The touch sheet shows two times. Hold the key against the NFC area each time, until the sheet closes. The terminal opens. |
+| D13 | Select "USB-C and NFC", and turn off the ProxyJump bastion. Disconnect. Tap "Connect Host", and then tap "Cancel" on the connecting screen at once, before the touch sheet shows. | The connect stops. The touch sheet does not show later for this machine, and the key does not flash. If the touch sheet shows before you can tap "Cancel", the network is too fast for this step. Tap "Cancel" on the sheet, and do the step again with a host that is farther away. |
 
 ## Card E: Minified build with the flag on
 
