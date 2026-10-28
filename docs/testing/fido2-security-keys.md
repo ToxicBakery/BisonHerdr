@@ -7,7 +7,13 @@ in-process server (`TestSshServer`, Apache MINA SSHD), but they do not prove the
 NFC, and touch behavior of a real key.
 
 The feature flag `FeatureFlags.hardwareSecurityKeys` is off in each build type. Keep
-it off in a release until all cards on this page pass.
+it off in a release until all cards on this page pass. A release build with
+`-Pbison.hardwareSecurityKeys=true` stops with an error (`checkReleaseFeatureFlags` in
+`app/android/build.gradle.kts`). The pull request that turns on the flag removes this
+check.
+
+Over USB, the app accepts only YubiKeys (the Yubico vendor ID). Over NFC, other FIDO2
+keys can work, but nobody tested them.
 
 ## Equipment
 
@@ -16,13 +22,14 @@ it off in a release until all cards on this page pass.
 - A YubiKey 5 series key with USB-C and NFC, for example a YubiKey 5C NFC.
   - Ed25519 credentials need firmware 5.2.3 or later.
   - Use a key with no FIDO2 PIN. This version cannot send a PIN. A key with a PIN
-    can refuse the enrollment with "The security key needs its PIN". Record this
-    result if it occurs.
-- A second FIDO2 key for the wrong key test (card D, step 4). Any FIDO2 key is
-  satisfactory.
+    can refuse the enrollment with "The security key needs its PIN", for example a
+    YubiKey 5 with firmware before 5.7. Record this result if it occurs.
+- A second YubiKey for the wrong key test (card D, step D4).
 - An SSH server with OpenSSH 8.2 or later and Herdr, that the device can reach over the
   network. Use the host of the other manual tests. OpenSSH 8.2 and later accept
   `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com` by default.
+- A second SSH server for the ProxyJump test (card D, step D10). The bastion user must
+  have the public key of the YubiKey in `~/.ssh/authorized_keys`.
 - A computer with this repository, the Android SDK, and `adb`.
 
 ## Step 0: Install a build with the flag on
@@ -86,13 +93,36 @@ Use the machine of card A for each step.
 | D1 | Tap "Connect Host". When the touch sheet shows, tap "Cancel". | The touch sheet closes at once. The error on the connecting screen contains "The security key request was cancelled." The app does not stop. |
 | D2 | Tap "Connect Host". Do not touch the key for 40 seconds. | The error on the connecting screen contains "The user did not touch the security key before the time limit." |
 | D3 | Remove the key. Tap "Connect Host" and wait 60 seconds. | The error on the connecting screen contains "No security key came before the time limit". |
-| D4 | Connect the second FIDO2 key. Tap "Connect Host" and touch the second key. | The error on the connecting screen contains "This security key does not have the credential of this machine". |
+| D4 | Connect the second YubiKey. Tap "Connect Host" and touch the second key. | The error on the connecting screen contains "This security key does not have the credential of this machine". |
 | D5 | Remove the line of the key from `authorized_keys`. Tap "Connect Host". | The touch sheet does not show, because the server refuses the key before the app asks for a signature. The login fails, or the server asks for a password. If the server asks for a password, tap "Cancel". |
 | D6 | Add the line again and connect. Put the app in the background. Turn airplane mode on, and then off. | If the session closes, the reconnect fails with "The app is in the background, so it cannot use the security key". The app does not ask for a touch in the background. |
 | D7 | Open the app. Tap "Connect Host" and touch the key. | The terminal opens. |
-| D8 | In the editor, select the other key type. | The public key line goes away. "Save & Connect" is not available until you enroll the key again. |
+| D8 | In the editor, select the other key type. | The public key line goes away. "Save & Connect" is not available until you enroll the key again. Select the first key type again, or enroll again. |
+| D9 | Remove the YubiKey from the USB-C port, and connect it again. Android then forgets the USB permission. Tap "Connect Host". When Android asks for the USB permission, deny it. | The permission dialog closes and does not show again during this request. The touch sheet stays. Tap "Cancel" on the touch sheet. The error contains "The security key request was cancelled." |
+| D10 | Tap "Connect Host" again. Allow the USB permission and touch the key. | The terminal opens. |
+| D11 | In the editor, turn on the ProxyJump bastion with the second SSH server. Tap "Save & Connect". | The touch sheet shows two times: first for the bastion, then for the host. Touch the key each time. The terminal opens. |
 
-## Card E: Flag off
+## Card E: Minified build with the flag on
+
+The debug build of step 0 has no R8. This card tests the minified benchmark build,
+which uses the release rules of R8 and the debug signature. Thus it tests the classes
+that yubikit, slf4j, and JSch load at run time.
+
+1. Install the benchmark build with the flag:
+
+   ```
+   ./gradlew :app:android:installBenchmark -Pbison.hardwareSecurityKeys=true
+   ```
+
+2. Do steps A1 to A9 of card A, and then steps A1 to A9 of card C for one key type.
+
+| Step | Action | Expected result |
+| --- | --- | --- |
+| E1 | Do the steps of card A over USB-C. | The results agree with card A. The app does not stop. |
+| E2 | Do the steps of card C over NFC. | The results agree with card C. The app does not stop. |
+| E3 | Run `adb logcat -d \| grep -iE "ClassNotFound\|NoSuchMethod\|ServiceConfigurationError"`. | The command finds no line for the app. |
+
+## Card F: Flag off
 
 1. Install a build with no flag:
 
@@ -104,11 +134,12 @@ Use the machine of card A for each step.
 
 | Step | Action | Expected result |
 | --- | --- | --- |
-| E1 | Look at "SSH Authentication Strategy". | The screen shows "Hardware security key: Not supported in this version". It does not show "Enroll key". |
-| E2 | Open "Add Herdr Host". | The choices are only "Android Keystore Key" and "Password / Passphrase". |
-| E3 | Go to the machine list. | The card of the machine shows "Not supported in this version". "Connect Host" is not available. |
-| E4 | Connect the YubiKey to the USB-C port. | The app does not ask for the USB permission. |
-| E5 | Hold the YubiKey against the NFC area while the app is open. | The app does not take the tag. Android handles the tag as before, for example it opens the Yubico OTP link. |
+| F1 | Look at "SSH Authentication Strategy". | The screen shows "Hardware security key: Not supported in this version". It does not show "Enroll key". |
+| F2 | Open "Add Herdr Host". | The choices are only "Android Keystore Key" and "Password / Passphrase". |
+| F3 | Go to the machine list. | The card of the machine shows "Not supported in this version". "Connect Host" is not available. |
+| F4 | Connect the YubiKey to the USB-C port. | The app does not ask for the USB permission. |
+| F5 | Hold the YubiKey against the NFC area while the app is open. | The app does not take the tag. Android handles the tag as before, for example it opens the Yubico OTP link. |
+| F6 | On the computer, run `./gradlew :app:android:assembleRelease -Pbison.hardwareSecurityKeys=true`. | The build stops in `checkReleaseFeatureFlags` with "bison.hardwareSecurityKeys=true is only for a debug or benchmark test build". |
 
 ## Result record
 
@@ -121,3 +152,4 @@ Write one row for each card. Add the record to the pull request that turns on th
 | C | | | | | |
 | D | | | | | |
 | E | | | | | |
+| F | | | | | |
