@@ -10,12 +10,14 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import java.security.ProviderException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -35,7 +37,9 @@ import kotlinx.coroutines.test.runTest
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConnectionPathsE2ETest {
 
-    private class Harness {
+    private class Harness(
+        keystoreKeyManager: AndroidKeystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
+    ) {
         val debugLog = SshDebugLog()
         val stateManager = SshStateManager()
         val snapshotBus = EndpointSnapshotBus()
@@ -52,7 +56,7 @@ class ConnectionPathsE2ETest {
             endpointSnapshotBus = snapshotBus,
             paneSurfaceBus = surfaceBus,
             semanticNotificationBus = notificationBus,
-            keystoreKeyManager = AndroidKeystoreKeyManager(allowSoftwareKeys = true),
+            keystoreKeyManager = keystoreKeyManager,
         )
         val transport = SshTransportManager(
             backend = backend,
@@ -331,6 +335,30 @@ class ConnectionPathsE2ETest {
                 it.isError && it.tag == "SSHAuth" && it.message.contains("failed: AuthFailed")
             },
         )
+    }
+
+    @Test
+    fun path4C_keystoreKeyThatTheKeyStoreCannotMakeFailsTheLogin() = runTest {
+        val keystoreError = ProviderException("Keystore operation failed")
+        val h = Harness(
+            keystoreKeyManager = AndroidKeystoreKeyManager(
+                allowSoftwareKeys = false,
+                keystoreKeyGenerator = { _, _, _ -> throw keystoreError },
+            ),
+        )
+        val machine = HostMachine(
+            id = "workbox-4c",
+            name = "Workbox 4C",
+            hostname = "100.64.0.12",
+            username = "ian",
+            authMethod = SshAuthMethod.KeystoreKey(keyAlias = "alias_4c", algorithm = KeyAlgorithm.EcdsaP256),
+            transportMode = TransportMode.SshEndpointOnly,
+        )
+
+        val result = assertIs<SshAuthResult.Failed>(h.backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine)))
+        assertSame(keystoreError, assertIs<KeyCreationException>(result.cause).cause)
+        assertFalse(h.transport.connect(machine))
+        assertEquals(ConnectionProgress.Failed, h.stateManager.connectionProgress.value["workbox-4c"])
     }
 
     @Test
