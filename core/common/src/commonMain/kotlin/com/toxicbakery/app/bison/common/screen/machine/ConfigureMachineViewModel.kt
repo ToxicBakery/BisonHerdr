@@ -75,6 +75,8 @@ class ConfigureMachineViewModel(
         val publicKeyError: String? = null,
         /** The cause when the device key store did not make the key. The screen shows it next to the key types. */
         val keyCreationFailure: KeyCreationFailure? = null,
+        /** True while the screen shows the warning before [Event.ConfirmRegenerateKey]. */
+        val showRegenerateKeyWarning: Boolean = false,
         val passwordRef: String = "",
         /** Tells if the loaded machine has a stored password. The password field shows a hint for it. */
         val storedPassword: StoredPassword = StoredPassword.None,
@@ -134,6 +136,18 @@ class ConfigureMachineViewModel(
 
         /** Loads the public key of the key store key. This creates the key if it does not exist. */
         data object ShowPublicKey : Event
+
+        /** Shows the warning before the app replaces the key store key with a new key. */
+        data object RegenerateKey : Event
+
+        /**
+         * Replaces the key store key with a new key that has the current key parameters, and shows the new
+         * public key. Each host that has only the old public key then refuses the login.
+         */
+        data object ConfirmRegenerateKey : Event
+
+        /** Closes the warning of [RegenerateKey] and keeps the key. */
+        data object DismissRegenerateKey : Event
         data class UpdateRequireBiometric(val require: Boolean) : Event
         data class UpdatePasswordRef(val passwordRef: String) : Event
         data class UpdateProxyJumpEnabled(val enabled: Boolean) : Event
@@ -183,7 +197,20 @@ class ConfigureMachineViewModel(
             is Event.UpdateRequireBiometric -> updateState {
                 it.copy(requireBiometric = event.require, keyCreationFailure = null)
             }
-            is Event.ShowPublicKey -> loadPublicKey()
+            is Event.ShowPublicKey -> loadPublicKey { alias, algorithm, requireBiometric ->
+                authorizedKeyLine(alias, algorithm, requireBiometric)
+            }
+            Event.RegenerateKey -> if (sshPublicKeyProvider != null) {
+                updateState { it.copy(showRegenerateKeyWarning = true) }
+            }
+            Event.ConfirmRegenerateKey -> {
+                // The old public key is not valid after this step, so do not show it.
+                updateState { it.copy(showRegenerateKeyWarning = false, publicKeyLine = null) }
+                loadPublicKey { alias, algorithm, requireBiometric ->
+                    regenerateAuthorizedKeyLine(alias, algorithm, requireBiometric)
+                }
+            }
+            Event.DismissRegenerateKey -> updateState { it.copy(showRegenerateKeyWarning = false) }
             is Event.UpdatePasswordRef -> updateState { it.copy(passwordRef = event.passwordRef) }
             is Event.UpdateProxyJumpEnabled -> updateState { it.copy(proxyJumpEnabled = event.enabled) }
             is Event.UpdateBastionHost -> updateState { it.copy(bastionHost = event.host) }
@@ -274,7 +301,10 @@ class ConfigureMachineViewModel(
     private fun State.withoutPublicKey(): State =
         copy(publicKeyLine = null, isLoadingPublicKey = false, publicKeyError = null, keyCreationFailure = null)
 
-    private fun loadPublicKey() {
+    /** Shows the public key that [load] gives for the current key alias, key type, and biometric setting. */
+    private fun loadPublicKey(
+        load: suspend SshPublicKeyProvider.(alias: String, algorithm: KeyAlgorithm, requireBiometric: Boolean) -> String,
+    ) {
         val provider = sshPublicKeyProvider ?: return
         val request = state.value
         if (request.isLoadingPublicKey) return
@@ -282,7 +312,7 @@ class ConfigureMachineViewModel(
         val algorithm = request.keyAlgorithm
         updateState { it.copy(isLoadingPublicKey = true, publicKeyError = null, keyCreationFailure = null) }
         viewModelScope.launch {
-            val result = runCatching { provider.authorizedKeyLine(alias, algorithm, request.requireBiometric) }
+            val result = runCatching { provider.load(alias, algorithm, request.requireBiometric) }
             val error = result.exceptionOrNull()
             updateState { current ->
                 val currentAlias = current.keystoreAlias.trim().ifBlank { current.keyAlgorithm.defaultKeystoreAlias }

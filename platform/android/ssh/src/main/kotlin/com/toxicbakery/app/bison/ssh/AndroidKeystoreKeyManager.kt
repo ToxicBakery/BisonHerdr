@@ -161,6 +161,45 @@ class AndroidKeystoreKeyManager internal constructor(
         ).openSshAuthorizedKeyLine
     }
 
+    override suspend fun regenerateAuthorizedKeyLine(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean,
+    ): String = withContext(Dispatchers.IO) {
+        regenerateKey(
+            keyAlias = keyAlias,
+            algorithm = algorithm,
+            requireBiometric = requireBiometric,
+        ).openSshAuthorizedKeyLine
+    }
+
+    /**
+     * Makes a new key pair for [keyAlias] with the current key parameters and returns its public key. The new
+     * key replaces the stored key of [keyAlias], also a key of a different algorithm or a key from an earlier
+     * version. Each host that knows only the old public key then refuses the login.
+     *
+     * Throws a [KeyCreationException] when AndroidKeyStore does not make the key.
+     */
+    fun regenerateKey(
+        keyAlias: String,
+        algorithm: KeyAlgorithm,
+        requireBiometric: Boolean = false,
+        comment: String = DEFAULT_KEY_COMMENT,
+    ): ExportedSshPublicKey =
+        synchronized(keyLock) {
+            fallbackKeyPairs.remove(keyAlias)
+            forgetExportedPublicKeys(keyAlias)
+            // AndroidKeyStore replaces the entry of an alias when it makes a new key with that alias.
+            val exported = exportPublicKey(
+                keyAlias = keyAlias,
+                algorithm = algorithm,
+                publicKey = generateKeyPair(keyAlias, algorithm, requireBiometric).public,
+                comment = comment,
+            )
+            exportedPublicKeys["$keyAlias:${algorithm.name}:$comment"] = exported
+            exported
+        }
+
     /**
      * Signs an SSH `SSH_MSG_USERAUTH_REQUEST` challenge payload using the private key for [keyAlias]
      * and returns the RFC 4253 / RFC 8332 / RFC 5656 / RFC 8709 formatted SSH signature blob.

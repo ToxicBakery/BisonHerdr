@@ -101,6 +101,11 @@
     <string name="machine_key_error_no_secure_lock_screen">This key needs a secure screen lock and a biometric. Set them in the device settings. Then show the public key again.</string>
     <string name="machine_key_error_algorithm_not_supported">This device cannot make %1$s keys. Select a different key type.</string>
     <string name="machine_key_error_other">The device key store did not make the key: %1$s</string>
+    <string name="machine_key_regenerate_hint">The biometric setting applies only when the app makes a key. To apply a changed setting, or to update a key from an earlier version, make a new key.</string>
+    <string name="machine_key_regenerate">Make a New Key</string>
+    <string name="machine_key_regenerate_warning_title">Make a New Key?</string>
+    <string name="machine_key_regenerate_warning_body">The app replaces the key %1$s with a new key. Hosts that have only the old public key then refuse the login. Add the new public key to ~/.ssh/authorized_keys on each host. All machines that use this key alias use the new key.</string>
+    <string name="machine_key_regenerate_confirm">Replace the Key</string>
     <string name="machine_auth_password">Password / Keyboard-Interactive</string>
     <string name="machine_field_proxy_jump_label">Bastion / ProxyJump Host (Optional)</string>
     <string name="machine_bastion_credentials_hint">The app also uses the password or key of this machine for the bastion.</string>

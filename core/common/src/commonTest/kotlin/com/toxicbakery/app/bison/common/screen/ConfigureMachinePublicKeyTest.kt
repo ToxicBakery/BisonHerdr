@@ -34,9 +34,21 @@ class ConfigureMachinePublicKeyTest {
     ) : SshPublicKeyProvider {
         val requests = mutableListOf<Triple<String, KeyAlgorithm, Boolean>>()
 
+        /** The keys that [regenerateAuthorizedKeyLine] made. */
+        val regenerated = mutableListOf<Triple<String, KeyAlgorithm, Boolean>>()
+
         override suspend fun authorizedKeyLine(keyAlias: String, algorithm: KeyAlgorithm, requireBiometric: Boolean): String {
             requests += Triple(keyAlias, algorithm, requireBiometric)
             return reply(keyAlias, algorithm)
+        }
+
+        override suspend fun regenerateAuthorizedKeyLine(
+            keyAlias: String,
+            algorithm: KeyAlgorithm,
+            requireBiometric: Boolean,
+        ): String {
+            regenerated += Triple(keyAlias, algorithm, requireBiometric)
+            return "${reply(keyAlias, algorithm)} new"
         }
     }
 
@@ -121,6 +133,58 @@ class ConfigureMachinePublicKeyTest {
             // The failure is for the old key type, so a different key type removes it.
             viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateKeyAlgorithm(KeyAlgorithm.EcdsaP256))
             assertNull(viewModel.state.value.keyCreationFailure)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun regenerateKeyShowsAWarningFirstAndMakesNoKeyUntilTheUserConfirms() = runTest {
+        try {
+            val provider = RecordingProvider { alias, algorithm -> "${algorithm.sshKeyType} AAAA $alias" }
+            val viewModel = viewModel(provider)
+
+            viewModel.onEvent(ConfigureMachineViewModel.Event.RegenerateKey)
+            assertTrue(viewModel.state.value.showRegenerateKeyWarning)
+            viewModel.onEvent(ConfigureMachineViewModel.Event.DismissRegenerateKey)
+
+            assertFalse(viewModel.state.value.showRegenerateKeyWarning)
+            assertTrue(provider.regenerated.isEmpty())
+            assertNull(viewModel.state.value.publicKeyLine)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun confirmedRegenerateKeyMakesANewKeyWithTheCurrentSettingsAndShowsItsPublicKey() = runTest {
+        try {
+            val provider = RecordingProvider { alias, algorithm -> "${algorithm.sshKeyType} AAAA $alias" }
+            val viewModel = viewModel(provider)
+            viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateKeyAlgorithm(KeyAlgorithm.EcdsaP256))
+            viewModel.onEvent(ConfigureMachineViewModel.Event.UpdateRequireBiometric(true))
+            viewModel.onEvent(ConfigureMachineViewModel.Event.ShowPublicKey)
+
+            viewModel.onEvent(ConfigureMachineViewModel.Event.RegenerateKey)
+            viewModel.onEvent(ConfigureMachineViewModel.Event.ConfirmRegenerateKey)
+
+            assertEquals(listOf(Triple("bison_default_ecdsa_p256", KeyAlgorithm.EcdsaP256, true)), provider.regenerated)
+            assertEquals("ecdsa-sha2-nistp256 AAAA bison_default_ecdsa_p256 new", viewModel.state.value.publicKeyLine)
+            assertFalse(viewModel.state.value.showRegenerateKeyWarning)
+            assertFalse(viewModel.state.value.isLoadingPublicKey)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun withoutAProviderRegenerateKeyShowsNoWarning() = runTest {
+        try {
+            val viewModel = viewModel(provider = null)
+
+            viewModel.onEvent(ConfigureMachineViewModel.Event.RegenerateKey)
+
+            assertFalse(viewModel.state.value.showRegenerateKeyWarning)
         } finally {
             Dispatchers.resetMain()
         }

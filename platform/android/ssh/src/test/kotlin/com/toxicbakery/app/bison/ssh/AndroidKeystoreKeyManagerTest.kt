@@ -16,7 +16,9 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 /**
  * Tests that [AndroidKeystoreKeyManager] makes no software key on a device, and that only
@@ -203,6 +205,37 @@ class AndroidKeystoreKeyManagerTest {
         }
 
         assertSame(signError, error)
+    }
+
+    @Test
+    fun regenerateKeyReplacesTheKeyAndTheNewKeySigns() {
+        val manager = manager(FailingKeystore(ProviderException("No AndroidKeyStore")), allowSoftwareKeys = true)
+        val oldKey = manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256)
+
+        val newKey = manager.regenerateKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
+
+        assertNotEquals(oldKey.openSshAuthorizedKeyLine, newKey.openSshAuthorizedKeyLine)
+        assertEquals(newKey, manager.getExistingPublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256))
+        assertEquals(newKey, manager.getOrCreatePublicKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256))
+        assertTrue(manager.signSshChallenge(KEY_ALIAS, KeyAlgorithm.EcdsaP256, CHALLENGE).isNotEmpty())
+    }
+
+    @Test
+    fun regenerateKeyAsksTheKeyStoreWithTheNewParameters() {
+        val requests = mutableListOf<Triple<String, KeyAlgorithm, Boolean>>()
+        val manager = manager(
+            keystore = { alias, algorithm, requireBiometric ->
+                requests += Triple(alias, algorithm, requireBiometric)
+                throw InvalidAlgorithmParameterException(IllegalStateException("No secure lock screen"))
+            },
+        )
+
+        val error = assertFailsWith<KeyCreationException> {
+            manager.regenerateKey(KEY_ALIAS, KeyAlgorithm.EcdsaP256, requireBiometric = true)
+        }
+
+        assertEquals(KeyCreationFailure.NoSecureLockScreen, error.failure)
+        assertEquals(listOf(Triple(KEY_ALIAS, KeyAlgorithm.EcdsaP256, true)), requests)
     }
 
     private companion object {
