@@ -1,5 +1,6 @@
 import com.android.build.api.artifact.ScopedArtifact
 import com.android.build.api.artifact.SingleArtifact
+import com.android.build.api.variant.HostTestBuilder
 import com.android.build.api.variant.ScopedArtifacts
 import com.toxicbakery.app.bison.composite.task.CheckReleaseClassesTask
 import com.toxicbakery.app.bison.composite.task.ListClassesTask
@@ -179,7 +180,7 @@ val checkReleaseClasses = tasks.register<CheckReleaseClassesTask>("checkReleaseC
         "com.toxicbakery.app.bison.ssh.SimulatedSshBackend",
     )
     checkedPackage = "com.toxicbakery.app.bison"
-    // This check only finds the classes in the release build. It cannot see the bindings.
+    // ReleaseDebugModuleTest checks the release bindings. This check only finds the classes in the release build.
     requiredClasses = setOf(
         "com.toxicbakery.app.bison.debug.NoDebugServer",
         "com.toxicbakery.app.bison.ssh.RealSshBackend",
@@ -188,6 +189,11 @@ val checkReleaseClasses = tasks.register<CheckReleaseClassesTask>("checkReleaseC
 }
 
 androidComponents {
+    // AGP makes unit tests only for the debug build type. ReleaseDebugModuleTest in src/testRelease checks the
+    // bindings of the release DebugModule.
+    beforeVariants(selector().withBuildType("release")) { variant ->
+        variant.hostTests[HostTestBuilder.UNIT_TEST_TYPE]?.enable = true
+    }
     // The class lists include the classes of all modules and libraries of the variant, before R8.
     onVariants(selector().withBuildType("debug")) { variant ->
         variant.artifacts.forScope(ScopedArtifacts.Scope.ALL)
