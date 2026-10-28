@@ -5,6 +5,7 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.RoamingStatus
 import com.toxicbakery.app.bison.protocol.FrameData
+import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import java.io.IOException
 import java.net.ConnectException
@@ -76,6 +77,35 @@ class SshTransportManagerTest {
         )
 
     private fun debugLogDump(): String = debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
+
+    @Test
+    fun anRpcWithNoResponseFromTheBackendGivesAnErrorResponse() = runTest {
+        // The recording backend gives no response, as the real backend does after an error.
+        val backend = RecordingSshBackend()
+        val manager = manager(backend)
+        connectAll(manager, backend, lanBox)
+
+        val response = assertNotNull(manager.sendEndpointCommand(lanBox.id, HerdrRpcBuilder.workspaceFocus("w2")))
+
+        assertEquals(listOf("sendEndpointCommand lan-box"), backend.calls)
+        assertTrue(response.contains("\"error\""), response)
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+        assertFalse(response.contains("\"ok\""), response)
+        assertTrue(
+            debugLog.entries.value.any { it.isError && it.message == "No response for workspace.focus" },
+            debugLogDump(),
+        )
+    }
+
+    @Test
+    fun anRpcForAMachineWithNoProfileGivesAnErrorResponse() = runTest {
+        val backend = RecordingSshBackend()
+
+        val response = assertNotNull(manager(backend).sendEndpointCommand("unknown-box", HerdrRpcBuilder.paneFocus("w1:p1")))
+
+        assertTrue(backend.calls.isEmpty(), "The backend got ${backend.calls}")
+        assertTrue(response.contains(SshTransportManager.NO_RESPONSE_CODE), response)
+    }
 
     @Test
     fun connectWithoutAProfileFailsAndDoesNotCallTheBackend() = runTest {

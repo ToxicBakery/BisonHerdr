@@ -108,5 +108,5 @@ class DebugModuleTest {
      * For an endpoint-only machine, [RealSshBackend] selects the backbone with no network call and no log entry.
      */
     private fun hasSimulatedEndpointLog(machineId: String): Boolean =
-        debugLog.entries.value.any { it.machineId == machineId && it.tag == "SimulatedHost" }
+        debugLog.entries.value.any { it.machineId == machineId && it.tag == SimulatedSshBackend.SIMULATED_HOST_LOG_TAG }
 }

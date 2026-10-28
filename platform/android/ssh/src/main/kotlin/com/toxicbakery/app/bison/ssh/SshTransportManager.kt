@@ -8,7 +8,6 @@ import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
 import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
-import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.SurfaceDeltaAssembler
 import java.io.IOException
@@ -30,6 +29,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
  * Android SSH transport coordinator for Herdr hosts.
@@ -393,7 +395,7 @@ class SshTransportManager(
                 sshDebugLog.record(
                     machineId = machineId,
                     tag = "PresentationFence",
-                    message = "Did not send ${readyControl.kind} ${readyControl.dataJson}: this version has no Herdr endpoint stream",
+                    message = "Resumed: published the last frame again with presentation epoch $epoch",
                 )
             }
             sshStateManager.setRoamingStatus(machineId, RoamingStatus.Healthy)
@@ -401,41 +403,35 @@ class SshTransportManager(
     }
 
     /**
-     * Sends a Herdr RPC to the backend of [machineId], and writes it to the debug log with its lane in the target
-     * design. The real backend of this version sends each request as a `herdr remote-api-bridge` line, whatever the
-     * lane. The simulated backend gives the lane back. The lanes of the target design are `herdr remote-api-bridge`
-     * (`herdr.sock`) and `ClientMessage::ClientShellEndpointRequest` (`herdr-client.sock`):
-     * - In Mosh UDP mode (not in this version, issue #22), focus/navigation RPCs (`workspace.focus`, `tab.focus`,
-     *   `pane.focus`, `agent.focus`)
-     *   are always dispatched over `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode])
-     *   so `focus_all_shell_clients_on_default_target()` switches the Mosh `herdr` view.
-     * - Non-`client_shell` methods (`agent.read`, `pane.read`, `agent.prompt`, `pane.send_input`, `pane.layout`)
-     *   or requests sent while the surface lease is off also use the `herdr remote-api-bridge` lane.
+     * Sends a Herdr RPC to the backend of [machineId], and returns the response line of the backend. The real backend
+     * sends each request as a `herdr remote-api-bridge` line.
+     *
+     * When the machine has no profile, or when the backend gives no response, the manager writes an error to the
+     * debug log and returns an error response with the code [NO_RESPONSE_CODE]. Thus a caller cannot take a failed
+     * RPC for a success.
      */
     suspend fun sendEndpointCommand(
         machineId: String,
         request: ClientShellEndpointRequest,
     ): String? {
-        val backbone = sshStateManager.activeTransportBackbone.value[machineId]
-        val isMoshActive = backbone is ActiveBackbone.MoshUdp
-        val isLeaseActive = surfaceLeaseActive[machineId] != false
-
-        val useApiSocket = (isMoshActive && MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode(request.method)) ||
-            !MoshBootstrapConfig.isClientShellSupportedMethod(request.method) ||
-            !isLeaseActive
-
-        val transportLane = if (useApiSocket) API_BRIDGE_LANE else CLIENT_BRIDGE_LANE
-        val wireLine = HerdrRpcBuilder.toNdjsonLine(request).trim()
+        val isMoshActive = sshStateManager.activeTransportBackbone.value[machineId] is ActiveBackbone.MoshUdp
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
-            message = rpcLogMessage(transportLane, wireLine),
+            message = HerdrRpcBuilder.toNdjsonLine(request).trim(),
         )
         val machine = activeMachines[machineId]
         val response = machine?.let {
             backend.sendEndpointCommand(it, proxyJumpTunnel.resolveRoute(it), request, isMoshActive)
         }
-        return response ?: """{"id":"${request.id}","result":{"type":"ok","lane":"$transportLane"}}"""
+        if (response != null) return response
+        sshDebugLog.record(
+            machineId = machineId,
+            tag = "RPC",
+            message = "No response for ${request.method}",
+            isError = true,
+        )
+        return noResponseError(request)
     }
 
     suspend fun sendEndpointCommand(
@@ -662,8 +658,9 @@ class SshTransportManager(
         if (surfaceLeaseActive[machineId] == false) RoamingStatus.SurfaceParked else RoamingStatus.Healthy
 
     /**
-     * Restores [machineId] after the reconnect loop opened a new session. It turns the surface lease on again when
-     * the lease is on, reads the surface again, and sends the queued prompts.
+     * Restores [machineId] after the reconnect loop opened a new session. When the surface lease is on, it publishes
+     * the last frame again and sets [RoamingStatus.Healthy]. When the lease is off, it keeps
+     * [RoamingStatus.SurfaceParked]. Then it reads the surface again and sends the queued prompts.
      */
     private suspend fun restoreAfterReconnect(machineId: String) {
         val machine = activeMachines[machineId] ?: return
@@ -823,11 +820,8 @@ class SshTransportManager(
 
     companion object {
         const val REMOTE_TABLET_CONFIG_PATH: String = "/tmp/herdr-bison-tablet.toml"
-        /** The `herdr remote-api-bridge` lane. The real backend sends each request on it in this version. */
-        internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
-
-        /** The `herdr remote-client-bridge` lane of the target design. No code uses this bridge in this version. */
-        internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
+        /** The error code of the response of [sendEndpointCommand] when the backend gives no response. */
+        const val NO_RESPONSE_CODE: String = "no_response"
         internal val DEFAULT_COLS: UShort = 120u
         internal val DEFAULT_ROWS: UShort = 36u
 
@@ -868,8 +862,15 @@ class SshTransportManager(
                 "env HERDR_CONFIG_PATH=$REMOTE_TABLET_CONFIG_PATH herdr$sessionArg"
         }
 
-        /** Returns the debug log text of an RPC with [wireLine] and the [lane] that the target design gives it. */
-        internal fun rpcLogMessage(lane: String, wireLine: String): String = "$wireLine (lane in the target design: $lane)"
+        /** Returns the error response line of [request] for a backend that gave no response. */
+        internal fun noResponseError(request: ClientShellEndpointRequest): String =
+            buildJsonObject {
+                put("id", request.id)
+                putJsonObject("error") {
+                    put("code", NO_RESPONSE_CODE)
+                    put("message", "The backend gave no response for ${request.method}")
+                }
+            }.toString()
 
         /**
          * Builds the command of the Herdr Endpoint Generation 1 bridge of the target design. No code runs this

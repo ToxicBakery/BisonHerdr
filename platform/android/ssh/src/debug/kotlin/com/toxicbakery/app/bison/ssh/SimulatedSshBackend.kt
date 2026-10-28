@@ -18,6 +18,7 @@ import com.toxicbakery.app.bison.protocol.CursorShape
 import com.toxicbakery.app.bison.protocol.CursorState
 import com.toxicbakery.app.bison.protocol.FrameData
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
+import com.toxicbakery.app.bison.protocol.MoshBootstrapConfig
 import com.toxicbakery.app.bison.protocol.PaneSurfaceFrame
 import com.toxicbakery.app.bison.protocol.PaneSurfacePane
 import com.toxicbakery.app.bison.protocol.SemanticNotification
@@ -29,8 +30,11 @@ import com.toxicbakery.app.bison.ssh.SshTransportManager.Companion.HARDWARE_KEY_
 import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
  * Debug [SshBackend] that simulates a Herdr host. It does not open a network connection.
@@ -320,14 +324,24 @@ class SimulatedSshBackend(
     /**
      * Applies a focus RPC to the simulated snapshot and surface. Returns null, because no host answers.
      */
+    /**
+     * Applies a focus RPC to the simulated snapshot, and returns a simulated success. The response names the lane
+     * that the target design gives the request ([designLaneOf]), so that a test can check the lane rules.
+     */
     override suspend fun sendEndpointCommand(
         machine: HostMachine,
         route: ResolvedSshRoute,
         request: ClientShellEndpointRequest,
         isMoshActive: Boolean,
-    ): String? {
+    ): String {
         applyFocusRpcMutation(machine.id, request)
-        return null
+        return buildJsonObject {
+            put("id", request.id)
+            putJsonObject("result") {
+                put("type", "ok")
+                put("lane", designLaneOf(request, isMoshActive))
+            }
+        }.toString()
     }
 
     /** The simulated host has no terminal, so the input has no effect. */
@@ -344,18 +358,12 @@ class SimulatedSshBackend(
     /** The simulated host has no session. */
     override fun disconnect(machineId: String) = Unit
 
-    /**
-     * Writes the debug log entry that [SshTransportManager.sendEndpointCommand] writes for an RPC on the
-     * `herdr remote-api-bridge` lane.
-     */
+    /** Writes the debug log entry that [SshTransportManager.sendEndpointCommand] writes for an RPC. */
     private fun recordApiBridgeRpc(machineId: String, request: ClientShellEndpointRequest) {
         sshDebugLog.record(
             machineId = machineId,
             tag = "RPC",
-            message = SshTransportManager.rpcLogMessage(
-                lane = SshTransportManager.API_BRIDGE_LANE,
-                wireLine = HerdrRpcBuilder.toNdjsonLine(request).trim(),
-            ),
+            message = HerdrRpcBuilder.toNdjsonLine(request).trim(),
         )
     }
 
@@ -435,12 +443,30 @@ class SimulatedSshBackend(
         }
     }
 
-    internal companion object {
+    companion object {
         /** The round trip time of the backbone of a simulated host. */
-        const val SIMULATED_RTT_MS: Int = 24
+        internal const val SIMULATED_RTT_MS: Int = 24
 
         /** The debug log tag of the entry that [negotiateBackbone] writes. Only this backend writes it. */
         const val SIMULATED_HOST_LOG_TAG: String = "SimulatedHost"
+
+        /** The `herdr remote-api-bridge` lane (`herdr.sock`) of the target design. */
+        internal const val API_BRIDGE_LANE: String = "herdr remote-api-bridge (herdr.sock)"
+
+        /** The `herdr remote-client-bridge` lane (`herdr-client.sock`) of the target design. */
+        internal const val CLIENT_BRIDGE_LANE: String = "herdr remote-client-bridge (herdr-client.sock)"
+
+        /**
+         * Returns the lane that the target design gives [request]. In Mosh mode (issue #22), a focus RPC goes over
+         * `herdr.sock` ([MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode]). A method that is not a
+         * `client_shell` method also goes over `herdr.sock`. Each other request goes over `herdr-client.sock`. The
+         * real backend of this version sends each request over `herdr remote-api-bridge`.
+         */
+        internal fun designLaneOf(request: ClientShellEndpointRequest, isMoshActive: Boolean): String {
+            val useApiBridge = (isMoshActive && MoshBootstrapConfig.isFocusRpcRequiringApiSocketInMoshMode(request.method)) ||
+                !MoshBootstrapConfig.isClientShellSupportedMethod(request.method)
+            return if (useApiBridge) API_BRIDGE_LANE else CLIENT_BRIDGE_LANE
+        }
 
         private val BLANK_CELL = CellData()
     }

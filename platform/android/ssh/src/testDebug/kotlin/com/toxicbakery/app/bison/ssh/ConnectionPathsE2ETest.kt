@@ -79,9 +79,9 @@ class ConnectionPathsE2ETest {
     /** Returns the lane that the target design gives [request] while the surface lease is on. */
     private fun expectedLane(request: ClientShellEndpointRequest): String =
         if (MoshBootstrapConfig.isClientShellSupportedMethod(request.method)) {
-            SshTransportManager.CLIENT_BRIDGE_LANE
+            SimulatedSshBackend.CLIENT_BRIDGE_LANE
         } else {
-            SshTransportManager.API_BRIDGE_LANE
+            SimulatedSshBackend.API_BRIDGE_LANE
         }
 
     /** Sends [request] to [machineId] and asserts that the response names the lane of the target design. */
@@ -464,14 +464,14 @@ class ConnectionPathsE2ETest {
         assertEquals(surfaceBeforePark.panes.size, surfaceWhileParked.panes.size)
 
         // Path 6B: setSurfaceLease(active = true) publishes the frame with a new presentation epoch and restores
-        // Healthy. This version has no Herdr endpoint stream, so the log tells that the ready control was not sent.
+        // Healthy.
         h.transport.setSurfaceLease(machineId, active = true)
         assertEquals(RoamingStatus.Healthy, h.stateManager.roamingState.value[machineId])
         assertTrue(
             h.debugLog.entries.value.any {
                 it.machineId == machineId &&
                     it.tag == "PresentationFence" &&
-                    it.message.startsWith("Did not send endpoint.presentation.ready.v1")
+                    it.message.startsWith("Resumed: published the last frame again")
             },
         )
 
