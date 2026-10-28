@@ -15,6 +15,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
+    packaging {
+        jniLibs {
+            // androidx.benchmark:benchmark-common and androidx.tracing:tracing-perfetto-binary ship
+            // these libraries without a symbol table, so `llvm-strip --strip-unneeded` gives the
+            // same bytes. The same block in app/android/build.gradle.kts tells why AGP cannot strip
+            // them on CI. Do not add a library with symbols here.
+            keepDebugSymbols += "**/libbenchmarkNative.so"
+            keepDebugSymbols += "**/libtracing_perfetto.so"
+        }
+    }
+
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()

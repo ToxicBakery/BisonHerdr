@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Lint applies this file to each module, because the file is in a parent folder of each module.
+    The three checks below read the newest versions from the network. Thus their result can change
+    when no code changes. Dependabot opens the pull requests that update the versions.
+-->
+<lint>
+    <issue id="AndroidGradlePluginVersion" severity="ignore" />
+    <issue id="GradleDependency" severity="ignore" />
+    <issue id="NewerVersionAvailable" severity="ignore" />
+</lint>
