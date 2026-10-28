@@ -63,6 +63,13 @@ internal class TestSshServer(
     @Volatile
     var hostKey: KeyPair = newHostKey()
 
+    /**
+     * More host keys that the server offers to each new session after [hostKey]. A test sets them to add a key of
+     * a new type to a server that the client knows already.
+     */
+    @Volatile
+    var extraHostKeys: List<KeyPair> = emptyList()
+
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
 
@@ -118,7 +125,7 @@ internal class TestSshServer(
         val server = SshServer.setUpDefaultServer().apply {
             host = HOST
             port = this@TestSshServer.port
-            keyPairProvider = KeyPairProvider { listOf(this@TestSshServer.hostKey) }
+            keyPairProvider = KeyPairProvider { listOf(this@TestSshServer.hostKey) + extraHostKeys }
             setPasswordAuthenticator { username, password, _ ->
                 credentialCheckCount.incrementAndGet()
                 username == PASSWORD_USER && password == PASSWORD
@@ -205,5 +212,13 @@ internal class TestSshServer(
             KeyPairGenerator.getInstance("EC").apply {
                 initialize(ECGenParameterSpec("secp256r1"))
             }.generateKeyPair()
+
+        /** Makes a new in-memory 2048-bit `ssh-rsa` host key. */
+        fun newRsaHostKey(): KeyPair =
+            KeyPairGenerator.getInstance("RSA").apply {
+                initialize(RSA_KEY_BITS)
+            }.generateKeyPair()
+
+        private const val RSA_KEY_BITS = 2048
     }
 }

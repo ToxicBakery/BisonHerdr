@@ -1,7 +1,9 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.jcraft.jsch.HostKeyRepository
+import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchException
+import com.jcraft.jsch.JSchHostKeyException
 import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.model.KnownHost
 import com.toxicbakery.app.bison.model.SshAuthMethod
@@ -11,6 +13,7 @@ import java.util.Base64
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -135,6 +138,32 @@ class HostKeyCheckTest {
     }
 
     @Test
+    fun aNewKeyTypeOnTheServerDoesNotChangeTheAcceptedKey() = runTest {
+        server.hostKey = TestSshServer.newRsaHostKey()
+        val unknown = assertIs<SshAuthResult.HostKeyUnknown>(authenticate(passwordMachine), debugLogDump())
+        assertEquals("ssh-rsa", unknown.presented.keyType)
+        knownHostsStore.put(unknown.presented)
+        assertEquals(SshAuthResult.Success, authenticate(passwordMachine), debugLogDump())
+        backend.disconnect(passwordMachine.id)
+
+        // The server now also offers an ecdsa-sha2-nistp256 key. The JSch list has ECDSA before RSA.
+        server.extraHostKeys = listOf(TestSshServer.newHostKey())
+        val globalPreference = JSch.getConfig(PREFER_KNOWN_HOST_KEY_TYPES)
+        // A system property can set this JSch default to "no". The value of the session must have priority.
+        JSch.setConfig(PREFER_KNOWN_HOST_KEY_TYPES, "no")
+        try {
+            assertFailsWith<JSchHostKeyException>("Without the preference, JSch selects the new key type") {
+                connectWithoutTheSessionPreference()
+            }
+
+            assertEquals(SshAuthResult.Success, authenticate(passwordMachine), debugLogDump())
+        } finally {
+            JSch.setConfig(PREFER_KNOWN_HOST_KEY_TYPES, globalPreference)
+        }
+        assertEquals(listOf(unknown.presented), knownHostsStore.knownHosts.value)
+    }
+
+    @Test
     fun keyOfADifferentPortIsUnknown() = runTest {
         knownHostsStore.put(server.knownHost().copy(port = server.port + 1))
 
@@ -208,6 +237,23 @@ class HostKeyCheckTest {
     private suspend fun authenticate(machine: HostMachine): SshAuthResult =
         backend.authenticate(machine, route(machine))
 
+    /**
+     * Connects with the same host key check as [KnownHostsRepository.connect], but with the global JSch value of
+     * `prefer_known_host_key_types`.
+     */
+    private fun connectWithoutTheSessionPreference() {
+        val session = JSch().getSession(TestSshServer.PASSWORD_USER, TestSshServer.HOST, server.port)
+        session.hostKeyRepository = KnownHostsRepository(knownHostsStore)
+        session.setConfig("StrictHostKeyChecking", "yes")
+        session.setPassword(TestSshServer.PASSWORD.encodeToByteArray())
+        JschAndroidCrypto.configureSession(session)
+        try {
+            session.connect(CONNECT_TIMEOUT_MS)
+        } finally {
+            session.disconnect()
+        }
+    }
+
     private fun route(machine: HostMachine): ResolvedSshRoute = ProxyJumpTunnel().resolveRoute(machine)
 
     private fun sampleKnownHost(): KnownHost = KnownHost(
@@ -220,4 +266,9 @@ class HostKeyCheckTest {
 
     private fun debugLogDump(): String =
         debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
+
+    private companion object {
+        const val PREFER_KNOWN_HOST_KEY_TYPES = "prefer_known_host_key_types"
+        const val CONNECT_TIMEOUT_MS = 10_000
+    }
 }
