@@ -53,6 +53,9 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = true
+            // The resource shrink removes each resource that no kept code and no manifest refers
+            // to. Give a resource that the app loads by name (getIdentifier) a tools:keep rule.
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -63,6 +66,7 @@ android {
         create("benchmark") {
             isDebuggable = false
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
