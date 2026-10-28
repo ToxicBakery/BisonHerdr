@@ -63,6 +63,8 @@ class AgentAlertsTest {
 
         snapshot = snapshotLine("working")
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
+        // The agent left Blocked, so the service removes an old alert of the pane.
+        assertEquals(emptyMap(), notifications.agentsNeedingUser.value)
         snapshot = snapshotLine("blocked")
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
@@ -72,13 +74,16 @@ class AgentAlertsTest {
         assertEquals("claude", alert.agentName)
         assertEquals("Fix the build", alert.body)
         assertEquals("herdr-box", alert.bootId)
+        assertEquals(mapOf("box" to mapOf("w1:p1" to AgentStatus.Blocked)), notifications.agentsNeedingUser.value)
 
         snapshot = snapshotLine("done")
         assertTrue(client.refreshSnapshotAndSurface(machine, route))
         assertEquals(listOf("w1:p1=blocked", "w1:p1=done"), alerts())
 
-        // A disconnect clears the known agents. The next snapshot is the first snapshot of a new connect.
+        // A disconnect clears the known agents and the agents that need the user. The next snapshot is the first
+        // snapshot of a new connect.
         client.disconnect(machine.id)
+        assertEquals(emptyMap(), notifications.agentsNeedingUser.value)
         snapshot = snapshotLine("blocked")
         assertTrue(client.connectAndVerify(machine, route).isSuccess)
         assertTrue(client.refreshSnapshotAndSurface(machine, route))

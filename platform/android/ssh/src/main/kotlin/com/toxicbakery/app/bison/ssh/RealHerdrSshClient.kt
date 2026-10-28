@@ -747,6 +747,7 @@ internal class RealHerdrSshClient(
         withFrames(machineId) { frames ->
             discardRunningPolls(machineId)
             frames.knownAgents = null
+            semanticNotificationBus.setAgentsNeedingUser(machineId, emptyMap())
             frames.scrollRequests.clear()
             paneScrolls.remove(machineId)
             optimisticEdits.remove(machineId)?.let { synchronized(it) { it.clear() } }
@@ -994,7 +995,7 @@ internal class RealHerdrSshClient(
             val sel = selectionState.computeIfAbsent(machine.id) { ClientSelectionState() }
             parseSnapshotObject(machine.id, resolvedSnapshotObj, sel).also { parsed ->
                 snapshotPublisher(machine.id, parsed.snapshot)
-                agentAlerts = recordAgents(frames, pollSeq) { known ->
+                agentAlerts = recordAgents(machine.id, frames, pollSeq) { known ->
                     AgentStatusTransitions.fromSnapshot(known, parsed.snapshot.agents)
                 }
             }
@@ -1205,11 +1206,15 @@ internal class RealHerdrSshClient(
     }
 
     /**
-     * Applies [step] to the known agents of [frames] when [seq] is newer than the data in them, and returns the alerts
-     * of the step. A step that returns null changes nothing. The caller holds the frame lock. See
+     * Applies [step] to the known agents of [frames] of [machineId] when [seq] is newer than the data in them, and
+     * returns the alerts of the step. A step that returns null changes nothing. The caller holds the frame lock. See
      * [MachineFrames.agentSeq].
+     *
+     * It also gives the known agents that need the user to [SemanticNotificationBus.setAgentsNeedingUser]. Thus the
+     * service removes an alert when its agent leaves `Blocked` or `Done`, or stops.
      */
     private inline fun recordAgents(
+        machineId: String,
         frames: MachineFrames,
         seq: Long,
         step: (known: Map<String, ClientShellAgent>?) -> AgentStatusUpdate?,
@@ -1218,6 +1223,7 @@ internal class RealHerdrSshClient(
         val update = step(frames.knownAgents) ?: return emptyList()
         frames.agentSeq = seq
         frames.knownAgents = update.known
+        semanticNotificationBus.setAgentsNeedingUser(machineId, update.known.mapValues { it.value.agentStatus })
         return update.alerts
     }
 
@@ -1248,7 +1254,7 @@ internal class RealHerdrSshClient(
             // After a disconnect, a snapshot that ends late changes nothing.
             ensureActive()
             val alerts = withFrames(machine.id) { frames ->
-                recordAgents(frames, seq) { known -> AgentStatusTransitions.fromSnapshot(known, agents) }
+                recordAgents(machine.id, frames, seq) { known -> AgentStatusTransitions.fromSnapshot(known, agents) }
             }
             publishAgentAlerts(machine.id, alerts)
             agents.mapTo(HashSet()) { it.paneId }
@@ -1259,7 +1265,7 @@ internal class RealHerdrSshClient(
         val seq = pollSequence.incrementAndGet()
         val alerts = withFrames(machine.id) { frames ->
             // With no known agents, the client has no snapshot since the last disconnect. Then it ignores the event.
-            recordAgents(frames, seq) { known ->
+            recordAgents(machine.id, frames, seq) { known ->
                 known?.let { AgentStatusTransitions.fromEvent(it, agent) }
             }
         }

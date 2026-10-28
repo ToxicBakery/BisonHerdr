@@ -203,4 +203,5 @@
     <string name="agent_alert_action_failed_text">%1$s: %2$s</string>
     <string name="agent_alert_action_no_answer">The machine sent no answer.</string>
     <string name="agent_alert_action_not_connected">The machine is not connected.</string>
+    <string name="agent_alert_action_not_needed">The agent does not need an answer now.</string>
 </resources>
