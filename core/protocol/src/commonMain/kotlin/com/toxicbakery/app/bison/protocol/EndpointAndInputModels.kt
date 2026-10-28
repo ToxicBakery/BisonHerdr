@@ -56,6 +56,10 @@ sealed interface ClientPaneInputEvent {
     @SerialName("key")
     data class Key(val event: ClientKeyEvent) : ClientPaneInputEvent
 
+    /**
+     * Text that the user types, for example with the keyboard or a quick key. The SSH client sends it as raw bytes
+     * (`pane.send_text`), so the program in the pane reads it as keys and never as a paste.
+     */
     @Serializable
     @SerialName("text_commit")
     data class TextCommit(val text: String) : ClientPaneInputEvent
@@ -64,6 +68,10 @@ sealed interface ClientPaneInputEvent {
     @SerialName("mouse")
     data class Mouse(val event: ClientMouseEvent) : ClientPaneInputEvent
 
+    /**
+     * Text that the user pastes. The SSH client sends it with `pane.send_input` and no keys. Herdr then puts the text in
+     * a bracketed paste when the pane has bracketed paste on, as a terminal does.
+     */
     @Serializable
     @SerialName("paste")
     data class Paste(val text: String) : ClientPaneInputEvent

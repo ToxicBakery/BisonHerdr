@@ -4,6 +4,7 @@ import com.toxicbakery.app.bison.model.HostMachine
 import com.toxicbakery.app.bison.protocol.ClientKeyCode
 import com.toxicbakery.app.bison.protocol.ClientKeyEvent
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
+import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
 import java.io.File
@@ -11,6 +12,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -28,7 +30,9 @@ import kotlinx.serialization.json.jsonPrimitive
  * Tests the key forms of [HerdrKeys] and the pane input lines of [RealHerdrSshClient].
  *
  * Herdr 0.9.5 has no `pane.send_keys` name for Home, End, PageUp, PageDown, Delete, and Insert. For a name that it
- * does not know, Herdr answers `invalid_key` and writes no key of the request.
+ * does not know, Herdr answers `invalid_key` and writes no key of the request. `pane.send_text` writes its text with
+ * no change. `pane.send_input` puts its text in a bracketed paste when the pane has bracketed paste on. Herdr drops a
+ * request line over 1 MiB with no answer.
  */
 class PaneKeyInputTest {
 
@@ -38,11 +42,13 @@ class PaneKeyInputTest {
     /**
      * A Herdr 0.9.5 server for the input lane. It does not accept a request with a key name in [unknownKeys], and it
      * writes nothing of that request. Like the batch script, it then does not run the next pane input lines of the
-     * batch. When [holdFirstBatch] is true, it holds the first batch until the test completes [release].
+     * batch. When [holdFirstBatch] is true, it holds the first batch until the test completes [release]. It gives no
+     * answer to a request with a method in [silentMethods].
      */
     private class FakeHerdr(
         private val unknownKeys: Set<String> = emptySet(),
         private val holdFirstBatch: Boolean = false,
+        private val silentMethods: Set<String> = emptySet(),
     ) {
         val held = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -50,7 +56,7 @@ class PaneKeyInputTest {
         private val notAccepted = mutableListOf<InputRequest>()
         private var batches = 0
 
-        /** The input that the pane got. A named key shows as `<name>`. */
+        /** The input that the pane got. A named key shows as `<name>`, and a paste as `(paste:text)`. */
         val paneInput: String
             get() = synchronized(this) { written.toString() }
 
@@ -75,6 +81,8 @@ class PaneKeyInputTest {
                 val id = requestId(cmd.ndjsonLine)
                 val request = inputRequest(cmd.ndjsonLine)
                 when {
+                    request.method in silentMethods -> Unit
+
                     request.method == "pane.read" -> appendLine(
                         """{"id":"$id","result":{"type":"pane_read","read":{"pane_id":"w1:p1","text":"$ "}}}""",
                     )
@@ -87,7 +95,11 @@ class PaneKeyInputTest {
                     }
 
                     else -> {
-                        written.append(request.text)
+                        if (request.method == "pane.send_input") {
+                            written.append("(paste:").append(request.text).append(')')
+                        } else {
+                            written.append(request.text)
+                        }
                         request.keys.forEach { written.append('<').append(it).append('>') }
                         appendLine("""{"id":"$id","result":{"type":"ok"}}""")
                     }
@@ -169,12 +181,108 @@ class PaneKeyInputTest {
         )
         assertEquals(
             listOf(
-                InputRequest("pane.send_input", text = "a", keys = listOf("Up")),
+                InputRequest("pane.send_text", text = "a"),
+                InputRequest("pane.send_keys", keys = listOf("Up")),
                 InputRequest("pane.send_text", text = "$ESC[Hb"),
             ),
             lines.map { inputRequest(it.ndjsonLine) },
         )
         assertTrue(lines.all { it.paneInput })
+    }
+
+    @Test
+    fun typedTextGoesToPaneSendTextAndNeverToAPaste() {
+        // In vim, typed "dd" and then Up must arrive as keys. As a bracketed paste, vim puts "dd" in the text.
+        val lines = client(FakeHerdr()).buildCoalescedInputCommands(
+            listOf(text("ls"), keyInput(ClientKeyCode.Enter), text("dd"), keyInput(ClientKeyCode.Up)),
+        )
+        assertEquals(
+            listOf(
+                InputRequest("pane.send_text", text = "ls"),
+                InputRequest("pane.send_keys", keys = listOf("Enter")),
+                InputRequest("pane.send_text", text = "dd"),
+                InputRequest("pane.send_keys", keys = listOf("Up")),
+            ),
+            lines.map { inputRequest(it.ndjsonLine) },
+        )
+    }
+
+    @Test
+    fun aPasteGoesToPaneSendInputWithNoKeys() {
+        val lines = client(FakeHerdr()).buildCoalescedInputCommands(
+            listOf(text("a"), paste("one\n"), paste("two"), keyInput(ClientKeyCode.Enter)),
+        )
+        assertEquals(
+            listOf(
+                InputRequest("pane.send_text", text = "a"),
+                InputRequest("pane.send_input", text = "one\ntwo"),
+                InputRequest("pane.send_keys", keys = listOf("Enter")),
+            ),
+            lines.map { inputRequest(it.ndjsonLine) },
+        )
+    }
+
+    @Test
+    fun aLongTextGoesInLinesBelowTheHerdrLimit() {
+        // Each part of this text has a JSON escape or a two-char code point: 1,200,000 chars give about 2.2 MB of JSON.
+        val long = buildString { repeat(200_000) { append("a\t\"\\\uD83D\uDE00") } }
+        for ((input, method) in listOf(text(long) to "pane.send_text", paste(long) to "pane.send_input")) {
+            val lines = client(FakeHerdr()).buildCoalescedInputCommands(listOf(input))
+
+            assertTrue(lines.size > 1, method)
+            lines.forEach { line ->
+                assertTrue(line.ndjsonLine.encodeToByteArray().size < RealHerdrSshClient.MAX_HERDR_REQUEST_BYTES)
+                val request = inputRequest(line.ndjsonLine)
+                assertEquals(method, request.method)
+                // A split never cuts a code point.
+                assertFalse(request.text.first().isLowSurrogate())
+                assertFalse(request.text.last().isHighSurrogate())
+            }
+            assertEquals(long, lines.joinToString("") { inputRequest(it.ndjsonLine).text })
+        }
+    }
+
+    @Test
+    fun theBytesOfOneKeyNeverGoInTwoLines() {
+        val filler = "a".repeat(RealHerdrSshClient.MAX_INPUT_JSON_BYTES - 1)
+        val lines = client(FakeHerdr()).buildCoalescedInputCommands(listOf(text(filler), keyInput(ClientKeyCode.Home)))
+        assertEquals(listOf(filler, "$ESC[H"), lines.map { inputRequest(it.ndjsonLine).text })
+    }
+
+    @Test
+    fun anEndpointRequestOverTheHerdrLimitIsNotSent() = runBlocking {
+        var batches = 0
+        val debugLog = SshDebugLog()
+        val client = RealHerdrSshClient(
+            sshDebugLog = debugLog,
+            endpointSnapshotBus = EndpointSnapshotBus(),
+            paneSurfaceBus = PaneSurfaceBus(),
+            semanticNotificationBus = SemanticNotificationBus(),
+            knownHostsStore = KnownHostsStore(InMemoryStoreIOProvider()),
+            secretStore = InMemorySecretStore(),
+            remoteBatchExecutor = { _, _, _, _ ->
+                batches++
+                ""
+            },
+        )
+        val prompt = "x".repeat(RealHerdrSshClient.MAX_HERDR_REQUEST_BYTES)
+
+        val request = HerdrRpcBuilder.paneSendInput(paneId = PANE, text = prompt)
+
+        assertNull(client.executeEndpointRpc(MACHINE, ROUTE, request))
+        assertEquals(0, batches)
+        assertTrue(debugLog.entries.value.any { it.isError && it.message.contains("did not send it") })
+    }
+
+    @Test
+    fun aPaneInputLineWithNoAnswerIsAFailureInTheDebugLog() = runBlocking {
+        val debugLog = SshDebugLog()
+        val client = client(FakeHerdr(silentMethods = setOf("pane.send_text")), debugLog)
+
+        assertTrue(client.sendPaneInput(MACHINE, ROUTE, PANE, text("a").event))
+
+        awaitRealTime { debugLog.entries.value.any { it.message.contains("gave no answer") } }
+        assertTrue(debugLog.entries.value.any { it.isError && it.message.contains("gave no answer") })
     }
 
     @Test
@@ -318,6 +426,9 @@ class PaneKeyInputTest {
 
         fun text(text: String) =
             RealHerdrSshClient.PendingPaneInput(seq = 0L, paneId = PANE, event = ClientPaneInputEvent.TextCommit(text))
+
+        fun paste(text: String) =
+            RealHerdrSshClient.PendingPaneInput(seq = 0L, paneId = PANE, event = ClientPaneInputEvent.Paste(text))
 
         fun requestId(line: String): String =
             Json.parseToJsonElement(line).jsonObject.getValue("id").jsonPrimitive.content
