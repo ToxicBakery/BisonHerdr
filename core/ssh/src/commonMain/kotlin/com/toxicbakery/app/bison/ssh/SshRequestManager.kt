@@ -45,10 +45,15 @@ sealed interface SshRequest {
 
     data class TriggerNetworkRoam(val machineId: String? = null) : SshRequest
 
+    /**
+     * A touch prompt of a security key for [machineId]. [bastionHostPort] is the `host:port` of the ProxyJump bastion
+     * when the touch is for the bastion login, or null.
+     */
     data class PromptHardwareKeyTouch(
         val machineId: String,
         val keyType: String,
         val promptMessage: String,
+        val bastionHostPort: String? = null,
     ) : SshRequest
 }
 

@@ -4,6 +4,8 @@ import com.jcraft.jsch.JSch
 import com.toxicbakery.app.bison.model.HardwareKeyTransport
 import com.toxicbakery.app.bison.model.HardwareKeyType
 import com.toxicbakery.app.bison.model.HostMachine
+import com.toxicbakery.app.bison.model.KnownHost
+import com.toxicbakery.app.bison.model.ProxyJumpConfig
 import com.toxicbakery.app.bison.model.SshAuthMethod
 import com.toxicbakery.app.bison.store.InMemoryStoreIOProvider
 import com.toxicbakery.app.bison.store.KnownHostsStore
@@ -76,6 +78,35 @@ class HardwareKeyLoginTest {
     @Test
     fun anEnrolledP256KeyLogsInAndRunsACommand() = runBlocking<Unit> {
         loginWithAnEnrolledKey(HardwareKeyType.SkEcdsaSha2Nistp256)
+    }
+
+    @Test
+    fun aProxyJumpLoginTellsTheBastionForTheFirstTouch() = runBlocking<Unit> {
+        TestSshServer(allowTcpForwarding = true, name = "bastion").start().use { bastion ->
+            knownHostsStore.put(bastion.knownHost())
+            startHost()
+            val enrolled = signer.enroll("jump", HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+            val line = SecurityKeyPublicKeys.authorizedKeyLine(enrolled)
+            server.authorizeKey(line)
+            bastion.authorizeKey(line)
+            val machine = machine("jump", enrolled).copy(
+                proxyJump = ProxyJumpConfig(
+                    bastionHost = TestSshServer.HOST,
+                    bastionPort = bastion.port,
+                    bastionUser = TestSshServer.KEY_USER,
+                ),
+            ).also { machines += it }
+
+            val result = backend.authenticate(machine, ProxyJumpTunnel().resolveRoute(machine))
+
+            assertEquals(SshAuthResult.Success, result, debugLogDump())
+            // Each session has its own identity: the first touch is for the bastion, the second for the machine.
+            assertEquals(
+                listOf(KnownHost.formatHostPort(TestSshServer.HOST, bastion.port), null),
+                checkingSigner.bastionHostPorts.toList(),
+            )
+            backend.disconnect(machine.id)
+        }
     }
 
     @Test
@@ -183,13 +214,18 @@ class HardwareKeyLoginTest {
     private class CheckingSigner(private val delegate: HardwareKeySigner) : HardwareKeySigner by delegate {
         val errors: MutableList<AssertionError> = CopyOnWriteArrayList()
 
+        /** The bastion `host:port` of each sign call, in order. Null is a sign call for the machine. */
+        val bastionHostPorts: MutableList<String?> = CopyOnWriteArrayList()
+
         override suspend fun sign(
             machineId: String,
             key: SshAuthMethod.HardwareSecurityKey,
             data: ByteArray,
             cancelMark: Long?,
+            bastionHostPort: String?,
         ): ByteArray {
-            val blob = delegate.sign(machineId, key, data, cancelMark)
+            bastionHostPorts += bastionHostPort
+            val blob = delegate.sign(machineId, key, data, cancelMark, bastionHostPort)
             try {
                 OpenSshSkSignatureCheck.check(key, data, blob)
             } catch (error: AssertionError) {

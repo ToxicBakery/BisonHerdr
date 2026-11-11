@@ -202,6 +202,8 @@ class SecurityKeyWireFormatTest {
             "extension data" to authenticatorData("ssh:", flags = ED_AND_UP, counter = 1) + byteArrayOf(0xa0.toByte()),
             "the ED flag with no data" to authenticatorData("ssh:", flags = ED_AND_UP, counter = 1),
             "no user presence" to authenticatorData("ssh:", flags = 0x04, counter = 1),
+            // Extra bytes with no ED flag: the length check must refuse them.
+            "extra bytes with no ED flag" to authenticatorData("ssh:", flags = 0x01, counter = 1) + byteArrayOf(0x00),
         )
         for ((name, data) in cases) {
             val error = assertFailsWith<HardwareKeyException>(name) {

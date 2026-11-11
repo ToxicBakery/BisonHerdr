@@ -60,6 +60,9 @@ class SshStateManager {
      */
     val userAuthCancelCounts: StateFlow<UserAuthCancelCounts> = _userAuthCancelCounts.asStateFlow()
 
+    /** The cancel marks of the connect requests that wait for their login. See [markConnectRequest]. */
+    private val _connectCancelMarks = MutableStateFlow<Map<String, Long>>(emptyMap())
+
     private val _hostKeyPrompts = MutableStateFlow<Map<String, HostKeyPrompt>>(emptyMap())
 
     /** The open host key decisions, by machine id. See [HostKeyPrompt]. */
@@ -275,11 +278,12 @@ class SshStateManager {
      * [requestKeyboardInteractive] then ends at once. A disconnect calls it before its request goes into a queue,
      * because the connect that waits for the prompt can hold that queue.
      *
-     * It also removes the touch prompt of [machineId] and adds one to the count of [machineId] in
-     * [userAuthCancelCounts], so that the [HardwareKeySigner] call of the connect stops, also when it did not start yet
-     * or waits for its turn.
+     * It also adds one to the count of [machineId] in [userAuthCancelCounts], and then removes the touch prompt of
+     * [machineId]. Thus the [HardwareKeySigner] call of the connect stops, also when it did not start yet or waits for
+     * its turn. The count changes first, so that a call that puts its prompt at the same time also sees the cancel.
      */
     fun cancelUserAuth(machineId: String) {
+        _userAuthCancelCounts.update { counts -> counts.plusMachine(machineId) }
         _userAuthPrompts.value
             .filter { it.machineId == machineId }
             .forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
@@ -287,7 +291,28 @@ class SshStateManager {
             .filter { it.machineId == machineId }
             .forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
         _hardwareKeyTouchPrompt.update { current -> if (current?.machineId == machineId) null else current }
-        _userAuthCancelCounts.update { counts -> counts.plusMachine(machineId) }
+    }
+
+    /**
+     * Keeps the count of [machineId] in [userAuthCancelCounts] now as the cancel mark of its next login. The app calls
+     * it when a connect request arrives, before the request goes into a queue. The connect can wait in that queue
+     * behind the login of a different machine. A cancel during that wait then also stops the login.
+     */
+    fun markConnectRequest(machineId: String) {
+        _connectCancelMarks.update { marks -> marks + (machineId to _userAuthCancelCounts.value.of(machineId)) }
+    }
+
+    /**
+     * Returns the cancel mark for a new login of [machineId], and removes the mark of [markConnectRequest]. Without
+     * such a mark, for example for a reconnect, it returns the count of [machineId] in [userAuthCancelCounts] now.
+     */
+    fun takeLoginCancelMark(machineId: String): Long {
+        var mark: Long? = null
+        _connectCancelMarks.update { marks ->
+            mark = marks[machineId]
+            marks - machineId
+        }
+        return mark ?: _userAuthCancelCounts.value.of(machineId)
     }
 
     /**
@@ -295,10 +320,10 @@ class SshStateManager {
      * prompt. It also adds one to [UserAuthCancelCounts.all], so that each [HardwareKeySigner] call stops.
      */
     fun cancelAllUserAuth() {
+        _userAuthCancelCounts.update { counts -> counts.copy(all = counts.all + 1) }
         _userAuthPrompts.value.forEach { answerUserAuth(it, UserAuthOutcome.Cancelled) }
         _keyboardInteractivePrompts.value.forEach { answerKeyboardInteractive(it, KeyboardInteractiveOutcome.Cancelled) }
         _hardwareKeyTouchPrompt.value = null
-        _userAuthCancelCounts.update { counts -> counts.copy(all = counts.all + 1) }
     }
 
     /** Returns the result of [show], or [UserAuthOutcome.Failed] when [show] throws an error. */

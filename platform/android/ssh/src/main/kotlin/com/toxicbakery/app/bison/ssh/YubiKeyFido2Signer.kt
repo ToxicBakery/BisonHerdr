@@ -23,7 +23,9 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
@@ -44,12 +46,12 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Calls run one at a time. A login takes a cancel mark at its start ([cancelMark]). A cancel of its machine after the
  * mark ([SshStateManager.cancelUserAuth], for example a disconnect) stops the call before its turn, during the wait for
- * its turn, and before the prompt. A call needs a visible activity ([SecurityKeyHub.hasHost]). It puts a
- * [SshRequest.PromptHardwareKeyTouch] in [SshStateManager], and waits for a key from [SecurityKeyHub] for
+ * its turn, before the prompt, and while the prompt shows. A call needs a visible activity ([SecurityKeyHub.hasHost]).
+ * It puts a [SshRequest.PromptHardwareKeyTouch] in [SshStateManager], and waits for a key from [SecurityKeyHub] for
  * [keyWaitTimeout] at most. When no activity is visible any more, the wait stops with
  * [HardwareKeyException.Reason.NoUi]. The request on the key, with the touch, has the time limit [operationTimeout].
- * When the user closes the touch sheet, the call cancels the request on the key and stops with
- * [HardwareKeyException.Reason.Cancelled].
+ * With the default limits, a call takes [LOGIN_TIME_LIMIT] at most. When the user closes the touch sheet, the call
+ * cancels the request on the key and stops with [HardwareKeyException.Reason.Cancelled].
  */
 class YubiKeyFido2Signer(
     private val hub: SecurityKeyHub,
@@ -63,7 +65,22 @@ class YubiKeyFido2Signer(
 
     private val operationLock = Mutex()
 
-    override fun cancelMark(machineId: String): Long = sshStateManager.userAuthCancelCounts.value.of(machineId)
+    /** A test seam: the call runs it at each [Stage], so that a test can put a cancel at that point. */
+    internal var stageHook: (Stage) -> Unit = {}
+
+    /** The points of a call where [stageHook] runs. */
+    internal enum class Stage {
+        /** The call has its turn and did not check the cancel mark yet. */
+        LockTaken,
+
+        /** The call checked the cancel mark and did not put its prompt yet. */
+        BeforePrompt,
+    }
+
+    override fun cancelMark(machineId: String): Long = sshStateManager.takeLoginCancelMark(machineId)
+
+    /** Returns the count of [machineId] in [SshStateManager.userAuthCancelCounts] now. */
+    private fun currentMark(machineId: String): Long = sshStateManager.userAuthCancelCounts.value.of(machineId)
 
     override suspend fun enroll(
         machineId: String,
@@ -71,7 +88,7 @@ class YubiKeyFido2Signer(
         transport: HardwareKeyTransport,
         applicationId: String,
     ): SshAuthMethod.HardwareSecurityKey {
-        val mark = cancelMark(machineId)
+        val mark = currentMark(machineId)
         val algorithm = SecurityKeyWireFormat.coseAlgorithmOf(keyType)
         val application = checkedApplication(applicationId)
         sshDebugLog.record(
@@ -79,7 +96,7 @@ class YubiKeyFido2Signer(
             tag = LOG_TAG,
             message = "Enroll a ${keyType.opensshKeyType} credential for $application",
         )
-        val credential = runWithKey(machineId, mark, keyType, transport, ENROLL_PROMPT) { session, state ->
+        val credential = runWithKey(machineId, mark, keyType, transport, ENROLL_PROMPT, null) { session, state ->
             // The server does not check the attestation, so the challenge is only random data.
             val challenge = ByteArray(CHALLENGE_LENGTH).also(random::nextBytes)
             session.makeCredential(
@@ -124,15 +141,23 @@ class YubiKeyFido2Signer(
         key: SshAuthMethod.HardwareSecurityKey,
         data: ByteArray,
         cancelMark: Long?,
+        bastionHostPort: String?,
     ): ByteArray {
-        val mark = cancelMark ?: cancelMark(machineId)
+        val mark = cancelMark ?: currentMark(machineId)
         if (!key.keyType.isFido2) {
             throw HardwareKeyException(HardwareKeyException.Reason.NotSupported, key.keyType.opensshKeyType)
         }
         if (!key.isEnrolled) throw HardwareKeyException(HardwareKeyException.Reason.NotEnrolled)
         val credentialId = Base64.decode(requireNotNull(key.credentialId))
         val application = checkedApplication(key.applicationId)
-        val assertion = runWithKey(machineId, mark, key.keyType, key.transport, SIGN_PROMPT) { session, state ->
+        val assertion = runWithKey(
+            machineId,
+            mark,
+            key.keyType,
+            key.transport,
+            SIGN_PROMPT,
+            bastionHostPort,
+        ) { session, state ->
             session.getAssertions(
                 application,
                 SecurityKeyWireFormat.sha256(data),
@@ -161,7 +186,8 @@ class YubiKeyFido2Signer(
     /**
      * Shows the touch prompt, waits for a key, and runs [operation] on a CTAP2 session of the key. Converts each error
      * to a [HardwareKeyException]. [mark] is the cancel mark of [machineId] at the start of the login. A cancel of the
-     * machine after the mark stops the call before the wait for its turn, during that wait, and before the prompt.
+     * machine after the mark stops the call before the wait for its turn, during that wait, before the prompt, and
+     * while the prompt shows. [bastionHostPort] goes into the prompt.
      */
     private suspend fun <T> runWithKey(
         machineId: String,
@@ -169,6 +195,7 @@ class YubiKeyFido2Signer(
         keyType: HardwareKeyType,
         transport: HardwareKeyTransport,
         message: String,
+        bastionHostPort: String?,
         operation: (Ctap2Session, CommandState) -> T,
     ): T {
         val owner = Any()
@@ -179,7 +206,8 @@ class YubiKeyFido2Signer(
             throw recorded(machineId, error)
         }
         try {
-            return runWithLock(machineId, mark, keyType, transport, message, operation)
+            stageHook(Stage.LockTaken)
+            return runWithLock(machineId, mark, keyType, transport, message, bastionHostPort, operation)
         } finally {
             operationLock.unlock(owner)
         }
@@ -187,7 +215,7 @@ class YubiKeyFido2Signer(
 
     /** Throws [HardwareKeyException.Reason.Cancelled] when [machineId] got a cancel after [mark]. */
     private fun checkNotCancelled(machineId: String, mark: Long) {
-        if (cancelMark(machineId) != mark) throw HardwareKeyException(HardwareKeyException.Reason.Cancelled)
+        if (currentMark(machineId) != mark) throw HardwareKeyException(HardwareKeyException.Reason.Cancelled)
     }
 
     /**
@@ -219,6 +247,7 @@ class YubiKeyFido2Signer(
         keyType: HardwareKeyType,
         transport: HardwareKeyTransport,
         message: String,
+        bastionHostPort: String?,
         operation: (Ctap2Session, CommandState) -> T,
     ): T {
         try {
@@ -231,16 +260,27 @@ class YubiKeyFido2Signer(
             machineId = machineId,
             keyType = keyType.opensshKeyType,
             promptMessage = message,
+            bastionHostPort = bastionHostPort,
         )
         val commandState = CommandState()
+        stageHook(Stage.BeforePrompt)
         sshStateManager.setHardwareKeyTouchPrompt(prompt)
         return try {
             hub.withDiscovery {
                 coroutineScope {
-                    // The user closed the touch sheet, or a disconnect removed the prompt.
-                    val closeWatch = launch {
+                    // The user closed the touch sheet, or a cancel of the machine came after the mark. A cancel can
+                    // come after the last check and before the prompt, so the watch also reads the cancel counts. The
+                    // watch starts at once, so that such a cancel stops the call before the request on the key.
+                    val closeWatch = launch(start = CoroutineStart.UNDISPATCHED) {
                         try {
-                            sshStateManager.hardwareKeyTouchPrompt.first { it !== prompt }
+                            val open = sshStateManager.hardwareKeyTouchPrompt.value === prompt &&
+                                currentMark(machineId) == mark
+                            if (open) {
+                                merge(
+                                    sshStateManager.hardwareKeyTouchPrompt.filter { it !== prompt },
+                                    sshStateManager.userAuthCancelCounts.filter { it.of(machineId) != mark },
+                                ).first()
+                            }
                         } finally {
                             // Also after a cancel of the caller: stop the request on the key.
                             commandState.cancel()
@@ -338,8 +378,18 @@ class YubiKeyFido2Signer(
         /** The maximum time that a call waits for a key over USB or NFC. */
         val KEY_WAIT_TIMEOUT: Duration = 60.seconds
 
-        /** The maximum time of the request on the key, after the call found the key. It includes the touch. */
-        val OPERATION_TIMEOUT: Duration = 60.seconds
+        /**
+         * The maximum time of the request on the key, after the call found the key. It includes the touch. A YubiKey
+         * stops its own wait for the touch after about 30 s.
+         */
+        val OPERATION_TIMEOUT: Duration = 40.seconds
+
+        /**
+         * The maximum time of a call with the default limits: [KEY_WAIT_TIMEOUT] and [OPERATION_TIMEOUT]. It is less
+         * than 120 s, the default `LoginGraceTime` of an OpenSSH server, so the server does not close the connection
+         * during the wait.
+         */
+        val LOGIN_TIME_LIMIT: Duration = KEY_WAIT_TIMEOUT + OPERATION_TIMEOUT
 
         /** The debug log tag of the security key calls. */
         const val LOG_TAG: String = "FIDO2"

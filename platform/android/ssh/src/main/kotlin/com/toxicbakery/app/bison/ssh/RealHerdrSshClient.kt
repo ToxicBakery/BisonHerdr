@@ -1,6 +1,7 @@
 package com.toxicbakery.app.bison.ssh
 
 import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.Identity
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
@@ -130,7 +131,8 @@ import kotlinx.serialization.json.put
  *
  * A machine with a FIDO2 security key logs in with a [HardwareKeyJschIdentity] over [hardwareKeySigner]. The user
  * touches the key for each new session. A ProxyJump machine thus needs two touches: one for the bastion and one for
- * the target. When [hardwareKeySigner] is null, the client refuses such a machine before the network connection.
+ * the target. Each session has its own identity, so that the touch sheet tells when the touch is for the bastion.
+ * When [hardwareKeySigner] is null, the client refuses such a machine before the network connection.
  */
 internal class RealHerdrSshClient(
     private val sshDebugLog: SshDebugLog,
@@ -2202,6 +2204,7 @@ internal class RealHerdrSshClient(
             knownHostsStore.awaitLoaded()
             JschAndroidCrypto.installGlobalDefaults()
             val jsch = JSch()
+            var securityKeyIdentity: ((bastionHostPort: String?) -> Identity)? = null
             val preferredAuths = when (val auth = machine.authMethod) {
                 is SshAuthMethod.Password -> "password,keyboard-interactive,publickey"
                 is SshAuthMethod.KeystoreKey -> {
@@ -2220,15 +2223,19 @@ internal class RealHerdrSshClient(
                     val signer = hardwareKeySigner
                         ?: throw UnsupportedOperationException(SshTransportManager.HARDWARE_KEY_NOT_SUPPORTED)
                     if (!auth.isEnrolled) throw HardwareKeyException(HardwareKeyException.Reason.NotEnrolled)
-                    jsch.addIdentity(
+                    // One mark for the login. newSession gives each session its own identity with this mark.
+                    val cancelMark = signer.cancelMark(machine.id)
+                    val callerJob = currentCoroutineContext()[Job]
+                    securityKeyIdentity = { bastionHostPort ->
                         HardwareKeyJschIdentity(
                             machineId = machine.id,
                             key = auth,
                             signer = signer,
-                            callerJob = currentCoroutineContext()[Job],
-                        ),
-                        null,
-                    )
+                            cancelMark = cancelMark,
+                            bastionHostPort = bastionHostPort,
+                            callerJob = callerJob,
+                        )
+                    }
                     "publickey,password,keyboard-interactive"
                 }
             }
@@ -2242,6 +2249,7 @@ internal class RealHerdrSshClient(
                     password = password,
                     preferredAuths = preferredAuths,
                     callerJob = currentCoroutineContext()[Job],
+                    securityKeyIdentity = securityKeyIdentity,
                 )
                 // The bastion uses the same password or key as the machine.
                 val bastion = if (route.viaBastion) connectBastion(logins, route) else null
@@ -2297,6 +2305,8 @@ internal class RealHerdrSshClient(
     /**
      * The values that the bastion session and the target session of one login share. [password] is null for a key
      * machine. [callerJob] is the job of the login, so that a cancel stops the wait for the answers of the user.
+     * [securityKeyIdentity] makes the identity of a security key session: it gets the `host:port` of the bastion for
+     * the bastion session, or null for the target session. It is null for the other login methods.
      */
     private class SessionLogins(
         val jsch: JSch,
@@ -2304,6 +2314,7 @@ internal class RealHerdrSshClient(
         val password: ByteArray?,
         val preferredAuths: String,
         val callerJob: Job?,
+        val securityKeyIdentity: ((bastionHostPort: String?) -> Identity)? = null,
     ) {
         /**
          * True after a `keyboard-interactive` question of the bastion or the target went to the user. Then the login
@@ -2315,13 +2326,15 @@ internal class RealHerdrSshClient(
 
     /**
      * Returns a new session as [username] to [host] and [port], with the settings that the bastion session and the
-     * target session use. The session gets a [KeyboardInteractiveUserInfo] for the `host:port` of the session.
+     * target session use. The session gets a [KeyboardInteractiveUserInfo] for the `host:port` of the session. For a
+     * security key login, the session gets its own identity. [isBastion] is true for the bastion session.
      */
     private fun newSession(
         logins: SessionLogins,
         username: String,
         host: String,
         port: Int,
+        isBastion: Boolean = false,
     ): Session {
         val session = logins.jsch.getSession(username, host, port)
         logins.password?.let(session::setPassword)
@@ -2347,8 +2360,10 @@ internal class RealHerdrSshClient(
             session.setServerAliveCountMax(SERVER_ALIVE_COUNT_MAX)
         }
         JschAndroidCrypto.configureSession(session)
-        if (logins.machine.authMethod is SshAuthMethod.HardwareSecurityKey) {
+        logins.securityKeyIdentity?.let { identityFor ->
             JschAndroidCrypto.enableSecurityKeyAlgorithms(session)
+            val bastionHostPort = if (isBastion) KnownHost.formatHostPort(host, port) else null
+            session.setIdentityRepository(SingleIdentityRepository(identityFor(bastionHostPort)))
         }
         return session
     }
@@ -2369,6 +2384,7 @@ internal class RealHerdrSshClient(
             username = route.entryUsername,
             host = route.entryHost,
             port = route.entryPort,
+            isBastion = true,
         )
         bastion.setSocketFactory(socketFactory)
         try {

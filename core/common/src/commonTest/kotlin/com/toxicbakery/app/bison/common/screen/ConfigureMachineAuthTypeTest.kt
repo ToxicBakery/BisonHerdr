@@ -367,6 +367,7 @@ class ConfigureMachineAuthTypeTest {
             key: SshAuthMethod.HardwareSecurityKey,
             data: ByteArray,
             cancelMark: Long?,
+            bastionHostPort: String?,
         ): ByteArray = error("The view model does not sign")
     }
 

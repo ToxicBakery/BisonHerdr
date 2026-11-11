@@ -24,13 +24,16 @@ import androidx.compose.ui.window.Dialog
 import com.toxicbakery.app.bison.common.theme.LocalBisonPalette
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.common_cancel
+import com.toxicbakery.app.bison.resources.hardware_key_bastion_label
 import com.toxicbakery.app.bison.resources.hardware_key_key_type_label
+import com.toxicbakery.app.bison.resources.hardware_key_machine_label
 import com.toxicbakery.app.bison.resources.hardware_key_sheet_tap_nfc
 import com.toxicbakery.app.bison.resources.hardware_key_sheet_title
 import com.toxicbakery.app.bison.resources.hardware_key_sheet_touch_usb
 import com.toxicbakery.app.bison.ssh.HardwareKeySigner
 import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshStateManager
+import com.toxicbakery.app.bison.store.MachineStore
 import org.jetbrains.compose.resources.stringResource
 import org.kodein.di.compose.rememberInstance
 
@@ -40,26 +43,33 @@ import org.kodein.di.compose.rememberInstance
  * screen, and at a login on the connecting screen or during a reconnect. The cancel button removes the prompt, and
  * the call then stops.
  *
+ * The sheet shows the name of the machine from the [MachineStore]. A new machine that is not saved yet has no name.
+ *
  * Only a build with FIDO2 security keys puts a prompt (issue #23). In all other builds, this host shows nothing.
  */
 @Composable
 internal fun HardwareKeyTouchPromptHost() {
     val sshStateManager: SshStateManager by rememberInstance()
+    val machineStore: MachineStore by rememberInstance()
     val prompt by sshStateManager.hardwareKeyTouchPrompt.collectAsState()
+    val machines by machineStore.knownMachines.collectAsState()
     val touchPrompt = prompt ?: return
     HardwareSecurityKeyPromptSheet(
         prompt = touchPrompt,
+        machineName = machines.firstOrNull { it.id == touchPrompt.machineId }?.name,
         onCancel = { sshStateManager.dismissHardwareKeyTouchPrompt(touchPrompt) },
     )
 }
 
 /**
  * Asks the user to touch the security key or to hold it against the device. [onCancel] stops the request. A prompt
- * with no message shows the default USB and NFC texts.
+ * with no message shows the default USB and NFC texts. The sheet shows [machineName] when it is not null, and the
+ * ProxyJump bastion when the touch is for the bastion login ([SshRequest.PromptHardwareKeyTouch.bastionHostPort]).
  */
 @Composable
 internal fun HardwareSecurityKeyPromptSheet(
     prompt: SshRequest.PromptHardwareKeyTouch,
+    machineName: String?,
     onCancel: () -> Unit,
 ) {
     val palette = LocalBisonPalette.current
@@ -86,11 +96,27 @@ internal fun HardwareSecurityKeyPromptSheet(
                     color = palette.accent,
                     fontWeight = FontWeight.Bold,
                 )
+                if (!machineName.isNullOrBlank()) {
+                    Text(
+                        text = stringResource(Res.string.hardware_key_machine_label, machineName),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = palette.text,
+                        modifier = Modifier.testTag("hardwareKeyPromptMachine"),
+                    )
+                }
                 Text(
                     text = stringResource(Res.string.hardware_key_key_type_label, prompt.keyType),
                     style = MaterialTheme.typography.labelLarge,
                     color = palette.mauve,
                 )
+                prompt.bastionHostPort?.let { bastion ->
+                    Text(
+                        text = stringResource(Res.string.hardware_key_bastion_label, bastion),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.accent,
+                        modifier = Modifier.testTag("hardwareKeyPromptBastion"),
+                    )
+                }
                 if (prompt.promptMessage.isBlank()) {
                     Text(
                         text = stringResource(Res.string.hardware_key_sheet_touch_usb),

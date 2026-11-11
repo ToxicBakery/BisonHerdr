@@ -127,6 +127,84 @@ class YubiKeyFido2SignerTest {
     }
 
     @Test
+    fun aCancelAfterTheLastCheckStopsTheCallBeforeTheTouch() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        // The disconnect comes after the last check of the mark, and before the call puts its prompt.
+        signer.stageHook = { stage ->
+            if (stage == YubiKeyFido2Signer.Stage.BeforePrompt) stateManager.cancelUserAuth(MACHINE_ID)
+        }
+
+        val result = runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1)) }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, result)
+        assertNull(stateManager.hardwareKeyTouchPrompt.value)
+        assertTrue(key.commands.none { it == CTAP_GET_ASSERTION }, "The key got a request: ${key.commands}")
+    }
+
+    @Test
+    fun aCancelAfterTheTurnStopsTheCallBeforeThePrompt() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        runCurrent()
+        val eventsAfterEnroll = discovery.events.toList()
+        // The disconnect comes after the call got its turn, and before the check of the mark before the prompt.
+        signer.stageHook = { stage ->
+            if (stage == YubiKeyFido2Signer.Stage.LockTaken) stateManager.cancelUserAuth(MACHINE_ID)
+        }
+
+        val result = runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1)) }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, result)
+        runCurrent()
+        // The check before the prompt stopped the call, so the call put no prompt and did not start the discovery.
+        assertEquals(eventsAfterEnroll, discovery.events)
+        assertTrue(key.commands.none { it == CTAP_GET_ASSERTION }, "The key got a request: ${key.commands}")
+    }
+
+    @Test
+    fun aDisconnectWhileTheConnectWaitsInTheQueueStopsTheLogin() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        // The connect request arrives, and waits in the queue. The user then disconnects the machine.
+        stateManager.markConnectRequest(MACHINE_ID)
+        stateManager.cancelUserAuth(MACHINE_ID)
+
+        // The login starts after the wait, and takes the mark of the connect request.
+        val loginMark = signer.cancelMark(MACHINE_ID)
+        val result = runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1), loginMark) }
+
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, result)
+        // The mark of the connect request is for one login only. A reconnect takes the count now.
+        signer.sign(MACHINE_ID, enrolled, byteArrayOf(2), signer.cancelMark(MACHINE_ID))
+    }
+
+    @Test
+    fun theTouchPromptTellsWhenTheTouchIsForTheBastion() = runTest {
+        hostWithUsbKey()
+        val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
+        key.touch = FakeSecurityKey.Touch.UntilCancel
+
+        val call = async {
+            runCatching { signer.sign(MACHINE_ID, enrolled, byteArrayOf(1), bastionHostPort = BASTION_HOST_PORT) }
+        }
+        key.waitingForTouch.await()
+
+        assertEquals(BASTION_HOST_PORT, stateManager.hardwareKeyTouchPrompt.value?.bastionHostPort)
+        stateManager.dismissHardwareKeyTouchPrompt()
+        assertHardwareKeyError(HardwareKeyException.Reason.Cancelled, call.await())
+    }
+
+    @Test
+    fun theDefaultTimeLimitsEndBeforeTheLoginGraceTimeOfOpenSsh() {
+        assertEquals(
+            YubiKeyFido2Signer.KEY_WAIT_TIMEOUT + YubiKeyFido2Signer.OPERATION_TIMEOUT,
+            YubiKeyFido2Signer.LOGIN_TIME_LIMIT,
+        )
+        assertTrue(YubiKeyFido2Signer.LOGIN_TIME_LIMIT < OPENSSH_LOGIN_GRACE_TIME)
+    }
+
+    @Test
     fun aCancelBeforeTheCallStopsItWithNoPrompt() = runTest {
         hostWithUsbKey()
         val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
@@ -161,7 +239,14 @@ class YubiKeyFido2SignerTest {
         hostWithUsbKey()
         val enrolled = signer.enroll(MACHINE_ID, HardwareKeyType.SkSshEd25519, HardwareKeyTransport.UsbAndNfc, "ssh:")
         // The client makes the identity before the TCP connection. The user then disconnects.
-        val identity = HardwareKeyJschIdentity(MACHINE_ID, enrolled, signer, callerJob = null)
+        val identity = HardwareKeyJschIdentity(
+            machineId = MACHINE_ID,
+            key = enrolled,
+            signer = signer,
+            cancelMark = signer.cancelMark(MACHINE_ID),
+            bastionHostPort = null,
+            callerJob = null,
+        )
         stateManager.cancelUserAuth(MACHINE_ID)
 
         val error = assertFailsWith<HardwareKeyException> { identity.getSignature(byteArrayOf(1), null) }
@@ -514,6 +599,10 @@ class YubiKeyFido2SignerTest {
         const val MACHINE_ID = "yubikey-box"
         const val OTHER_MACHINE_ID = "second-box"
         const val THIRD_MACHINE_ID = "third-box"
+        const val BASTION_HOST_PORT = "jump.example:2222"
+
+        /** The default `LoginGraceTime` of an OpenSSH server. */
+        val OPENSSH_LOGIN_GRACE_TIME = 120.seconds
         val SHORT_OPERATION_TIMEOUT = 300.milliseconds
         const val SIGNATURE_COUNT = 24
         const val CTAP_GET_ASSERTION = 0x02

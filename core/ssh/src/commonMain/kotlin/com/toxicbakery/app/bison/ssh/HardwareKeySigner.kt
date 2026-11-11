@@ -32,8 +32,9 @@ interface HardwareKeySigner {
     ): SshAuthMethod.HardwareSecurityKey
 
     /**
-     * Returns the cancel mark of [machineId] now: its count in [SshStateManager.userAuthCancelCounts]. A login takes
-     * the mark at its start and gives it to [sign].
+     * Returns the cancel mark for a new login of [machineId] ([SshStateManager.takeLoginCancelMark]). It is the mark of
+     * the connect request when the request arrived, or the count in [SshStateManager.userAuthCancelCounts] now. A login
+     * takes the mark one time at its start and gives it to [sign].
      */
     fun cancelMark(machineId: String): Long
 
@@ -45,12 +46,16 @@ interface HardwareKeySigner {
      * [cancelMark] is the [cancelMark] of [machineId] at the start of the login, or null for the mark at the start of
      * this call. When the user cancelled the login after the mark, for example with a disconnect before JSch asks for
      * the signature, the call stops with [HardwareKeyException.Reason.Cancelled] and shows no prompt.
+     *
+     * [bastionHostPort] is the `host:port` of the ProxyJump bastion when the signature is for the bastion login, or
+     * null for the login to the machine. The touch sheet tells it to the user.
      */
     suspend fun sign(
         machineId: String,
         key: SshAuthMethod.HardwareSecurityKey,
         data: ByteArray,
         cancelMark: Long? = null,
+        bastionHostPort: String? = null,
     ): ByteArray
 }
 
