@@ -9,8 +9,8 @@ import kotlin.test.assertTrue
 /**
  * The full receive path on the first reply of a real `mosh-server` 1.4.0 (wire facts 1 to 8).
  *
- * A black-box test client sent one size state (20x4, user state 1) to `mosh-server new -i 127.0.0.1` and recorded
- * the key of its banner and the first datagram that came back. The server stopped after the test, so the key
+ * A black-box test client sent one size state (20x4, user state 1) to `mosh-server new -i 127.0.0.1`. It recorded
+ * the key of the banner and the first datagram that came back. The server stopped after the test, so the key
  * protects nothing.
  */
 class RecordedServerReplyTest {

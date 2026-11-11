@@ -35,6 +35,16 @@ class FragmentTest {
     }
 
     @Test
+    fun aRangeOutsideTheBytesDoesNotDecode() {
+        val bytes = Fragment(1uL, 0, isFinal = true, content = byteArrayOf(1, 2)).encode()
+        assertNull(Fragment.decode(bytes, offset = -1))
+        assertNull(Fragment.decode(bytes, offset = -1, length = bytes.size))
+        assertNull(Fragment.decode(bytes, offset = 1, length = bytes.size))
+        assertNull(Fragment.decode(bytes, offset = bytes.size + 1))
+        assertNull(Fragment.decode(bytes, offset = 0, length = bytes.size + 1))
+    }
+
+    @Test
     fun aNumberOutsideFifteenBitsIsAnError() {
         assertFailsWith<IllegalArgumentException> { Fragment(1uL, -1, isFinal = false, content = ByteArray(0)) }
         assertFailsWith<IllegalArgumentException> { Fragment(1uL, 0x8000, isFinal = false, content = ByteArray(0)) }

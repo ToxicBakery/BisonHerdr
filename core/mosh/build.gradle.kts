@@ -49,7 +49,18 @@ kotlin {
 }
 
 // The real mosh-server tests skip when mosh-server is absent, and fail when BISON_REQUIRE_MOSH is 1. The variable
-// is an input, so that a run with the value 1 never uses a cached result of a run that skipped.
+// and the path of mosh-server on the PATH are inputs. Thus a run never uses a cached result of a run that skipped
+// for a different reason.
 tasks.named<Test>("jvmTest") {
     inputs.property("bisonRequireMosh", providers.environmentVariable("BISON_REQUIRE_MOSH").orElse(""))
+    inputs.property(
+        "moshServerPath",
+        providers.environmentVariable("PATH").orElse("").map { path ->
+            path.split(File.pathSeparator)
+                .map { directory -> File(directory, "mosh-server") }
+                .firstOrNull { file -> file.isFile && file.canExecute() }
+                ?.absolutePath
+                .orEmpty()
+        },
+    )
 }

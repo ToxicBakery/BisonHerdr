@@ -9,7 +9,7 @@ interface Zlib {
     /**
      * Returns the expanded bytes of [data]. Returns null when [data] is not exactly one complete zlib stream, or
      * when the expanded bytes are more than [maxSize]. The expansion stops at [maxSize], so a small bad stream
-     * cannot fill the memory.
+     * cannot fill the memory. A negative [maxSize] is an error ([IllegalArgumentException]).
      */
     fun decompress(data: ByteArray, maxSize: Int): ByteArray?
 }

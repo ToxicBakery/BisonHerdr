@@ -29,8 +29,8 @@ internal class ProtoException(message: String) : Exception(message)
  * (https://protobuf.dev/programming-guides/encoding/).
  *
  * Call [next] to read each tag. Then read the value with [varint] or [bytes], or [skip] it. The reader skips the
- * fixed 32-bit and 64-bit types. It throws [ProtoException] for a group (wire types 3 and 4), for a bad wire type,
- * and for a value that goes past the end of the data.
+ * fixed 32-bit and 64-bit types. It throws [ProtoException] for a group (wire types 3 and 4) and for a bad wire
+ * type. It also throws [ProtoException] for a value that goes past the end of the data.
  */
 internal class ProtoReader(private val data: ByteArray) {
     private var position = 0

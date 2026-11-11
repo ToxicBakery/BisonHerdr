@@ -8,8 +8,8 @@ package com.toxicbakery.app.bison.mosh.wire
  * the memory small when the peer sends bad fragments:
  * - The assembler does not keep a fragment with a number of [maxFragments] or more.
  * - It removes an ID that has more than [maxStreamSize] bytes of content.
- * - It keeps the parts of the [maxInstructions] newest IDs. The server gives each instruction a higher ID than the
- *   instruction before it, so the newest ID is the highest ID.
+ * - It keeps the parts of the [maxInstructions] newest IDs. The ID of a server instruction is never lower than the
+ *   ID before it, so the newest ID is the highest ID. A second copy with the same ID has no effect on the parts.
  * - It removes an ID with parts that do not agree, for example two final fragments with different numbers.
  *
  * Use one assembler for each session. It is not safe for use by two threads at the same time.

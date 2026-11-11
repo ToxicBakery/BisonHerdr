@@ -3,6 +3,7 @@ package com.toxicbakery.app.bison.mosh.wire
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 
 /** The zlib stream of an instruction and its size limit (wire fact 5). */
@@ -38,6 +39,11 @@ class ZlibTest {
         for (size in 0 until stream.size) assertNull(zlib.decompress(stream.copyOf(size), 100), "size $size")
         assertNull(zlib.decompress(stream + byteArrayOf(0), 100))
         assertNull(zlib.decompress("00112233445566778899".hexToByteArray(), 100))
+    }
+
+    @Test
+    fun aNegativeLimitIsAnError() {
+        assertFailsWith<IllegalArgumentException> { zlib.decompress(zlib.compress(ByteArray(1)), -1) }
     }
 
     private companion object {
