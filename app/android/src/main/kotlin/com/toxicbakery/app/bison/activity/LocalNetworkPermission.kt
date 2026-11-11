@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
@@ -17,8 +18,10 @@ import androidx.compose.runtime.setValue
 import com.toxicbakery.app.bison.resources.Res
 import com.toxicbakery.app.bison.resources.local_network_permission_dismiss
 import com.toxicbakery.app.bison.resources.local_network_permission_rationale_body
+import com.toxicbakery.app.bison.resources.local_network_permission_rationale_body_timed_out
 import com.toxicbakery.app.bison.resources.local_network_permission_rationale_continue
 import com.toxicbakery.app.bison.resources.local_network_permission_settings_body
+import com.toxicbakery.app.bison.resources.local_network_permission_settings_body_timed_out
 import com.toxicbakery.app.bison.resources.local_network_permission_settings_open
 import com.toxicbakery.app.bison.resources.local_network_permission_title
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
@@ -29,6 +32,7 @@ import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.hasLocalNetworkPermission
 import kotlinx.coroutines.CompletableDeferred
+import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.stringResource
 
 /** A dialog of the app about the local network permission. See [LocalNetworkPermissionFlow]. */
@@ -52,27 +56,65 @@ internal enum class LocalNetworkDialog {
  *    [LocalNetworkDialog.Settings], which can open the app settings. A user who closes the first system dialog with
  *    Back also sees this dialog, so its text is true in the two cases.
  *
- * [showDialog] shows a dialog of the app for a host, and returns true when the user selects the main button.
- * [requestPermission] shows the system dialog, and returns true when the app has the permission after it.
+ * The flow reads the permission again before the settings dialog. A different request can get the grant while this
+ * request waits, and then the flow shows no dialog.
+ *
+ * [showDialog] shows a dialog of the app for a host, and returns true when the user selects the main button. Its
+ * `timedOut` tells the reason of the request ([LocalNetworkRequest.timedOut]). [requestPermission] shows the system
+ * dialog, and returns true when the app has the permission after it.
  */
 internal class LocalNetworkPermissionFlow(
     private val isGranted: () -> Boolean,
     private val shouldShowRationale: () -> Boolean,
-    private val showDialog: suspend (dialog: LocalNetworkDialog, hostPort: String) -> Boolean,
+    private val showDialog: suspend (dialog: LocalNetworkDialog, hostPort: String, timedOut: Boolean) -> Boolean,
     private val requestPermission: suspend () -> Boolean,
     private val openAppSettings: () -> Unit,
 ) {
 
-    /** Asks for the permission for a connection to [hostPort], and returns the result. */
-    suspend fun ask(hostPort: String): LocalNetworkOutcome {
+    /** Asks for the permission for a connection to [hostPort] for the reason [timedOut], and returns the result. */
+    suspend fun ask(hostPort: String, timedOut: Boolean = false): LocalNetworkOutcome {
         if (isGranted()) return LocalNetworkOutcome.Granted
         val rationaleBefore = shouldShowRationale()
-        if (rationaleBefore && !showDialog(LocalNetworkDialog.Rationale, hostPort)) return LocalNetworkOutcome.Denied
-        if (requestPermission()) return LocalNetworkOutcome.Granted
-        if (!rationaleBefore && !shouldShowRationale() && showDialog(LocalNetworkDialog.Settings, hostPort)) {
+        if (rationaleBefore && !showDialog(LocalNetworkDialog.Rationale, hostPort, timedOut)) {
+            return LocalNetworkOutcome.Denied
+        }
+        if (requestPermission() || isGranted()) return LocalNetworkOutcome.Granted
+        if (!rationaleBefore && !shouldShowRationale() && showDialog(LocalNetworkDialog.Settings, hostPort, timedOut)) {
             openAppSettings()
         }
         return LocalNetworkOutcome.Denied
+    }
+}
+
+/**
+ * Lets one request of the system dialog run at a time. A second launch while the system dialog is open returns an
+ * empty result at once. Thus a second caller waits for the result of the request that runs. [launch] shows the system
+ * dialog, and the activity result callback calls [onResult].
+ */
+internal class SinglePermissionLaunch(private val launch: () -> Unit) {
+
+    // Only the main thread reads and writes this field.
+    private var inFlight: CompletableDeferred<Boolean>? = null
+
+    /** Shows the system dialog, or waits for the dialog that is open. Returns true when the user granted it. */
+    suspend fun await(): Boolean {
+        inFlight?.let { return it.await() }
+        val result = CompletableDeferred<Boolean>()
+        inFlight = result
+        try {
+            launch()
+        } catch (error: RuntimeException) {
+            inFlight = null
+            throw error
+        }
+        return result.await()
+    }
+
+    /** Gives [granted] to each caller of [await]. The next [await] shows the system dialog again. */
+    fun onResult(granted: Boolean) {
+        val result = inFlight
+        inFlight = null
+        result?.complete(granted)
     }
 }
 
@@ -105,18 +147,25 @@ internal class LocalNetworkPermissionRequester(
     private val onGranted: () -> Unit,
 ) {
 
-    /** A dialog of the app that waits for the user. */
-    class OpenDialog(val dialog: LocalNetworkDialog, val hostPort: String) {
+    /** A dialog of the app that waits for the user. [timedOut] is the reason of the request. */
+    class OpenDialog(val dialog: LocalNetworkDialog, val hostPort: String, val timedOut: Boolean) {
         /** True when the user selects the main button. Only the first answer has an effect. */
         val answer = CompletableDeferred<Boolean>()
     }
 
-    // Only the main thread reads and writes this field.
-    private var permissionResult: CompletableDeferred<Boolean>? = null
+    private val launcher: ActivityResultLauncher<String> =
+        activity.registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            permissionLaunch.onResult(granted)
+            if (granted) onGranted()
+        }
 
-    private val launcher = activity.registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        permissionResult?.complete(granted)
-        if (granted) onGranted()
+    private val permissionLaunch: SinglePermissionLaunch = SinglePermissionLaunch {
+        // awaitPermission calls it only on API 37 and later.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN) {
+            launcher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        } else {
+            error("The local network permission does not exist before API 37")
+        }
     }
 
     /** The dialog that the activity shows now, or null. */
@@ -135,8 +184,8 @@ internal class LocalNetworkPermissionRequester(
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN &&
             activity.shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_LOCAL_NETWORK)
 
-    private suspend fun awaitDialog(dialog: LocalNetworkDialog, hostPort: String): Boolean {
-        val open = OpenDialog(dialog, hostPort)
+    private suspend fun awaitDialog(dialog: LocalNetworkDialog, hostPort: String, timedOut: Boolean): Boolean {
+        val open = OpenDialog(dialog, hostPort, timedOut)
         openDialog = open
         try {
             return open.answer.await()
@@ -148,14 +197,7 @@ internal class LocalNetworkPermissionRequester(
     private suspend fun awaitPermission(): Boolean {
         // Before API 37, the permission does not exist, and Android stops no connection.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN) return true
-        val result = CompletableDeferred<Boolean>()
-        permissionResult = result
-        try {
-            launcher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
-            return result.await()
-        } finally {
-            if (permissionResult === result) permissionResult = null
-        }
+        return permissionLaunch.await()
     }
 
     private fun openAppSettings() {
@@ -164,15 +206,35 @@ internal class LocalNetworkPermissionRequester(
     }
 }
 
-/** Shows [open] with the texts of its [LocalNetworkPermissionRequester.OpenDialog.dialog]. */
+/**
+ * Returns the body text and the text of the main button of [dialog]. When [timedOut] is true, the app does not know
+ * that the host is on the local network. Then the body tells only that Android can stop the connection.
+ */
+internal fun localNetworkDialogTexts(
+    dialog: LocalNetworkDialog,
+    timedOut: Boolean,
+): Pair<StringResource, StringResource> =
+    when (dialog) {
+        LocalNetworkDialog.Rationale -> if (timedOut) {
+            Res.string.local_network_permission_rationale_body_timed_out
+        } else {
+            Res.string.local_network_permission_rationale_body
+        } to Res.string.local_network_permission_rationale_continue
+        LocalNetworkDialog.Settings -> if (timedOut) {
+            Res.string.local_network_permission_settings_body_timed_out
+        } else {
+            Res.string.local_network_permission_settings_body
+        } to Res.string.local_network_permission_settings_open
+    }
+
+/**
+ * Shows [open] with the texts of its [LocalNetworkPermissionRequester.OpenDialog.dialog]. After a connect timeout, the
+ * app does not know that the host is on the local network. Then the texts tell only that Android can stop the
+ * connection.
+ */
 @Composable
 internal fun LocalNetworkPermissionDialog(open: LocalNetworkPermissionRequester.OpenDialog) {
-    val (body, confirm) = when (open.dialog) {
-        LocalNetworkDialog.Rationale ->
-            Res.string.local_network_permission_rationale_body to Res.string.local_network_permission_rationale_continue
-        LocalNetworkDialog.Settings ->
-            Res.string.local_network_permission_settings_body to Res.string.local_network_permission_settings_open
-    }
+    val (body, confirm) = localNetworkDialogTexts(open.dialog, open.timedOut)
     AlertDialog(
         onDismissRequest = { open.answer.complete(false) },
         title = { Text(stringResource(Res.string.local_network_permission_title)) },

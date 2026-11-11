@@ -52,10 +52,19 @@ class LocalNetworkGuardTest {
         prefix("fd7a:115c:a1e0::7", 128),
     )
 
-    private fun guard(permitted: Boolean, prefixes: List<AddressPrefix> = devicePrefixes): LocalNetworkGuard =
+    /** The own addresses of the device. */
+    private val deviceAddresses = listOf("192.168.1.5", "2001:db8:1:2::5", "fe80::5", "100.64.0.7", "fd7a:115c:a1e0::7")
+
+    private fun guard(
+        permitted: Boolean,
+        prefixes: List<AddressPrefix> = devicePrefixes,
+        isProtected: Boolean = true,
+    ): LocalNetworkGuard =
         LocalNetworkGuard(
             hasPermission = { permitted },
-            localPrefixes = { prefixes },
+            localNetwork = {
+                LocalNetworkView(prefixes, deviceAddresses.map { InetAddress.getByName(it).address }, isProtected)
+            },
             resolve = { host ->
                 resolved += host
                 (extraNames[host] ?: names[host])?.map(InetAddress::getByName) ?: listOf(literal(host))
@@ -93,8 +102,8 @@ class LocalNetworkGuardTest {
         assertFalse(guard.needsPermission("ts-box.tailnet.ts.net"))
         val tailscaleIpv6 = InetAddress.getByName("fd7a:115c:a1e0::9")
         assertEquals(tailscaleIpv6, guard.socketAddressFor("fd7a:115c:a1e0::9", 22).address)
-        // Only the own address of the VPN interface is local.
-        assertFailsWith<LocalNetworkPermissionException> { guard.socketAddressFor("100.64.0.7", 22) }
+        // Android permits the own address of the VPN interface, because the packet goes through the loopback interface.
+        assertEquals(InetAddress.getByName("100.64.0.7"), guard.socketAddressFor("100.64.0.7", 22).address)
     }
 
     @Test
@@ -163,6 +172,27 @@ class LocalNetworkGuardTest {
         assertEquals("[fe80::1]:22", assertFailsWith<LocalNetworkPermissionException> {
             guard.socketAddressFor("fe80::1", 22)
         }.hostPort)
+    }
+
+    @Test
+    fun anOwnAddressOfTheDeviceNeedsNoPermission() {
+        val guard = guard(permitted = false)
+
+        // For example, herdr in a terminal app on the tablet, reached by the own Wi-Fi address.
+        assertEquals(InetAddress.getByName("192.168.1.5"), guard.socketAddressFor("192.168.1.5", 22).address)
+        assertFalse(guard.needsPermission("2001:db8:1:2::5"))
+    }
+
+    @Test
+    fun withAnHttpProxyOnAllNetworksTheGuardRefusesNothing() {
+        val guard = guard(permitted = false, isProtected = false)
+
+        assertEquals(InetAddress.getByName("192.168.1.42"), guard.socketAddressFor("192.168.1.42", 22).address)
+        assertEquals(InetAddress.getByName("224.0.0.251"), guard.socketAddressFor("224.0.0.251", 5353).address)
+        assertFalse(guard.needsPermission("devbox.local"))
+        val timeout = SocketTimeoutException("connect timed out")
+        val routed = InetSocketAddress(InetAddress.getByName("192.168.2.10"), 22)
+        assertSame(timeout, guard.connectFailure(routed, "routed-box.lan:22", timeout))
     }
 
     @Test

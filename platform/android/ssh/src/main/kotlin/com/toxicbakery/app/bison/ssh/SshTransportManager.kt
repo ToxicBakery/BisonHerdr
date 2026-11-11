@@ -287,7 +287,11 @@ class SshTransportManager(
                 isError = true,
             )
             // The UI asks the user about a host key. The connection does not wait: the user connects again later.
-            stopForUser(machineId, causeOf(authResult), hostKeyPromptFor(machineId, authResult))
+            // A disconnect that ended the wait for the local network permission leaves no cause.
+            val cause = causeOf(authResult).takeUnless {
+                authResult is SshAuthResult.LocalNetworkBlocked && authResult.disconnected
+            }
+            stopForUser(machineId, cause, hostKeyPromptFor(machineId, authResult))
             return false
         }
 
@@ -736,7 +740,8 @@ class SshTransportManager(
 
             is SshAuthResult.InputCancelled -> "InputCancelled (${result.hostPort})"
             is SshAuthResult.LocalNetworkBlocked ->
-                "LocalNetworkBlocked (${result.hostPort}${if (result.timedOut) ", time limit" else ""})"
+                "LocalNetworkBlocked (${result.hostPort}${if (result.timedOut) ", time limit" else ""}" +
+                    "${if (result.disconnected) ", disconnected" else ""})"
         }
 
     /** Returns the host key prompt for [result], or null when [result] is not a host key rejection. */

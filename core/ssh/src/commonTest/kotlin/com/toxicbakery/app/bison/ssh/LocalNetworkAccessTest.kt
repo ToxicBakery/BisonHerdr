@@ -113,7 +113,7 @@ class LocalNetworkAccessTest {
 
         access.cancel(MACHINE_ID)
 
-        assertEquals(LocalNetworkOutcome.Cancelled, first.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, first.await())
         // The dialog stays open for the other machine.
         assertEquals(HOST_PORT, access.openRequest.value?.hostPort)
         answer.complete(LocalNetworkOutcome.Granted)
@@ -134,9 +134,10 @@ class LocalNetworkAccessTest {
         runCurrent()
 
         access.cancel("unknown-box")
-        access.cancelAll()
+        assertEquals(setOf(MACHINE_ID), access.cancelAll())
+        assertEquals(emptySet(), access.cancelAll())
 
-        assertEquals(LocalNetworkOutcome.Cancelled, result.await())
+        assertEquals(LocalNetworkOutcome.Disconnected, result.await())
         runCurrent()
         assertTrue(dialogCancelled)
         assertNull(access.openRequest.value)
@@ -155,6 +156,22 @@ class LocalNetworkAccessTest {
         assertEquals(LocalNetworkOutcome.Cancelled, older.await())
         answer.complete(LocalNetworkOutcome.Denied)
         assertEquals(LocalNetworkOutcome.Denied, newer.await())
+    }
+
+    @Test
+    fun theUiGetsTheReasonOfTheRequest() = runTest {
+        val kinds = mutableListOf<Boolean>()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            access.hostRequests { request ->
+                kinds += request.timedOut
+                LocalNetworkOutcome.Denied
+            }
+        }
+
+        access.request(MACHINE_ID, HOST_PORT, TIMEOUT)
+        access.request(MACHINE_ID, HOST_PORT, TIMEOUT, timedOut = true)
+
+        assertEquals(listOf(false, true), kinds)
     }
 
     @Test

@@ -20,8 +20,10 @@ package com.toxicbakery.app.bison.ssh
  * A host on a different private subnet behind a router is also not local. For such an address, [isPrivate] tells only
  * that Android can stop the connection on a network that has its range.
  *
- * A host name with the mDNS suffix `.local` is also local ([isLocalName]), because its query is a multicast. Loopback
- * addresses are not local.
+ * An own address of the device is not local. Linux sends a packet to it through the loopback interface, and that
+ * interface has no list. Loopback addresses are also not local. A host name with the mDNS suffix `.local`
+ * ([isLocalName]) is local while the network that carries its query has the protection. The query is a multicast.
+ * See [LocalNetworkView.isProtected].
  */
 object LocalNetworkAddresses {
 
@@ -78,12 +80,17 @@ object LocalNetworkAddresses {
 
     /**
      * Returns true when Android stops a connection to [address] without the permission. [address] has 4 bytes (IPv4)
-     * or 16 bytes (IPv6). Each other size is not local. [localPrefixes] are the prefixes of the interfaces of the
-     * device, from [localPrefixOf]. Multicast and broadcast addresses are always local.
+     * or 16 bytes (IPv6). Each other size is not local. [view] has the lists of the networks of the device.
+     *
+     * An own address of the device is not local. Multicast and broadcast addresses are local while at least one
+     * network has the protection ([LocalNetworkView.isProtected]).
      */
-    fun isLocal(address: ByteArray, localPrefixes: List<AddressPrefix>): Boolean {
-        val candidate = ipv4Of(address) ?: address.takeIf { it.size == IPV6_SIZE } ?: return false
-        return MULTICAST_AND_BROADCAST.any { it.contains(candidate) } || localPrefixes.any { it.contains(candidate) }
+    fun isLocal(address: ByteArray, view: LocalNetworkView): Boolean {
+        val candidate = normalized(address) ?: return false
+        if (!view.isProtected || view.ownAddresses.any { own -> normalized(own)?.contentEquals(candidate) == true }) {
+            return false
+        }
+        return isMulticastOrBroadcast(candidate) || view.prefixes.any { it.contains(candidate) }
     }
 
     /**
@@ -94,11 +101,17 @@ object LocalNetworkAddresses {
     fun isPrivate(address: ByteArray): Boolean {
         val ipv4 = ipv4Of(address)
         return when {
-            isLocal(address, emptyList()) -> true
+            normalized(address)?.let(::isMulticastOrBroadcast) == true -> true
             ipv4 != null -> IPV4_LOCAL_RANGES.any { it.contains(ipv4) }
             else -> IPV6_PRIVATE_RANGES.any { it.contains(address) }
         }
     }
+
+    /** Returns the IPv4 form of an IPv4 or IPv4-mapped address, the IPv6 address, or null for a different size. */
+    private fun normalized(address: ByteArray): ByteArray? = ipv4Of(address) ?: address.takeIf { it.size == IPV6_SIZE }
+
+    private fun isMulticastOrBroadcast(address: ByteArray): Boolean =
+        MULTICAST_AND_BROADCAST.any { it.contains(address) }
 
     /** Returns [address] when it is an IPv4 address, the IPv4 address in an IPv4-mapped IPv6 address, or null. */
     private fun ipv4Of(address: ByteArray): ByteArray? = when {
@@ -113,6 +126,29 @@ object LocalNetworkAddresses {
 
     private fun ipv6Prefix(first: Int, second: Int, length: Int): AddressPrefix =
         AddressPrefix(ByteArray(IPV6_SIZE).also { it[0] = first.toByte(); it[1] = second.toByte() }, length)
+}
+
+/**
+ * The local network lists of the device, from the networks that the app sees. See [LocalNetworkAddresses.isLocal].
+ *
+ * - [prefixes] are the local prefixes of the networks with the protection ([LocalNetworkAddresses.localPrefixOf]).
+ * - [ownAddresses] are the addresses of all networks of the device.
+ * - [isProtected] is true when the default network has the protection. A network with an HTTP proxy has no
+ *   protection. When the app does not know the default network, it is true when a network has the protection, or
+ *   when the app sees no network. Multicast, broadcast, and `.local` names are local only while it is true.
+ */
+class LocalNetworkView(
+    val prefixes: List<AddressPrefix>,
+    ownAddresses: List<ByteArray>,
+    val isProtected: Boolean,
+) {
+    /** A copy of the own addresses, so that a change of the list of the caller has no effect. */
+    val ownAddresses: List<ByteArray> = ownAddresses.map { it.copyOf() }
+
+    companion object {
+        /** A device with no network that the app sees. The protection applies, and only multicast is local. */
+        val EMPTY: LocalNetworkView = LocalNetworkView(emptyList(), emptyList(), isProtected = true)
+    }
 }
 
 /**

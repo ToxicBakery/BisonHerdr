@@ -10,6 +10,7 @@ import com.toxicbakery.app.bison.model.TransportMode
 import com.toxicbakery.app.bison.ssh.CredentialChecker
 import com.toxicbakery.app.bison.ssh.CredentialState
 import com.toxicbakery.app.bison.ssh.LocalNetworkGuard
+import com.toxicbakery.app.bison.ssh.LocalNetworkView
 import com.toxicbakery.app.bison.ssh.ProxyJumpTunnel
 import com.toxicbakery.app.bison.ssh.RealSshBackend
 import com.toxicbakery.app.bison.ssh.SelectingSshBackend
@@ -45,7 +46,7 @@ class DebugModuleTest {
         bindSingleton<StoreIOProvider>(tag = StoreIOProviderTags.SECRETS) { InMemoryStoreIOProvider() }
         // The Application also binds the local network guard with its Context.
         bindSingleton<LocalNetworkGuard> {
-            LocalNetworkGuard(hasPermission = { true }, localPrefixes = { emptyList() })
+            LocalNetworkGuard(hasPermission = { true }, localNetwork = { LocalNetworkView.EMPTY })
         }
     }
     private val backend = assertIs<SelectingSshBackend>(di.direct.instance<SshBackend>())

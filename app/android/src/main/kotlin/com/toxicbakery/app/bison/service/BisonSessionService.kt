@@ -222,15 +222,7 @@ class BisonSessionService : Service(), DIAware {
 
         serviceScope.launch {
             sshRequestManager.bus.collect { request ->
-                when (request) {
-                    is SshRequest.SendPaneInput,
-                    is SshRequest.ResizeShell -> fastInteractiveQueue.trySend(request)
-                    else -> {
-                        sshStateManager.cancelUserAuthBeforeQueue(request)
-                        localNetworkAccess.cancelRequestBeforeQueue(request)
-                        controlQueue.trySend(request)
-                    }
-                }
+                routeSshRequest(request, sshStateManager, localNetworkAccess, fastInteractiveQueue, controlQueue)
             }
         }
     }
@@ -406,9 +398,7 @@ class BisonSessionService : Service(), DIAware {
     private fun disconnectAllMachines() {
         // A connect that waits for a user authentication, for keyboard-interactive answers, or for the local network
         // permission holds the control queue. End the wait first.
-        sshStateManager.cancelAllUserAuth()
-        localNetworkAccess.cancelAll()
-        val machineIds = sshStateManager.connectedMachines.value
+        val machineIds = endWaitsForDisconnectAll(sshStateManager, localNetworkAccess)
         log.d { "Disconnect All: send Disconnect for ${machineIds.size} machines" }
         serviceScope.launch {
             machineIds.forEach { machineId ->
