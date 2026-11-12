@@ -212,7 +212,7 @@ class HerdrSessionTest {
 
     private fun debugLogDump(): String = debugLog.entries.value.joinToString("\n") { "[${it.tag}] ${it.message}" }
 
-    private companion object {
+    internal companion object {
         /** The line after the arguments of one call in [callLog]. */
         const val CALL_END = "@end"
 

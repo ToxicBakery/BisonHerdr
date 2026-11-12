@@ -228,10 +228,12 @@ internal class TestSshServer(
 
     /**
      * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [binDirectory] on the `PATH`, and
-     * [homeDirectory] as `HOME`.
+     * [homeDirectory] as `HOME`. The test JVM can run in a Herdr pane, so the process gets no `HERDR_*` variable of
+     * the JVM. Thus a `herdr` call cannot find the Herdr server of the test machine.
      */
     private fun shellCommand(command: String): List<String> = buildList {
         add("env")
+        System.getenv().keys.filter { it.startsWith("HERDR_") }.sorted().forEach { addAll(listOf("-u", it)) }
         add("$NAME_VARIABLE=$name")
         homeDirectory?.let { add("HOME=${it.absolutePath}") }
         binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }

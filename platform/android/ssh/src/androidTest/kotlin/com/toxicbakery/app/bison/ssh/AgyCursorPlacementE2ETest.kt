@@ -94,6 +94,7 @@ class AgyCursorPlacementE2ETest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
         )
         val machine = HostMachine(
             id = MACHINE_ID,

@@ -37,6 +37,7 @@ class HardwareSecurityKeyRefusalTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
         )
         val machine = hardwareKeyMachine(port = 22)
 
@@ -64,6 +65,7 @@ class HardwareSecurityKeyRefusalTest {
             sshStateManager = stateManager,
             sshDebugLog = debugLog,
             paneSurfaceBus = surfaceBus,
+            foregroundState = ForegroundState.ALWAYS,
             featureFlags = FeatureFlags(hardwareSecurityKeys = true),
         )
         val machine = hardwareKeyMachine(port = 22)

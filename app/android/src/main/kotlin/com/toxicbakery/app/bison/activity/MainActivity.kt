@@ -31,7 +31,6 @@ import com.toxicbakery.app.bison.service.BisonSessionService
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
 import com.toxicbakery.app.bison.ssh.LocalNetworkOutcome
 import com.toxicbakery.app.bison.ssh.SecurityKeyHub
-import com.toxicbakery.app.bison.ssh.SshRequest
 import com.toxicbakery.app.bison.ssh.SshRequestManager
 import com.toxicbakery.app.bison.ssh.SshStateManager
 import com.toxicbakery.app.bison.ssh.hasLocalNetworkPermission
@@ -159,6 +158,8 @@ class MainActivity : FragmentActivity(), DIAware {
 
     override fun onStart() {
         super.onStart()
+        // Change the count before the lease requests. A connect reads the count when it completes
+        // (SshTransportManager.setSurfaceLease gives the order rule).
         startedActivityCounter.onActivityStarted()
         // The service is the only collector of the request queue, so start it before the requests.
         // The service can stop itself while this activity is stopped.
@@ -169,30 +170,19 @@ class MainActivity : FragmentActivity(), DIAware {
         }
         // Turn the surface leases on again, so that the poll reads the snapshot and the panes again.
         lifecycleScope.launch {
-            for (machineId in sshStateManager.connectedMachines.value) {
-                sshRequestManager.emit(
-                    SshRequest.SetSurfaceLease(
-                        machineId = machineId,
-                        active = true,
-                    )
-                )
-            }
+            sendSurfaceLeaseRequests(active = true, startedActivityCounter, sshStateManager, sshRequestManager)
         }
     }
 
     override fun onStop() {
         super.onStop()
+        // Change the count before the lease requests. A connect reads the count when it completes
+        // (SshTransportManager.setSurfaceLease gives the order rule).
         startedActivityCounter.onActivityStopped()
-        // Turn the surface leases off, so that the poll reads no snapshot and no panes. The SSH sessions stay open.
+        // When no activity is started, turn the surface leases off, so that the poll reads no snapshot and no panes.
+        // The SSH sessions stay open.
         lifecycleScope.launch {
-            for (machineId in sshStateManager.connectedMachines.value) {
-                sshRequestManager.emit(
-                    SshRequest.SetSurfaceLease(
-                        machineId = machineId,
-                        active = false,
-                    )
-                )
-            }
+            sendSurfaceLeaseRequests(active = false, startedActivityCounter, sshStateManager, sshRequestManager)
         }
     }
 
