@@ -13,6 +13,7 @@ import java.security.PublicKey
 import java.security.spec.ECGenParameterSpec
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.io.path.createTempDirectory
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.KeyUtils
 import org.apache.sshd.common.config.keys.PublicKeyEntry
@@ -47,9 +48,12 @@ import org.apache.sshd.server.shell.ProcessShell
  * - [INTERACTIVE_USER] with the answers of [interactivePrompts] (`keyboard-interactive` method).
  *
  * An `exec` request runs `sh -c <command>` on the test machine, with [name] in the environment variable
- * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. A command finds the programs
- * in [binDirectory] before the programs of the test machine. A test can also give each command a [homeDirectory].
- * When [allowTcpForwarding] is true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump
+ * [NAME_VARIABLE]. A test with two servers can thus tell which server ran a command. The command gets only these
+ * environment variables: [NAME_VARIABLE], `HOME`, and `PATH`. `HOME` is [homeDirectory]. The `PATH` starts with the
+ * `.local/bin` directory of [homeDirectory], then [binDirectory], then a directory with a `herdr` that fails each
+ * command, then the `PATH` of the test machine. A test can put a fake `herdr` first on the `PATH` with
+ * [installHerdr]. Thus no test can run the `herdr` of the test machine and reach a Herdr server of the user. When
+ * [allowTcpForwarding] is true, the server opens `direct-tcpip` channels, so a test can use it as a ProxyJump
  * bastion. [directTcpipTargets] records the `host:port` of each channel that a client asked for.
  *
  * [credentialChecks] counts the login requests that get to an authenticator. A test uses it to prove that a
@@ -87,13 +91,19 @@ internal class TestSshServer(
     @Volatile
     var binDirectory: File? = null
 
+    /** The temporary directory of the server. [close] deletes it. */
+    private val serverDirectory: File = createTempDirectory("bison-test-ssh-server").toFile()
+
     /**
-     * The `HOME` of each `exec` command, or null for the `HOME` of the test machine. The workers of the client put
+     * The `HOME` of each `exec` command. The default is a new empty directory. The workers of the client put
      * `$HOME/.local/bin` first on the `PATH`. Thus a command finds a program in the `.local/bin` of this directory
      * first. A program of the same name on the test machine, for example `herdr`, comes after it.
      */
     @Volatile
-    var homeDirectory: File? = null
+    var homeDirectory: File = File(serverDirectory, "home").apply { mkdirs() }
+
+    /** A directory on the `PATH` of each `exec` command with a `herdr` that fails each command. */
+    private val stubDirectory: File = File(serverDirectory, "stub-bin")
 
     /** The keys that [KEY_USER] can log in with. */
     val authorizedKeys: MutableList<PublicKey> = CopyOnWriteArrayList()
@@ -139,7 +149,24 @@ internal class TestSshServer(
     private var sshd: SshServer? = null
 
     init {
+        writeHerdr(stubDirectory, STUB_HERDR)
         authorizeKey(keyManager.getOrCreatePublicKey(keyAlias = KEY_ALIAS, algorithm = keyAlgorithm).openSshAuthorizedKeyLine)
+    }
+
+    /**
+     * Writes [script] as the `herdr` program in the `.local/bin` directory of [homeDirectory]. The `PATH` of each
+     * `exec` command finds it before all other programs.
+     */
+    fun installHerdr(script: String) {
+        writeHerdr(File(homeDirectory, ".local/bin"), script)
+    }
+
+    private fun writeHerdr(directory: File, script: String) {
+        directory.mkdirs()
+        File(directory, "herdr").apply {
+            writeText(script)
+            setExecutable(true)
+        }
     }
 
     /** Adds the OpenSSH `authorized_keys` line [authorizedKeyLine] to [authorizedKeys]. */
@@ -208,7 +235,11 @@ internal class TestSshServer(
         sshd?.activeSessions?.forEach { it.close(true) }
     }
 
-    override fun close() = stop()
+    /** Stops the server and deletes its temporary directory. A [homeDirectory] that a test set stays. */
+    override fun close() {
+        stop()
+        serverDirectory.deleteRecursively()
+    }
 
     /** Returns a [HostMachine] that connects to this server as [username] with [authMethod]. */
     fun machine(
@@ -226,15 +257,19 @@ internal class TestSshServer(
         transportMode = transportMode,
     )
 
-    /**
-     * Returns the process that runs [command]: `sh -c` with [NAME_VARIABLE], [binDirectory] on the `PATH`, and
-     * [homeDirectory] as `HOME`.
-     */
+    /** Returns the process that runs [command]: `sh -c` with only the environment variables in the class comment. */
     private fun shellCommand(command: String): List<String> = buildList {
+        val path = listOfNotNull(
+            File(homeDirectory, ".local/bin").absolutePath,
+            binDirectory?.absolutePath,
+            stubDirectory.absolutePath,
+            System.getenv("PATH"),
+        )
         add("env")
+        add("-i")
         add("$NAME_VARIABLE=$name")
-        homeDirectory?.let { add("HOME=${it.absolutePath}") }
-        binDirectory?.let { add("PATH=${it.absolutePath}${File.pathSeparator}${System.getenv("PATH").orEmpty()}") }
+        add("HOME=${homeDirectory.absolutePath}")
+        add("PATH=${path.joinToString(File.pathSeparator)}")
         addAll(listOf("sh", "-c", command))
     }
 
@@ -297,5 +332,8 @@ internal class TestSshServer(
             }.generateKeyPair()
 
         private const val RSA_KEY_BITS = 2048
+
+        /** The default `herdr` of each server. It fails each command. */
+        private const val STUB_HERDR = "#!/bin/sh\necho 'herdr: this test has no fake Herdr' >&2\nexit 127\n"
     }
 }

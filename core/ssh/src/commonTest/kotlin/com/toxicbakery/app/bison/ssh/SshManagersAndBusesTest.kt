@@ -260,4 +260,31 @@ class SshManagersAndBusesTest {
         assertFalse(stateManager.setRoundTripTime("workbox", 50))
         assertNull(stateManager.activeTransportBackbone.value["workbox"])
     }
+
+    @Test
+    fun theBusKeepsTheAgentsThatNeedTheUser() {
+        val bus = SemanticNotificationBus()
+        // A notification with a status that needs the user adds its pane, for example from the demo server.
+        bus.publish(
+            "workbox",
+            SemanticNotification(title = "claude", paneId = "w1:p1", agentStatus = AgentStatus.Blocked),
+        )
+        bus.publish(
+            "workbox",
+            SemanticNotification(title = "claude", paneId = "w1:p2", agentStatus = AgentStatus.Working),
+        )
+        assertEquals(mapOf("workbox" to mapOf("w1:p1" to AgentStatus.Blocked)), bus.agentsNeedingUser.value)
+
+        // The SSH client replaces the panes of a machine with its known agents.
+        bus.setAgentsNeedingUser(
+            "workbox",
+            mapOf("w1:p1" to AgentStatus.Working, "w1:p3" to AgentStatus.Done),
+        )
+        assertNull(bus.statusNeedingUser("workbox", "w1:p1"))
+        assertEquals(AgentStatus.Done, bus.statusNeedingUser("workbox", "w1:p3"))
+
+        // An empty map removes the machine, for example at a disconnect.
+        bus.setAgentsNeedingUser("workbox", emptyMap())
+        assertEquals(emptyMap(), bus.agentsNeedingUser.value)
+    }
 }

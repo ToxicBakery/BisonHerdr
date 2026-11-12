@@ -51,7 +51,8 @@ import kotlinx.serialization.json.putJsonObject
  *    and others) on persistent `sh` channels of the SSH session. This version does not run
  *    `herdr remote-client-bridge`.
  * 5. Background parking ([setSurfaceLease]) and the session checks after a network change ([onNetworkAvailable]
- *    and [onNetworkLost]). While the surface lease is off, the poll reads no snapshot and no panes.
+ *    and [onNetworkLost]). While the surface lease is off, the poll reads no snapshot and no panes. Then the real
+ *    backend watches the agent statuses for the agent alerts (issue #53).
  *
  * The code for a Mosh backbone ([ActiveBackbone.MoshUdp] and [moshUdpEngine]) stays for issue #22, but the
  * backends never select it, and [MoshUdpEngine] starts no session.
@@ -370,7 +371,9 @@ class SshTransportManager(
      *
      * - Sets the parked state of the Mosh session. This version has no Mosh session (issue #22).
      * - While the lease is off, the poll of the backend reads no snapshot and no panes. Thus the SSH session stays
-     *   open with no terminal traffic. This version does not send `client_shell.surface.set` to the Herdr server.
+     *   open with no terminal traffic. The real backend keeps one `events.subscribe` stream open for the agent alerts,
+     *   and this stream sends no data while no agent changes (issue #53). This version does not send
+     *   `client_shell.surface.set` to the Herdr server.
      * - When the lease comes on (`active == true`), the manager publishes the last [PaneSurfaceFrame] again with a
      *   new presentation epoch, and the next poll reads the new state. The app does not send
      *   `endpoint.presentation.ready.v1` in this version.

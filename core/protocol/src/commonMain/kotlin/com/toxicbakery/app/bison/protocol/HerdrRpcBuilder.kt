@@ -308,6 +308,38 @@ object HerdrRpcBuilder {
         },
     )
 
+    /**
+     * Builds an `events.subscribe` request for the agent status of each pane of [paneIds], and for
+     * `pane.agent_detected`.
+     *
+     * Herdr 0.9.0 to 0.9.5 has no status subscription for all panes. A `pane.agent_status_changed` subscription
+     * names one pane, and the request fails when a pane does not exist. A `pane.agent_detected` event tells that an
+     * agent started or stopped in a pane, so that the client can subscribe again with the new panes.
+     */
+    fun agentStatusSubscribe(
+        paneIds: Collection<String>,
+        requestId: String = "agent_status_watch",
+    ): ClientShellEndpointRequest = buildRequest(
+        id = requestId,
+        method = "events.subscribe",
+        params = buildJsonObject {
+            put(
+                "subscriptions",
+                buildJsonArray {
+                    add(buildJsonObject { put("type", "pane.agent_detected") })
+                    paneIds.forEach { paneId ->
+                        add(
+                            buildJsonObject {
+                                put("type", "pane.agent_status_changed")
+                                put("pane_id", paneId)
+                            },
+                        )
+                    }
+                },
+            )
+        },
+    )
+
     fun agentPrompt(
         prompt: String,
         paneId: String? = null,

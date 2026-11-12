@@ -20,12 +20,18 @@ import com.toxicbakery.app.bison.activity.StartedActivityCounter
 import com.toxicbakery.app.bison.debug.DebugServer
 import com.toxicbakery.app.bison.model.ActiveBackbone
 import com.toxicbakery.app.bison.protocol.AgentStatus
-import com.toxicbakery.app.bison.protocol.ClientKeyCode
-import com.toxicbakery.app.bison.protocol.ClientKeyEvent
 import com.toxicbakery.app.bison.protocol.ClientPaneInputEvent
+import com.toxicbakery.app.bison.protocol.ClientShellEndpointRequest
 import com.toxicbakery.app.bison.protocol.HerdrRpcBuilder
 import com.toxicbakery.app.bison.protocol.SemanticNotification
 import com.toxicbakery.app.bison.resources.Res
+import com.toxicbakery.app.bison.resources.agent_alert_action_failed_text
+import com.toxicbakery.app.bison.resources.agent_alert_action_failed_title
+import com.toxicbakery.app.bison.resources.agent_alert_action_no_answer
+import com.toxicbakery.app.bison.resources.agent_alert_action_not_needed
+import com.toxicbakery.app.bison.resources.agent_alert_action_not_connected
+import com.toxicbakery.app.bison.resources.agent_alert_blocked_title
+import com.toxicbakery.app.bison.resources.agent_alert_done_title
 import com.toxicbakery.app.bison.resources.service_notification_action_disconnect_all
 import com.toxicbakery.app.bison.ssh.EndpointSnapshotBus
 import com.toxicbakery.app.bison.ssh.LocalNetworkAccess
@@ -59,9 +65,14 @@ import org.kodein.di.instance
  * [SshRequestManager.bus]. It gives each change of the default network to [SshTransportManager], which checks the
  * sessions and connects again when a check fails.
  *
- * The service posts an alert with actions for each `Blocked` or `Done` event of [SemanticNotificationBus]. In this
- * version, only the demo server sends these events, so a real host gives no agent alert. Agent alerts for real hosts
- * are planned. Issue #53 (https://github.com/ToxicBakery/BisonHerdr/issues/53) holds the work.
+ * The service posts an alert with actions for each `Blocked` or `Done` event of [SemanticNotificationBus]. The real
+ * SSH client sends one event for each agent that goes to `Blocked` or `Done` on a real host, also while the app is
+ * in the background (issue #53). The demo server also sends these events. The alert actions (Approve, Reject, and
+ * Reply) go to the SSH control lane of the machine as Herdr requests ([AgentAlertAction]), one at a time. A request
+ * that finds a closed session waits for one reconnect attempt. After a success, the service removes the alert. After a
+ * failure, it replaces the alert with a notification that shows the cause. The service also removes an alert when its
+ * agent leaves `Blocked` or `Done`, when the agent stops, and at a disconnect ([AgentAlertBook]). An action for such an
+ * agent sends nothing.
  *
  * The service stops itself when [ServiceStopPolicy] finds no connected machine, no connection in
  * progress, and no started activity for 30 s. [MainActivity] starts the service again in `onStart`.
@@ -93,6 +104,23 @@ class BisonSessionService : Service(), DIAware {
 
     private val networkEvents = NetworkEventQueue()
 
+    /** The actions of the agent alerts in the order of the taps. [collectAgentAlertActions] runs them one at a time. */
+    private val agentAlertActions = Channel<AgentAlertWork>(Channel.UNLIMITED)
+
+    /** The posted agent alerts. Only the main thread uses it. */
+    private val agentAlerts = AgentAlertBook()
+
+    /**
+     * An [action] of the alert of the agent [agentLabel] on [machineId]. [sequence] is the sequence of the alert, or
+     * null for an intent with no sequence.
+     */
+    private data class AgentAlertWork(
+        val machineId: String,
+        val agentLabel: String?,
+        val sequence: Long?,
+        val action: AgentAlertAction,
+    )
+
     /**
      * Sends the changes of the default network to [networkEvents]. [collectNetworkEvents] gives them to
      * [sshTransportManager] one at a time. The manager checks each machine a maximum of one time each second, so the
@@ -123,6 +151,7 @@ class BisonSessionService : Service(), DIAware {
         collectSshRequests()
         observeSessionStatusForForegroundNotification()
         observeSemanticNotifications()
+        collectAgentAlertActions()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -334,13 +363,23 @@ class BisonSessionService : Service(), DIAware {
         }
     }
 
+    /**
+     * Posts an alert for each `Blocked` or `Done` event, and removes each alert that is old ([AgentAlertBook]). Both
+     * collectors run on the main thread, the same thread as the actions.
+     */
     private fun observeSemanticNotifications() {
-        serviceScope.launch {
+        serviceScope.launch(Dispatchers.Main) {
             semanticNotificationBus.notifications.collect { (machineId, notification) ->
                 val status = notification.agentStatus
                 if (status == AgentStatus.Blocked || status == AgentStatus.Done) {
                     postAgentAlertNotification(machineId, notification)
                 }
+            }
+        }
+        serviceScope.launch(Dispatchers.Main) {
+            semanticNotificationBus.agentsNeedingUser.collect { needing ->
+                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                agentAlerts.removeOld(needing).forEach { id -> manager?.cancel(id) }
             }
         }
     }
@@ -353,54 +392,140 @@ class BisonSessionService : Service(), DIAware {
         }
         val machineId = intent.getStringExtra(EXTRA_MACHINE_ID) ?: return
         val paneId = intent.getStringExtra(EXTRA_PANE_ID) ?: return
-        val agentName = intent.getStringExtra(EXTRA_AGENT_NAME)
+        val agentLabel = intent.getStringExtra(EXTRA_AGENT_NAME)
+        val sequence = intent.getLongExtra(EXTRA_ALERT_SEQUENCE, NO_SEQUENCE).takeIf { it != NO_SEQUENCE }
 
-        when (action) {
-            ACTION_AGENT_APPROVE -> {
-                serviceScope.launch {
-                    sshRequestManager.emit(
-                        SshRequest.SendPaneInput(
-                            machineId = machineId,
-                            paneId = paneId,
-                            event = ClientPaneInputEvent.Key(
-                                ClientKeyEvent(code = ClientKeyCode.Enter)
-                            ),
-                        )
-                    )
-                }
-            }
-
-            ACTION_AGENT_REJECT -> {
-                serviceScope.launch {
-                    sshRequestManager.emit(
-                        SshRequest.SendPaneInput(
-                            machineId = machineId,
-                            paneId = paneId,
-                            event = ClientPaneInputEvent.Key(
-                                ClientKeyEvent(code = ClientKeyCode.Escape)
-                            ),
-                        )
-                    )
-                }
-            }
-
+        val alertAction = when (action) {
+            ACTION_AGENT_APPROVE -> AgentAlertAction.Approve(paneId)
+            ACTION_AGENT_REJECT -> AgentAlertAction.Reject(paneId)
             ACTION_AGENT_INLINE_REPLY -> {
                 val remoteInput = RemoteInput.getResultsFromIntent(intent)
                 val replyText = remoteInput?.getCharSequence(KEY_TEXT_REPLY)?.toString()?.trim()
-                if (!replyText.isNullOrEmpty()) {
-                    serviceScope.launch {
-                        sshRequestManager.emit(
-                            SshRequest.SubmitAgentPrompt(
-                                machineId = machineId,
-                                paneId = paneId,
-                                agentName = agentName,
-                                prompt = replyText,
-                            )
-                        )
-                    }
+                if (replyText.isNullOrEmpty()) {
+                    // The shade shows a progress mark after a reply until the alert changes. Remove the alert.
+                    cancelAgentAlert(machineId, paneId, sequence)
+                    return
+                }
+                AgentAlertAction.Reply(paneId, replyText)
+            }
+
+            else -> return
+        }
+        agentAlertActions.trySend(AgentAlertWork(machineId, agentLabel, sequence, alertAction))
+    }
+
+    /** Runs the actions of [agentAlertActions] one at a time, in the order of the taps, on the main thread. */
+    private fun collectAgentAlertActions() {
+        serviceScope.launch(Dispatchers.Main) {
+            for (work in agentAlertActions) {
+                runCatching { runAgentAlertAction(work) }.onFailure { error ->
+                    rethrowIfCancelled(error)
+                    log.e(error) { "Could not run the agent alert action $work" }
                 }
             }
         }
+    }
+
+    /**
+     * Sends the requests of [work] to the machine, and waits for the answers. After a success, it removes the alert.
+     * After a failure, it replaces the alert with a notification that shows the cause.
+     *
+     * It sends nothing to a machine that is not connected, for example after a disconnect. It also sends nothing when
+     * the agent does not need the user now ([SemanticNotificationBus.statusNeedingUser]). Then the pane can have a
+     * different program, for example a shell, and the keys or the text must not go to it.
+     */
+    private suspend fun runAgentAlertAction(work: AgentAlertWork) {
+        val paneId = work.action.paneId
+        val refusal = when {
+            !sshStateManager.isMachineConnected(work.machineId) ->
+                getString(Res.string.agent_alert_action_not_connected)
+
+            semanticNotificationBus.statusNeedingUser(work.machineId, paneId) == null ->
+                getString(Res.string.agent_alert_action_not_needed)
+
+            else -> null
+        }
+        if (refusal != null) {
+            postAgentAlertFailure(work, refusal)
+            return
+        }
+        val result = withContext(Dispatchers.IO) {
+            work.action.perform { request -> sendAgentAlertRequest(work.machineId, request) }
+        }
+        when (result) {
+            AgentAlertAction.Result.Sent -> cancelAgentAlert(work.machineId, paneId, work.sequence)
+            is AgentAlertAction.Result.Failed ->
+                postAgentAlertFailure(work, result.cause ?: getString(Res.string.agent_alert_action_no_answer))
+        }
+    }
+
+    /** Sends [request] to the demo server or to the SSH transport, and returns the answer. */
+    private suspend fun sendAgentAlertRequest(machineId: String, request: ClientShellEndpointRequest): String? {
+        val demoAnswer = if (debugServer.isEnabled) {
+            debugServer.handleEndpointCommand(machineId, request.method, request.paramsJson)
+        } else {
+            null
+        }
+        return demoAnswer ?: sshTransportManager.sendEndpointCommand(machineId, request)
+    }
+
+    /**
+     * Removes the alert of [paneId] on [machineId] when the notification still shows the alert with [sequence]. A
+     * newer alert of the pane stays.
+     */
+    private fun cancelAgentAlert(machineId: String, paneId: String, sequence: Long?) {
+        val id = agentAlertNotificationId(machineId, paneId)
+        if (!agentAlerts.isCurrent(id, sequence)) return
+        agentAlerts.remove(id)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        manager.cancel(id)
+    }
+
+    /**
+     * Shows a notification that tells the user that the action of [work] failed, and why. It replaces the alert of
+     * the action. When a newer alert of the pane exists, the newer alert stays, and the failure gets its own
+     * notification.
+     */
+    private suspend fun postAgentAlertFailure(work: AgentAlertWork, cause: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val paneId = work.action.paneId
+        val title = getString(Res.string.agent_alert_action_failed_title, work.agentLabel ?: paneId)
+        val text = getString(Res.string.agent_alert_action_failed_text, machineLabel(work.machineId), cause)
+        log.w { "The agent alert action ${work.action::class.simpleName} for $paneId failed: $cause" }
+        val builder = NotificationCompat.Builder(this, CHANNEL_AGENT_ALERTS_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(launchAppPendingIntent())
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+        val alertId = agentAlertNotificationId(work.machineId, paneId)
+        val replacesAlert = !agentAlerts.has(alertId) || agentAlerts.isCurrent(alertId, work.sequence)
+        if (replacesAlert) agentAlerts.remove(alertId)
+        val id = if (replacesAlert) alertId else alertId xor FAILURE_NOTIFICATION_ID_BIT
+        runCatching {
+            manager.notify(id, builder.build())
+        }
+    }
+
+    /** Returns the name of [machineId] that the user gave, or the id when the store has no name. */
+    private suspend fun machineLabel(machineId: String): String {
+        machineStore.awaitLoaded()
+        return machineStore.getMachine(machineId)?.name?.takeIf { it.isNotBlank() } ?: machineId
+    }
+
+    /** Returns an intent that opens the app. */
+    private fun launchAppPendingIntent(): PendingIntent {
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        return PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 
     private fun disconnectAllMachines() {
@@ -463,15 +588,7 @@ class BisonSessionService : Service(), DIAware {
         transportSummary: String,
         activeAgentCount: Int,
     ): Notification {
-        val launchIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val contentPendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            launchIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val contentPendingIntent = launchAppPendingIntent()
         val builder = NotificationCompat.Builder(this, CHANNEL_SESSION_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("BisonHerdr: $connectedCount machines ($transportSummary)")
@@ -500,20 +617,35 @@ class BisonSessionService : Service(), DIAware {
         return builder.build()
     }
 
-    private fun postAgentAlertNotification(
+    /**
+     * Posts the alert of [notification]. The title tells the status, the machine, and the agent. The text is the body
+     * of [notification], or the machine and the pane. A new alert of the same pane replaces the old alert. Each action
+     * of the alert has the sequence of [notification]. When the agent does not need the user any more, the service
+     * posts no alert.
+     */
+    private suspend fun postAgentAlertNotification(
         machineId: String,
         notification: SemanticNotification,
     ) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val paneId = notification.paneId ?: "w1:p1"
-        val agentName = notification.agentName
-        val notificationId = (machineId.hashCode() * 31 + paneId.hashCode()) and 0x7FFFFFFF
+        val agentName = notification.agentName?.takeIf { it.isNotBlank() } ?: notification.title
+        val notificationId = agentAlertNotificationId(machineId, paneId)
+        val machineLabel = machineLabel(machineId)
+        val titleResource = if (notification.agentStatus == AgentStatus.Done) {
+            Res.string.agent_alert_done_title
+        } else {
+            Res.string.agent_alert_blocked_title
+        }
+        val title = getString(titleResource, machineLabel, agentName)
+        val sequence = notification.sequence.toLong()
 
         val approveIntent = Intent(this, BisonSessionService::class.java).apply {
             action = ACTION_AGENT_APPROVE
             putExtra(EXTRA_MACHINE_ID, machineId)
             putExtra(EXTRA_PANE_ID, paneId)
             putExtra(EXTRA_AGENT_NAME, agentName)
+            putExtra(EXTRA_ALERT_SEQUENCE, sequence)
         }
         val approvePendingIntent = PendingIntent.getService(
             this,
@@ -527,6 +659,7 @@ class BisonSessionService : Service(), DIAware {
             putExtra(EXTRA_MACHINE_ID, machineId)
             putExtra(EXTRA_PANE_ID, paneId)
             putExtra(EXTRA_AGENT_NAME, agentName)
+            putExtra(EXTRA_ALERT_SEQUENCE, sequence)
         }
         val rejectPendingIntent = PendingIntent.getService(
             this,
@@ -540,6 +673,7 @@ class BisonSessionService : Service(), DIAware {
             putExtra(EXTRA_MACHINE_ID, machineId)
             putExtra(EXTRA_PANE_ID, paneId)
             putExtra(EXTRA_AGENT_NAME, agentName)
+            putExtra(EXTRA_ALERT_SEQUENCE, sequence)
         }
         val replyPendingIntent = PendingIntent.getService(
             this,
@@ -558,17 +692,21 @@ class BisonSessionService : Service(), DIAware {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_AGENT_ALERTS_ID)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(notification.title)
-            .setContentText(notification.body.ifBlank { "$machineId · $paneId" })
+            .setContentTitle(title)
+            .setContentText(notification.body.ifBlank { "$machineLabel · $paneId" })
+            .setContentIntent(launchAppPendingIntent())
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .addAction(android.R.drawable.checkbox_on_background, "Approve (Enter)", approvePendingIntent)
             .addAction(android.R.drawable.ic_delete, "Reject (Esc)", rejectPendingIntent)
             .addAction(replyAction)
 
+        // No suspension occurs from this check to the record, so the collector of old alerts sees the alert.
+        if (semanticNotificationBus.statusNeedingUser(machineId, paneId) == null) return
         runCatching {
             manager.notify(notificationId, builder.build())
         }
+        agentAlerts.posted(notificationId, AgentAlertBook.Alert(machineId, paneId, sequence))
     }
 
     private fun ensureNotificationChannels() {
@@ -613,6 +751,10 @@ class BisonSessionService : Service(), DIAware {
     }
 
     companion object {
+        /** Returns the id of the alert of [paneId] on [machineId]. A new alert of a pane replaces its old alert. */
+        private fun agentAlertNotificationId(machineId: String, paneId: String): Int =
+            (machineId.hashCode() * 31 + paneId.hashCode()) and 0x7FFFFFFF
+
         const val CHANNEL_SESSION_ID: String = "bison_active_sessions"
         const val CHANNEL_AGENT_ALERTS_ID: String = "bison_agent_alerts"
         const val FOREGROUND_NOTIFICATION_ID: Int = 1001
@@ -625,6 +767,13 @@ class BisonSessionService : Service(), DIAware {
         const val EXTRA_MACHINE_ID: String = "extra_machine_id"
         const val EXTRA_PANE_ID: String = "extra_pane_id"
         const val EXTRA_AGENT_NAME: String = "extra_agent_name"
+        const val EXTRA_ALERT_SEQUENCE: String = "extra_alert_sequence"
+
+        /** The value of [EXTRA_ALERT_SEQUENCE] in an intent with no sequence. */
+        private const val NO_SEQUENCE: Long = -1L
+
+        /** A failure notification that must not replace a newer alert gets the alert id with this bit changed. */
+        private const val FAILURE_NOTIFICATION_ID_BIT: Int = 0x40000000
         const val KEY_TEXT_REPLY: String = "key_text_reply"
 
         private val log = Arbor.tag("BisonSessionService")
